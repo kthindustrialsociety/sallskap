@@ -101,7 +101,7 @@ Roles are Django groups. An association can rename them or add its own. Every mo
 |---|---|---|
 | Web server | Caddy | Automatic HTTPS, very short config, imports one config snippet per module |
 | App and login | Django (Python), SQLite | Mature (LTS releases), role-based admin built in, large community |
-| Login protocol | OpenID Connect, with Django as the login service (django-oauth-toolkit) | Supported by every planned module; one user database |
+| Login protocol | OpenID Connect, with Django as the login service (django-allauth's provider) | Supported by every planned module; one user database |
 | Two-factor and email verification | django-allauth | Set up once in core, protects every module |
 | Backups | restic | Encrypted, deduplicated, writes to any SFTP or S3-compatible target |
 | Packaging | Docker Compose, versioned images | Identical on every server |
@@ -113,6 +113,7 @@ Roles are Django groups. An association can rename them or add its own. Every mo
 | Own server | Cloudflare Workers/D1, Supabase, Firebase | Per-request CPU caps, user caps, pausing projects, multiple accounts, weak ownership of data |
 | Django | PocketBase | PocketBase is pre-1.0 with essentially one maintainer, and its admin is superuser-only, so the board can't get role-limited access |
 | Django as login service | Authentik, Kanidm | Adds a service, and people would be managed in two places. Revisit if a module needs features Django can't provide. |
+| django-allauth's provider | django-oauth-toolkit | Shares core's login, 2FA and login limits instead of sitting beside them. django-oauth-toolkit is the fallback if a module needs something allauth's provider lacks. |
 | No Amazon SES, no Cloudflare | — | Fewer providers; FOSS preference |
 | Matrix or Zulip | Mattermost | Mattermost's free edition caps viewable history at 10,000 messages |
 | Hosted email | Self-hosted mail | Outgoing mail ports blocked by default on cloud servers; spam filtering and blocklists |
@@ -241,7 +242,7 @@ An installation has one **primary domain** and any number of **site domains**.
 ## 8. Identity and access
 
 - **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect).
-- **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights.
+- **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
 - **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access at their next login everywhere.
 - **Sessions:** short lifetimes for sensitive modules (vault: 8–24 h).
 - **Two-factor authentication:** required for the board, treasurer and operator groups; optional for members.
@@ -319,6 +320,7 @@ An association should never have to ask its provider how the server works. The k
 | `kit init <domain>` | Create the first config (the setup wizard does this in a browser) |
 | `kit admin <email>` | Create the first admin, or restore someone's Operator access and clear any login lockouts. `--reset-2fa` also removes their 2FA |
 | `kit link <email>` | Create a one-time link that lets someone choose a password. It doesn't log them in, so it can't get around 2FA |
+| `kit tool add <name> <callback>` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once; list tools; remove a tool and end its access |
 | `kit enable <module>` | Ask the setup questions, show any DNS record needed, start the module |
 | `kit disable <module>` | Stop the module and keep its data |
 | `kit remove <module>` | Delete its data after confirmation |
