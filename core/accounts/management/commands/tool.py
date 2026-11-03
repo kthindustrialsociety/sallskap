@@ -3,10 +3,12 @@ from urllib.parse import urlparse
 from allauth.idp.oidc.adapter import get_adapter
 from allauth.idp.oidc.models import Client
 from django.conf import settings
+from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.core.validators import URLValidator
 
+from accounts.hashers import ToolSecretHasher
 from accounts.login_service import SCOPES
 
 
@@ -41,7 +43,7 @@ class Command(BaseCommand):
         tool.set_default_scopes(SCOPES)
         tool.set_grant_types([Client.GrantType.AUTHORIZATION_CODE])  # no refresh tokens, and no other way in
         tool.set_response_types([Client.ResponseType.CODE])
-        tool.set_secret(secret)
+        tool.secret = make_password(secret, hasher=ToolSecretHasher.algorithm)
         tool.save()
 
         self.stdout.write(f"Registered {name}. Give the tool these settings. The secret is shown once and isn't kept here.")
@@ -52,13 +54,14 @@ class Command(BaseCommand):
 
     def check_callback(self, callback):
         """Registered addresses are matched exactly, so a fragment or wildcard here
-        could only be a mistake, and plain HTTP would expose the login code."""
-        problem = CommandError(f"{callback!r} must be a full https address, with no wildcard or #.")
+        could only be a mistake, plain HTTP would expose the login code, and a
+        password in the address would end up stored in the database."""
+        problem = CommandError(f"{callback!r} must be a full https address, with no wildcard, # or password.")
         try:
             URLValidator(schemes=["https"])(callback)
         except ValidationError as error:
             raise problem from error
-        if "*" in callback or urlparse(callback).fragment or "#" in callback:
+        if "*" in callback or "#" in callback or urlparse(callback).username:
             raise problem
 
     def list(self):

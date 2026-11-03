@@ -534,6 +534,21 @@ class Tools(Service):
         secret = self.read(self.run_command("add", "git", "https://git.example.org/callback"), "Secret")
         self.assertNotIn(secret, Client.objects.get(name="git").secret)
 
+    def test_the_secret_is_long_and_checked_without_argon2(self):
+        """Anyone can try the token address, so a guess mustn't cost 100 MB."""
+        secret = self.read(self.run_command("add", "git", "https://git.example.org/callback"), "Secret")
+        self.assertGreaterEqual(len(secret), 60)
+        self.assertTrue(Client.objects.get(name="git").secret.startswith("sallskap_sha256$"))
+
+    def test_a_tool_added_this_way_can_log_someone_in(self):
+        output = self.run_command("add", "git", CALLBACK)
+        client_id, secret = self.read(output, "Client ID"), self.read(output, "Secret")
+        user, _ = make_user(groups=["member"])
+        self.client.force_login(user)
+        response = self.exchange(self.get_code(client_id=client_id), secret=secret, client_id=client_id)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.verified_claims(response.json()["id_token"], audience=client_id)["groups"], ["member"])
+
     def test_a_new_tool_is_limited_to_the_safe_flow(self):
         self.run_command("add", "git", "https://git.example.org/callback")
         tool = Client.objects.get(name="git")
@@ -554,7 +569,13 @@ class Tools(Service):
         self.assertEqual((after.id, after.secret, after.redirect_uris), (before.id, before.secret, before.redirect_uris))
 
     def test_a_return_address_must_be_a_full_https_address(self):
-        for address in ("http://git.example.org/callback", "git.example.org", "https://*.example.org/x", "https://git.example.org/#x"):
+        for address in (
+            "http://git.example.org/callback",
+            "git.example.org",
+            "https://*.example.org/x",
+            "https://git.example.org/#x",
+            "https://user:password@git.example.org/callback",
+        ):
             with self.subTest(address), self.assertRaisesRegex(CommandError, "https"):
                 self.run_command("add", "git", address)
         self.assertFalse(Client.objects.filter(name="git").exists())
