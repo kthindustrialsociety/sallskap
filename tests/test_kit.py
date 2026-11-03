@@ -492,6 +492,30 @@ class Docker(unittest.TestCase):
         self.assertEqual(self.calls[-1][-3:], ["create_admin", "o'brien@kth.se", "--reset-2fa"])
 
 
+    def test_tool_commands_reach_core(self):
+        self.run_kit("tool", "add", "git", "https://git.example.org/callback")
+        self.assertEqual(self.calls[-1][-5:], ["manage.py", "tool", "add", "git", "https://git.example.org/callback"])
+        self.run_kit("tool", "list")
+        self.assertEqual(self.calls[-1][-2:], ["tool", "list"])
+        self.run_kit("tool", "remove", "git")
+        self.assertEqual(self.calls[-1][-3:], ["tool", "remove", "git"])
+
+    def test_tool_commands_refuse_what_could_be_read_as_an_option(self):
+        for args in (
+            ("tool", "add", "--help=x", "https://git.example.org/callback"),
+            ("tool", "add", "git", "--settings=x"),
+            ("tool", "add", "Git Tool", "https://git.example.org/callback"),
+            ("tool", "add", "git", "http://git.example.org/callback"),
+            ("tool", "remove", "--force"),
+        ):
+            with self.subTest(args), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    code, _ = self.run_kit(*args)
+                except SystemExit as stopped:  # argparse refuses some of these itself
+                    code = stopped.code
+                self.assertNotEqual(code, 0)
+        self.assertEqual(self.calls, [])
+
 
 class Status(unittest.TestCase):
     def setUp(self):

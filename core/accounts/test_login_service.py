@@ -1,6 +1,7 @@
 """The login service for other tools, tested with a fake tool and fake users."""
 
 import base64
+import io
 import json
 from datetime import timedelta
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import Group
+from django.core.management import CommandError, call_command
 from django.test import override_settings
 from django.urls import resolve, reverse
 from django.utils import timezone
@@ -507,3 +509,81 @@ class Logout(Service):
         response = self.client.get("/identity/o/logout")
         self.assertEqual(response.status_code, 200)
         self.assert_logged_in()
+
+
+class Tools(Service):
+    """The commands behind `kit tool`."""
+
+    def run_command(self, *args):
+        output = io.StringIO()
+        call_command("tool", *args, stdout=output)
+        return output.getvalue()
+
+    def read(self, output, label):
+        return next(line.split(":", 1)[1].strip() for line in output.splitlines() if line.strip().startswith(label))
+
+    def test_adding_a_tool_prints_its_settings_and_the_secret_works(self):
+        output = self.run_command("add", "git", "https://git.example.org/callback")
+        self.assertEqual(self.read(output, "Issuer"), f"https://{settings.APP_HOST}")
+        client_id, secret = self.read(output, "Client ID"), self.read(output, "Secret")
+        tool = Client.objects.get(id=client_id)
+        self.assertEqual(tool.name, "git")
+        self.assertTrue(tool.check_secret(secret))
+
+    def test_the_secret_is_not_stored_as_written(self):
+        secret = self.read(self.run_command("add", "git", "https://git.example.org/callback"), "Secret")
+        self.assertNotIn(secret, Client.objects.get(name="git").secret)
+
+    def test_a_new_tool_is_limited_to_the_safe_flow(self):
+        self.run_command("add", "git", "https://git.example.org/callback")
+        tool = Client.objects.get(name="git")
+        self.assertEqual(tool.get_grant_types(), ["authorization_code"])
+        self.assertEqual(tool.get_response_types(), ["code"])
+        self.assertEqual(tool.type, Client.Type.CONFIDENTIAL)
+        self.assertEqual(tool.get_redirect_uris(), ["https://git.example.org/callback"])
+        self.assertFalse(tool.allow_uri_wildcards)
+        self.assertTrue(tool.skip_consent)
+        self.assertEqual(set(tool.get_scopes()), set(SCOPES))
+
+    def test_adding_a_tool_twice_changes_nothing(self):
+        self.run_command("add", "git", "https://git.example.org/callback")
+        before = Client.objects.get(name="git")
+        with self.assertRaisesRegex(CommandError, "already"):
+            self.run_command("add", "git", "https://other.example.org/callback")
+        after = Client.objects.get(name="git")
+        self.assertEqual((after.id, after.secret, after.redirect_uris), (before.id, before.secret, before.redirect_uris))
+
+    def test_a_return_address_must_be_a_full_https_address(self):
+        for address in ("http://git.example.org/callback", "git.example.org", "https://*.example.org/x", "https://git.example.org/#x"):
+            with self.subTest(address), self.assertRaisesRegex(CommandError, "https"):
+                self.run_command("add", "git", address)
+        self.assertFalse(Client.objects.filter(name="git").exists())
+
+    def test_listing_shows_tools_and_no_secrets(self):
+        secret = self.read(self.run_command("add", "git", "https://git.example.org/callback"), "Secret")
+        output = self.run_command("list")
+        self.assertIn("git", output)
+        self.assertIn("https://git.example.org/callback", output)
+        self.assertNotIn(secret, output)
+
+    def test_removing_a_tool_ends_its_access(self):
+        user, _ = make_user()
+        self.client.force_login(user)
+        access_token = self.exchange(self.get_code()).json()["access_token"]
+        self.run_command("remove", "tool")
+        self.assertFalse(Client.objects.filter(name="tool").exists())
+        response = CaddyClient().get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
+        self.assertEqual(response.status_code, 401)
+
+    def test_removing_an_unknown_tool_is_refused(self):
+        with self.assertRaisesRegex(CommandError, "No tool"):
+            self.run_command("remove", "nope")
+
+
+class OperatorsAndTools(Service):
+    def test_only_the_kit_manages_tools(self):
+        """Adding a tool decides who gets people's details, so it stays with root."""
+        user, _ = make_user(groups=["operator"], two_factor=True)
+        self.client.force_login(user)
+        self.assertEqual(self.client.get("/admin/allauth_idp_oidc/client/").status_code, 403)
+        self.assertEqual(self.client.get("/admin/allauth_idp_oidc/token/").status_code, 403)
