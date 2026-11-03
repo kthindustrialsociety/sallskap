@@ -4,6 +4,7 @@ set -e
 python manage.py migrate --noinput
 python manage.py createcachetable
 python manage.py clearsessions  # Django keeps expired sessions until told otherwise
+python manage.py oidc_cleartokens
 
 # One process, so memory stays predictable: each thread can hold one Argon2
 # password check of about 100 MB, and the container's limit has to cover them all.
