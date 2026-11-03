@@ -1,5 +1,6 @@
 """Run from the repo root with: python3 -m unittest discover -s tests"""
 
+import contextlib
 import importlib.util
 import io
 import re
@@ -9,6 +10,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("kit", ROOT / "kit" / "kit.py")
@@ -371,14 +373,138 @@ class Core(unittest.TestCase):
 
     def test_email_addresses_are_checked_before_reaching_the_container(self):
         self.assertEqual(kit._check_email(" First.Admin@Example.org "), "first.admin@example.org")
-        for bad in ("nope", "--settings=x@example.org", "a b@example.org", ""):
+        for bad in ("nope", "--settings=x@example.org", ""):
             with self.assertRaisesRegex(kit.KitError, "valid email"):
                 kit._check_email(bad)
+
+    def test_kit_leaves_the_real_address_check_to_django(self):
+        """Otherwise someone an Operator added on the admin page couldn't get a link."""
+        self.assertEqual(kit._check_email("o'brien@kth.se"), "o'brien@kth.se")
 
     def test_the_uid_given_the_data_folder_is_the_one_core_runs_as(self):
         dockerfile = (ROOT / "core" / "Dockerfile").read_text()
         self.assertIn(f"USER {kit.CORE_UID}:{kit.CORE_UID}", dockerfile)
         self.assertIn(f"--uid {kit.CORE_UID} ", dockerfile)
+
+
+class Docker(unittest.TestCase):
+    """Runs kit's commands with Docker replaced, recording what it was asked to do."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.calls = []
+        self.broken = ()  # services that fail to start
+
+        real_run = subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[0] != "docker":
+                return real_run(command, *args, **kwargs)
+            self.calls.append(command)
+            if "up" in command and any(service in command for service in self.broken):
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        for patcher in (
+            mock.patch.object(kit.subprocess, "run", fake_run),
+            mock.patch.object(kit, "Paths", return_value=self.paths),
+            mock.patch.object(kit, "status", return_value=0),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_kit(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kit.main(list(args))
+        return code, out.getvalue()
+
+    def starts(self):
+        return [call[call.index("up") :] for call in self.calls if "up" in call]
+
+    def test_website_commands_only_touch_caddy(self):
+        self.run_kit("site", "add", "x.org")
+        self.run_kit("site", "remove", "x.org")
+        self.assertTrue(self.starts())
+        for start in self.starts():
+            self.assertIn("caddy", start)
+            self.assertNotIn("core", start)
+            self.assertNotIn("--wait", start)
+
+    def test_a_broken_core_cannot_stop_a_site_being_added(self):
+        self.broken = ("core",)
+        code, out = self.run_kit("site", "add", "x.org")
+        self.assertEqual(code, 0)
+        self.assertIn("PRIVATE KEY", out)
+
+    def test_a_new_deploy_key_is_shown_even_if_the_web_server_fails(self):
+        self.broken = ("caddy",)
+        code, out = self.run_kit("site", "add", "x.org")
+        self.assertEqual(code, 1)
+        self.assertIn("PRIVATE KEY", out)
+
+    def test_apply_starts_caddy_then_waits_for_core(self):
+        self.run_kit("apply")
+        self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"]])
+
+    def test_apply_only_rebuilds_when_asked(self):
+        self.run_kit("apply", "--build")
+        self.assertEqual(self.starts()[-1], ["up", "-d", "--wait", "--build", "core"])
+
+    def test_a_broken_core_cannot_hold_up_the_web_server(self):
+        self.run_kit("apply")
+        self.calls.clear()
+        self.broken = ("core",)
+        code, _ = self.run_kit("apply")
+        self.assertEqual(code, 1)
+        self.assertTrue(any("reload" in call for call in self.calls))
+
+    def test_init_shows_what_dns_is_needed(self):
+        self.paths.config.unlink()
+        self.run_kit("init", "example.org")
+        kit.status.assert_called_once()
+
+    def test_admin_passes_on_only_what_was_asked_for(self):
+        self.run_kit("admin", "o'brien@kth.se")
+        self.assertEqual(self.calls[-1][-2:], ["create_admin", "o'brien@kth.se"])
+        self.run_kit("admin", "o'brien@kth.se", "--reset-2fa")
+        self.assertEqual(self.calls[-1][-3:], ["create_admin", "o'brien@kth.se", "--reset-2fa"])
+
+
+class Status(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"203.0.113.1"
+        patcher = mock.patch.object(kit.urllib.request, "urlopen", return_value=response)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_status(self, addresses):
+        out = io.StringIO()
+        with mock.patch.object(kit, "_resolve_ipv4", return_value=addresses), contextlib.redirect_stdout(out):
+            code = kit.status(self.paths)
+        return code, out.getvalue()
+
+    def test_a_missing_record_for_the_app_hostname_is_reported(self):
+        code, out = self.run_status(set())
+        self.assertEqual(code, 1)
+        self.assertIn("Add this record: app.example.org A 203.0.113.1", out)
+
+    def test_the_app_hostname_pointing_here_is_fine(self):
+        code, out = self.run_status({"203.0.113.1"})
+        self.assertEqual(code, 0)
+        self.assertIn("ok   app.example.org", out)
 
 
 class CommandLine(unittest.TestCase):

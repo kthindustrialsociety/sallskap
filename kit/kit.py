@@ -278,14 +278,14 @@ def prepare_core(paths: Paths, config: Config) -> None:
         os.chown(paths.core_dir, CORE_UID, CORE_UID)
 
 
-def apply(paths: Paths, build: bool = False) -> None:
-    """Start the containers. Caddy's new config is validated inside its container
-    before the switch, so a bad one changes nothing."""
+def apply_web(paths: Paths) -> None:
+    """Start Caddy and switch it to the current config. The config is validated
+    inside its container first, so a bad one changes nothing. Core isn't involved,
+    so the public sites don't depend on it."""
     config = load_config(paths)
-    prepare_core(paths, config)
+    prepare_core(paths, config)  # Compose reads core's settings file for every command
     text = render_caddyfile(config)
-    # --wait means that when this returns, core has finished migrating.
-    start = _compose("up", "-d", "--wait", *(["--build"] if build else []), "core", "caddy")
+    start = _compose("up", "-d", "caddy")
     if not paths.caddyfile.exists():
         _write_atomic(paths.caddyfile, text)
         subprocess.run(start, check=True)
@@ -310,6 +310,13 @@ def apply(paths: Paths, build: bool = False) -> None:
     )
 
 
+def apply(paths: Paths, build: bool = False) -> None:
+    """Start everything. Caddy goes first, so a problem with core can't hold up the
+    public sites. With --wait, core has finished migrating when this returns."""
+    apply_web(paths)
+    subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
+
+
 # ---- Core: accounts ----------------------------------------------------------
 
 
@@ -319,8 +326,9 @@ def _manage(*args: str) -> int:
 
 
 def _check_email(address: str) -> str:
+    """Django checks the address properly. This only stops it being read as an option."""
     address = address.strip().lower()
-    if address.startswith("-") or not EMAIL.fullmatch(address):
+    if address.startswith("-") or "@" not in address:
         raise KitError(f"{address!r} isn't a valid email address.")
     return address
 
@@ -492,6 +500,17 @@ def _resolve_ipv4(name: str) -> set[str]:
         return set()
 
 
+def _check_dns(name: str, server_ip: str) -> int:
+    """Print whether a hostname points here, and return the number of problems."""
+    addresses = _resolve_ipv4(name)
+    if server_ip in addresses and len(addresses) == 1:
+        print(f"  ok   {name}")
+        return 0
+    found = ", ".join(sorted(addresses)) or "nothing"
+    print(f"  DNS  {name} points at {found}. Add this record: {name} A {server_ip}")
+    return 1
+
+
 def status(paths: Paths) -> int:
     config = load_config(paths)
     try:
@@ -501,19 +520,14 @@ def status(paths: Paths) -> int:
         raise KitError(f"Couldn't look up this server's public address: {error}") from error
 
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
-    problems = 0
+    print("Login and admin page:")
+    problems = _check_dns(f"app.{config.domain}", server_ip)
     for site in config.sites:
         current = paths.site_dir(site.domain) / "current"
         published = current.resolve().name if current.exists() else "nothing published yet"
         print(f"{site.domain}: {published}")
         for name in (site.domain, *site.redirects):
-            addresses = _resolve_ipv4(name)
-            if server_ip in addresses and len(addresses) == 1:
-                print(f"  ok   {name}")
-            else:
-                problems += 1
-                found = ", ".join(sorted(addresses)) or "nothing"
-                print(f"  DNS  {name} points at {found}. Add this record: {name} A {server_ip}")
+            problems += _check_dns(name, server_ip)
     return 1 if problems else 0
 
 
@@ -526,7 +540,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="create the first config").add_argument("domain", help="the primary domain")
     apply_command = commands.add_parser("apply", help="start the containers and switch to the current web server config")
     apply_command.add_argument("--build", action="store_true", help="rebuild core first, after its code has changed")
-    commands.add_parser("admin", help="create the first admin, or restore someone's Operator access").add_argument("email")
+    admin = commands.add_parser("admin", help="create the first admin, or restore someone's Operator access")
+    admin.add_argument("email")
+    admin.add_argument("--reset-2fa", action="store_true", help="also remove their 2FA, if they've lost their phone and codes")
     commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
 
@@ -558,11 +574,12 @@ def main(argv: list[str] | None = None) -> int:
             apply(paths)
             print(f"Created {paths.config}.")
             print("Create the first admin with: kit admin you@example.org")
-            print(f"Add a public site with: kit site add {args.domain}")
+            print(f"Add a public site with: kit site add {args.domain}\n")
+            status(paths)
         elif args.command == "apply":
             apply(paths, build=args.build)
         elif args.command == "admin":
-            return _manage("create_admin", _check_email(args.email))
+            return _manage("create_admin", _check_email(args.email), *(["--reset-2fa"] if args.reset_2fa else []))
         elif args.command == "link":
             return _manage("password_link", _check_email(args.email))
         elif args.command == "status":
@@ -570,13 +587,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "add":
             site = Site(args.domain, tuple(args.alias), not args.no_spa, args.www)
             add_site(paths, site)
-            private = create_deploy_key(paths, site.domain)
-            apply(paths)
-            _print_deploy_key(site.domain, private)
+            # Shown first: it's kept nowhere else, so a later failure mustn't lose it.
+            _print_deploy_key(site.domain, create_deploy_key(paths, site.domain))
+            apply_web(paths)
             status(paths)
         elif args.action == "remove":
             remove_site(paths, args.domain)
-            apply(paths)
+            apply_web(paths)
             print(f"Removed {args.domain}. Its files remain in {paths.site_dir(args.domain)}.")
         elif args.action == "rollback":
             print(f"{args.domain} now serves {rollback(paths, args.domain).name}.")
