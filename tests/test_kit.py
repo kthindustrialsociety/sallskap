@@ -1,5 +1,6 @@
 """Run from the repo root with: python3 -m unittest discover -s tests"""
 
+import base64
 import contextlib
 import importlib.util
 import io
@@ -340,6 +341,11 @@ class Core(unittest.TestCase):
         self.assertIn("SALLSKAP_DOMAIN=example.org\n", text)
         self.assertRegex(text, r"DJANGO_SECRET_KEY=[\w-]{60,}\n")
 
+    def test_it_makes_a_real_signing_key_on_one_line(self):
+        kit.prepare_core(self.paths, self.config)
+        encoded = re.search(r"OIDC_SIGNING_KEY=(.+)\n", self.paths.core_env.read_text()).group(1)
+        self.assertIn(b"BEGIN PRIVATE KEY", base64.b64decode(encoded))
+
     def test_core_data_folder_is_private(self):
         kit.prepare_core(self.paths, self.config)
         self.assertEqual(self.paths.core_dir.stat().st_mode & 0o777, 0o700)
@@ -361,10 +367,20 @@ class Core(unittest.TestCase):
     def test_changing_the_domain_keeps_the_secret_key(self):
         kit.prepare_core(self.paths, self.config)
         key = re.search(r"DJANGO_SECRET_KEY=(.+)", self.paths.core_env.read_text()).group(1)
+        signing_key = re.search(r"OIDC_SIGNING_KEY=(.+)", self.paths.core_env.read_text()).group(1)
         kit.prepare_core(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
         text = self.paths.core_env.read_text()
         self.assertIn("SALLSKAP_DOMAIN=new.org\n", text)
         self.assertIn(f"DJANGO_SECRET_KEY={key}\n", text)
+        self.assertIn(f"OIDC_SIGNING_KEY={signing_key}\n", text)
+
+    def test_an_installation_from_before_the_login_service_gets_a_signing_key(self):
+        self.paths.config_dir.mkdir()
+        self.paths.core_env.write_text("SALLSKAP_DOMAIN=example.org\nDJANGO_SECRET_KEY=keep-this\n")
+        kit.prepare_core(self.paths, self.config)
+        text = self.paths.core_env.read_text()
+        self.assertIn("DJANGO_SECRET_KEY=keep-this\n", text)
+        self.assertIn("OIDC_SIGNING_KEY=", text)
 
     def test_secrets_stay_out_of_git(self):
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True).stdout
@@ -474,6 +490,7 @@ class Docker(unittest.TestCase):
         self.assertEqual(self.calls[-1][-2:], ["create_admin", "o'brien@kth.se"])
         self.run_kit("admin", "o'brien@kth.se", "--reset-2fa")
         self.assertEqual(self.calls[-1][-3:], ["create_admin", "o'brien@kth.se", "--reset-2fa"])
+
 
 
 class Status(unittest.TestCase):

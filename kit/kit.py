@@ -6,6 +6,7 @@ installed. Needs Python 3.11 or newer.
 """
 
 import argparse
+import base64
 import fcntl
 import os
 import re
@@ -260,16 +261,25 @@ def _compose(*args: str) -> list[str]:
     return ["docker", "compose", "--project-directory", str(ROOT), *args]
 
 
+def _new_signing_key() -> str:
+    """The login service signs what it tells other tools with this."""
+    command = ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"]
+    pem = subprocess.run(command, check=True, capture_output=True).stdout
+    return base64.b64encode(pem).decode()  # on one line, for the settings file
+
+
 def prepare_core(paths: Paths, config: Config) -> None:
-    """Give core its folder and settings. The secret key is made once and then
-    kept: a new one would log everyone out and cancel every password link."""
+    """Give core its folder and settings. The secrets are made once and then kept:
+    a new secret key would log everyone out and cancel every password link, and
+    a new signing key would make every tool stop trusting the login service."""
     current = {}
     if paths.core_env.exists():
         for line in paths.core_env.read_text("utf-8").splitlines():
             name, _, value = line.partition("=")
             current[name] = value
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
-    text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\n"
+    signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
+    text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\nOIDC_SIGNING_KEY={signing_key}\n"
     if not paths.core_env.exists() or paths.core_env.read_text("utf-8") != text:
         _write_atomic(paths.core_env, text, 0o600)
 
