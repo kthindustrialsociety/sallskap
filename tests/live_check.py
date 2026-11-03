@@ -205,10 +205,16 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 print(json.dumps({
     "users": sorted(get_user_model().objects.values_list("email", "password")),
-    "groups": sorted((g.pk, g.name, g.role.key, sorted(g.permissions.values_list("pk", flat=True))) for g in Group.objects.all()),
+    "groups": sorted((g.pk, g.name, sorted(g.permissions.values_list("pk", flat=True))) for g in Group.objects.all()),
 }))
 """
     return json.loads(in_core(code).splitlines()[-1])
+
+
+def ssh_port():
+    settings = subprocess.run(["sshd", "-T"], capture_output=True, text=True).stdout
+    found = re.search(r"^port (\d+)$", settings, re.M)
+    return found.group(1) if found else "22"
 
 
 def env_fingerprint():
@@ -243,7 +249,7 @@ def check_exposure(host):
         if address.startswith(("127.", "[::1]")):
             continue
         open_ports.add(address.rsplit(":", 1)[1])
-    check("The server only listens on SSH, HTTP and HTTPS", open_ports <= {"22", "80", "443"}, str(sorted(open_ports)))
+    check("The server only listens on SSH, HTTP and HTTPS", open_ports <= {ssh_port(), "80", "443"}, str(sorted(open_ports)))
 
     public_ip = socket.gethostbyname(host)
     try:
@@ -255,7 +261,7 @@ def check_exposure(host):
     firewall = subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout
     check("The firewall is on", "Status: active" in firewall)
     allowed = {line.split()[0] for line in firewall.splitlines() if " ALLOW " in line}
-    expected = {"22/tcp", "80/tcp", "443/tcp", "443/udp"}
+    expected = {f"{ssh_port()}/tcp", "80/tcp", "443/tcp", "443/udp"}
     check("The firewall only allows SSH, HTTP and HTTPS", allowed <= expected, str(sorted(allowed)))
 
     data = subprocess.run(["stat", "-c", "%u %a", "/srv/core"], capture_output=True, text=True).stdout.strip()
@@ -423,7 +429,7 @@ def check_access(host, operator, secrets_by_name):
     )
     check("Django's own admin login can't log anyone in", not direct.logged_in(), str(response.status))
 
-    for path in ("/accounts/signup/", "/accounts/password/reset/", "/accounts/email/"):
+    for path in ("/accounts/signup/", "/accounts/password/reset/", "/accounts/password/set/", "/accounts/email/"):
         status = Browser(host).get(path).status
         check(f"{path} doesn't exist", status == 404, str(status))
 
@@ -462,6 +468,30 @@ def check_links(host, secrets_by_name):
     check("kit link refuses an unknown person", refused.returncode != 0, refused.stdout)
 
 
+def check_recovery(host):
+    section("Getting back in")
+    clear_limits()
+    locked = Browser(host)
+    for _ in range(5):
+        locked.log_in(email_of("fake-lockme"), "not-the-password-at-all")
+    locked.log_in(email_of("fake-lockme"))
+    check("Someone can be locked out at their address", not locked.logged_in())
+    kit("admin", email_of("fake-lockme"))
+    locked.log_in(email_of("fake-lockme"))
+    check("kit admin clears a lockout", locked.logged_in())
+
+    before = Browser(host)
+    before.log_in(email_of("fake-wrongcode"))
+    check("Before a 2FA reset, a password alone doesn't log in", not before.logged_in())
+    output = kit("admin", email_of("fake-wrongcode"), "--reset-2fa")
+    after = Browser(host)
+    after.log_in(email_of("fake-wrongcode"))
+    check("kit admin --reset-2fa removes 2FA", after.logged_in(), output.stdout + output.stderr)
+    _, visited = after.follow("/admin/")
+    check("...and they have to set it up again", "/accounts/2fa/" in visited[-1], str(visited))
+    clear_limits()
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -476,6 +506,7 @@ def prepare():
     # Each code works once, so the next users log in with their own fresh ones.
     check_access(host, operator, secrets_by_name)
     check_links(host, secrets_by_name)
+    check_recovery(host)
 
     keeper = Browser(host)
     keeper.log_in(email_of("fake-member"))
