@@ -49,7 +49,7 @@ kit tool list
 kit tool remove forgejo                                                  # ends its access
 ```
 
-A tool can ask for the scopes `openid`, `email`, `profile` and `groups`. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent by name. A tool only hears about changes when someone logs in to it.
+A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`, as `preferred_username` isn't unique. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent as `custom:<name>`. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
 
 ## Tests
 
