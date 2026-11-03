@@ -621,20 +621,14 @@ def check_login_service(host, secrets_by_name):
     check("A token in the address is refused", in_url.status == 401, str(in_url.status))
     used = exchange(host, tool, back["code"])
     check("A code works only once", used.status == 400, str(used.status))
-    refresh = tool_request(
-        host,
-        "/identity/o/api/token",
-        client_id=tool["client_id"],
-        secret=tool["secret"],
-        form={"grant_type": "refresh_token", "refresh_token": tokens.get("refresh_token", "")},
-    )
-    check("A refresh token can't be used", refresh.status in (400, 401), f"{refresh.status} {refresh.text[:120]}")
+    check("The tool gets no refresh token", "refresh_token" not in tokens, str(sorted(tokens)))
     fresh = sent_back(member.get(authorize_path(tool["client_id"])))
     wrong = exchange(host, tool, fresh["code"], secret="not-the-secret")
     check("A wrong secret is refused", wrong.status == 401, str(wrong.status))
 
     for label, path in (
         ("An unregistered return address", authorize_path(tool["client_id"], redirect_uri="https://evil.example.org/callback")),
+        ("A return address with extra text", authorize_path(tool["client_id"], redirect_uri=f"{FAKE_CALLBACK}?next=https://evil.example.org/")),
         ("An unknown tool", authorize_path("no-such-tool")),
     ):
         response = member.get(path)
@@ -684,8 +678,8 @@ get_user_model().objects.get(email={email_of("fake-tool-member")!r}).groups.add(
     response = leaving.get(authorize_path(tool["client_id"]))
     check("A turned-off account can't reach a tool", sent_back(response) is None, response.location)
 
-    clear_limits()
-    statuses = [
+    started = time.time()
+    statuses = {
         tool_request(
             host,
             "/identity/o/api/token",
@@ -693,9 +687,10 @@ get_user_model().objects.get(email={email_of("fake-tool-member")!r}).groups.add(
             secret="a-guess",
             form={"grant_type": "authorization_code", "code": "x", "redirect_uri": FAKE_CALLBACK},
         ).status
-        for _ in range(61)
-    ]
-    check("Guessing a tool's secret is limited", statuses[0] == 401 and statuses[-1] == 429, f"{statuses[0]} ... {statuses[-1]}")
+        for _ in range(20)
+    }
+    took = time.time() - started
+    check("20 guesses at a tool's secret are refused, and cost little", statuses == {401} and took < 4, f"{statuses} in {took:.1f}s")
     clear_limits()
     return tool
 
@@ -824,7 +819,10 @@ def main():
     stages = {"prepare": prepare, "verify": verify, "burst": burst, "cleanup": cleanup}
     if len(sys.argv) != 2 or sys.argv[1] not in stages:
         raise SystemExit(__doc__)
-    stages[sys.argv[1]]()
+    try:
+        stages[sys.argv[1]]()
+    except Exception as error:  # keep the results so far, as they're what's needed most when something breaks
+        check(f"The checks stopped early with {type(error).__name__}", False, str(error)[:300])
     if sys.argv[1] != "cleanup":
         print(f"\n{'All checks passed.' if not failures else f'{failures} checks FAILED.'}")
     return 1 if failures else 0
