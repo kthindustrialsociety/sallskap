@@ -74,9 +74,10 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def group_keys(self):
         """What other tools are told. Built-in groups go by their fixed key, so
-        renaming one can't silently change what someone can do in a tool."""
+        renaming one can't silently change what someone can do in a tool. Others are
+        marked as custom, so one named "operator" can't pass for the real thing."""
         groups = self.groups.select_related("role")
-        return sorted(group.role.key if hasattr(group, "role") else group.name for group in groups)
+        return sorted(group.role.key if hasattr(group, "role") else f"custom:{group.name}" for group in groups)
 
     # A property rather than Django's usual stored flag, so groups alone decide:
     # removing someone from a group removes their admin access at their next click.

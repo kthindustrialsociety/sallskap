@@ -577,6 +577,10 @@ class Packaging(unittest.TestCase):
         for name, text in compose_services().items():
             self.assertIn("mem_limit:", text, f"{name} has no memory limit")
 
+    def test_core_refuses_to_start_without_its_signing_key(self):
+        """Otherwise it looks fine until the first login to a tool fails."""
+        self.assertRegex((ROOT / "core" / "start.sh").read_text(), r"(?m)^: \"\$\{OIDC_SIGNING_KEY:\?")
+
     def test_core_runs_locked_down(self):
         text = compose_services()["core"]
         self.assertIn("read_only: true", text)

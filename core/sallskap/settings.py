@@ -111,7 +111,10 @@ CSRF_COOKIE_SECURE = True
 
 # ---- Accounts -----------------------------------------------------------------
 
-PASSWORD_HASHERS = ["django.contrib.auth.hashers.Argon2PasswordHasher"]
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",  # the first is what people's passwords get
+    "accounts.hashers.ToolSecretHasher",
+]
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
@@ -148,8 +151,6 @@ IDP_OIDC_ADAPTER = "accounts.login_service.LoginServiceAdapter"
 IDP_OIDC_PRIVATE_KEY = base64.b64decode(os.environ.get("OIDC_SIGNING_KEY", "")).decode()
 IDP_OIDC_AUTH_METHODS = ["client_secret_basic", "client_secret_post"]  # every tool has a secret
 IDP_OIDC_ACCESS_TOKEN_EXPIRES_IN = 10 * 60  # tools only need it just after someone logs in
-IDP_OIDC_REFRESH_TOKEN_EXPIRES_IN = 10 * 60  # always issued, never usable: tools aren't allowed that flow
-IDP_OIDC_RATE_LIMITS = {"token": "60/m/ip"}  # each attempt costs a 100 MB password check
 
 # Nothing sends mail yet. Until it does, people get in with `kit link`.
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
