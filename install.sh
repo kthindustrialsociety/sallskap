@@ -230,6 +230,19 @@ configure_firewall() {
   ok "Open: $ssh_port/tcp, 80/tcp, 443/tcp, 443/udp"
 }
 
+# Debian's resolver also answers local-network name lookups on port 5355. The
+# firewall blocks it, but a server has no use for it, so it shouldn't listen at all.
+disable_llmnr() {
+  systemctl is-active --quiet systemd-resolved || return 0
+  local conf=/etc/systemd/resolved.conf.d/sallskap.conf
+  local wanted=$'[Resolve]\nLLMNR=no'
+  [[ "$(cat "$conf" 2>/dev/null)" == "$wanted" ]] && return 0
+  step "Turning off local-network name lookups"
+  install -d -m 0755 /etc/systemd/resolved.conf.d
+  printf '%s\n' "$wanted" >"$conf"
+  systemctl restart systemd-resolved
+}
+
 install_docker() {
   step "Installing Docker"
   local id codename arch
@@ -336,6 +349,7 @@ main() {
   enable_automatic_updates
   secure_ssh
   configure_firewall
+  disable_llmnr
   install_docker
   prepare_folders
   fetch_kit
