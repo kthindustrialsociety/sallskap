@@ -813,7 +813,7 @@ class Commands(Base):
 
 class Deployment(Base):
     def test_passwords_are_hashed_with_argon2(self):
-        self.assertEqual(settings.PASSWORD_HASHERS, ["django.contrib.auth.hashers.Argon2PasswordHasher"])
+        self.assertEqual(settings.PASSWORD_HASHERS[0], "django.contrib.auth.hashers.Argon2PasswordHasher")
         self.assertTrue(make_password("anything").startswith("argon2"))
         user, _ = make_user(password=PASSWORD)
         self.assertTrue(user.password.startswith("argon2"))

@@ -1,11 +1,9 @@
-from allauth.core.internal import ratelimit
-from allauth.idp.oidc import views as provider_views
 from django.contrib import admin
 from django.http import Http404
 from django.urls import include, path, re_path
 
 from accounts import views
-from accounts.login_service import AuthorizationView
+from accounts.login_service import AuthorizationView, TokenView
 
 
 def not_found(request, *args, **kwargs):
@@ -26,6 +24,6 @@ urlpatterns = [
     # around the 2FA rule, and tools are only added through `kit`.
     re_path(r"^identity/o/(?!(authorize|logout|api/token|api/userinfo)$)", not_found),
     path("identity/o/authorize", AuthorizationView.as_view()),
-    path("identity/o/api/token", ratelimit.decorator(app="allauth.idp.oidc", action="token")(provider_views.token)),
+    path("identity/o/api/token", TokenView.as_view()),
     path("", include("allauth.idp.urls")),
 ]

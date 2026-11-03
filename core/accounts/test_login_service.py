@@ -7,10 +7,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import allauth.idp.urls
 import jwt
+from allauth.idp.oidc.internal.oauthlib.server import get_server
 from allauth.idp.oidc.models import Client, Token
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.conf import settings
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import Group
 from django.test import override_settings
 from django.urls import resolve, reverse
@@ -36,7 +38,7 @@ def make_tool(name="tool", callback=CALLBACK, secret=TOOL_SECRET):
     tool = Client(name=name, skip_consent=True)
     tool.set_redirect_uris([callback])
     tool.set_scopes(SCOPES)
-    tool.set_secret(secret)
+    tool.secret = make_password(secret, hasher="sallskap_sha256")
     tool.save()
     return tool
 
@@ -291,7 +293,14 @@ class Claims(Service):
     def test_a_group_an_operator_added_goes_by_its_name(self):
         user, _ = make_user(groups=["member"])
         user.groups.add(Group.objects.create(name="Robotics"))
-        self.assertEqual(self.login_claims(user)["groups"], ["Robotics", "member"])
+        self.assertEqual(self.login_claims(user)["groups"], ["custom:Robotics", "member"])
+
+    def test_a_group_an_operator_added_cannot_pass_for_a_built_in_one(self):
+        """It wouldn't carry the 2FA rule, but a tool would treat its members as Operators."""
+        user, _ = make_user()
+        user.groups.add(Group.objects.create(name="operator"))
+        self.assertFalse(user.requires_2fa)
+        self.assertEqual(self.login_claims(user)["groups"], ["custom:operator"])
 
     def test_a_tool_only_gets_what_it_asked_for(self):
         user, _ = make_user(groups=["member"])
@@ -339,26 +348,42 @@ class Tokens(Service):
         access_token = self.exchange(self.get_code()).json()["access_token"]
         self.assertEqual(CaddyClient().get(f"{USERINFO_URL}?access_token={access_token}").status_code, 401)
 
-    def test_a_refresh_token_cannot_be_used(self):
-        """oauthlib always issues one. If it worked, a tool could keep getting new
-        tokens for someone long after they'd left, without them ever logging in."""
+    def test_a_tool_gets_no_refresh_token(self):
+        """Otherwise a tool could keep getting new tokens for someone long after
+        they'd left, without them ever logging in."""
         user, _ = make_user()
         self.client.force_login(user)
-        refresh_token = self.exchange(self.get_code()).json()["refresh_token"]
+        data = self.exchange(self.get_code()).json()
+        self.assertNotIn("refresh_token", data)
+        self.assertIn("access_token", data)
+        self.assertIn("id_token", data)
+        self.assertFalse(Token.objects.filter(type=Token.Type.REFRESH_TOKEN).exists())
+
+    def test_a_refresh_token_would_be_refused_anyway(self):
+        """A second line of defence: a real one, made here, still can't be used."""
+        user, _ = make_user()
+        token_value = "a-real-refresh-token"
+        refresh = Token(client=self.tool, user=user, type=Token.Type.REFRESH_TOKEN)
+        refresh.set_value(token_value)
+        refresh.set_scopes(SCOPES)
+        refresh.save()
         credentials = base64.b64encode(f"{self.tool.id}:{TOOL_SECRET}".encode()).decode()
         response = self.client.post(
             TOKEN_URL,
-            {"grant_type": "refresh_token", "refresh_token": refresh_token},
+            {"grant_type": "refresh_token", "refresh_token": token_value},
             headers={"Authorization": f"Basic {credentials}"},
         )
         self.assertIn(response.status_code, (400, 401))
         self.assertNotIn("access_token", response.json())
 
-    def test_refresh_tokens_expire_and_get_cleaned_up(self):
+    def test_the_library_still_issues_a_refresh_token_or_this_view_can_go(self):
+        self.assertTrue(get_server().auth_grant.refresh_token)
+
+    def test_the_access_token_is_short_lived(self):
         user, _ = make_user()
         self.client.force_login(user)
         self.exchange(self.get_code())
-        token = Token.objects.get(type=Token.Type.REFRESH_TOKEN)
+        token = Token.objects.get(type=Token.Type.ACCESS_TOKEN)
         self.assertLess(token.expires_at, timezone.now() + timedelta(minutes=11))
 
     def test_tokens_are_stored_hashed(self):
@@ -411,11 +436,24 @@ class Refusals(Service):
         self.assertContains(response, "Error")
 
     def test_an_unregistered_return_address_is_refused_with_no_redirect(self):
-        for address in ("https://evil.example.org/callback", f"{CALLBACK}/extra", "https://tool.example.org/"):
+        for address in (
+            "https://evil.example.org/callback",
+            f"{CALLBACK}/extra",
+            "https://tool.example.org/",
+            f"{CALLBACK}?next=https://evil.example.org/",
+            f"{CALLBACK}?",
+            f"{CALLBACK}#fragment",
+        ):
             with self.subTest(address):
                 response = self.client.get(self.authorize_url(redirect_uri=address))
                 self.assertEqual(response.status_code, 200)
                 self.assertNotIn("Location", response.headers)
+
+    def test_a_wrong_return_address_is_refused_before_anyone_logs_in(self):
+        visitor = CaddyClient(ip="198.51.100.7")
+        response = visitor.get(self.authorize_url(redirect_uri=f"{CALLBACK}?next=https://evil.example.org/"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Location", response.headers)
 
     def test_a_scope_the_tool_is_not_allowed_is_refused(self):
         back = self.sent_back(self.client.get(self.authorize_url(scope="openid admin")))
@@ -449,19 +487,17 @@ class Refusals(Service):
         )
         self.assertEqual(response.status_code, 401)
 
-    @override_settings(IDP_OIDC_RATE_LIMITS={"token": "3/m/ip"})
-    def test_guessing_a_secret_is_limited_by_address(self):
-        """Each guess costs a 100 MB password check, so this also protects the server."""
-        for _ in range(3):
-            self.exchange("no-such-code", secret="a-guess")
-        self.assertEqual(self.exchange("no-such-code", secret="a-guess").status_code, 429)
-        other = CaddyClient(ip="198.51.100.7")
-        credentials = base64.b64encode(f"{self.tool.id}:a-guess".encode()).decode()
-        response = other.post(TOKEN_URL, {"grant_type": "authorization_code", "code": "x"}, headers={"Authorization": f"Basic {credentials}"})
-        self.assertEqual(response.status_code, 401)
+    def test_a_tool_secret_can_be_checked_without_argon2(self):
+        """Anyone can try the token address, so a guess mustn't cost 100 MB."""
+        encoded = make_password("a-secret", hasher="sallskap_sha256")
+        self.assertTrue(encoded.startswith("sallskap_sha256$"))
+        self.assertNotIn("a-secret", encoded)
+        self.assertTrue(check_password("a-secret", encoded))
+        self.assertFalse(check_password("a-guess", encoded))
 
-    def test_the_real_limit_is_set(self):
-        self.assertEqual(settings.IDP_OIDC_RATE_LIMITS["token"], "60/m/ip")
+    def test_the_cheap_check_is_never_used_for_a_persons_password(self):
+        user, _ = make_user("someone@example.org", password=PASSWORD)
+        self.assertTrue(user.password.startswith("argon2"))
 
 
 class Logout(Service):
