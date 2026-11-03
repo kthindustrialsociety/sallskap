@@ -45,7 +45,12 @@ FAKE = {
     "fake-lockme": (["member"], False),
     "fake-link": (["member"], False),
     "fake-link-2fa": (["board"], True),
+    "fake-tool-2fa": (["treasurer"], True),
+    "fake-tool-member": (["member"], False),
+    "fake-tool-off": (["member"], False),
 }
+FAKE_TOOL = "fake-tool"
+FAKE_CALLBACK = "https://tool.example.org/callback"
 
 failures = 0
 
@@ -170,6 +175,72 @@ class Browser:
 
 def email_of(name):
     return f"{name}@example.org"
+
+
+def authorize_path(client_id, **params):
+    query = {
+        "client_id": client_id,
+        "redirect_uri": FAKE_CALLBACK,
+        "response_type": "code",
+        "scope": "openid email profile groups",
+        "state": "state-from-the-tool",
+        "nonce": "nonce-from-the-tool",
+        **params,
+    }
+    return f"/identity/o/authorize?{urllib.parse.urlencode(query)}"
+
+
+def sent_back(response):
+    """What the person was sent back to the tool with, if they were."""
+    if response.status != 302 or not response.location.startswith(FAKE_CALLBACK):
+        return None
+    return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(response.location).query))
+
+
+def tool_request(host, path, *, secret=None, client_id=None, bearer=None, form=None):
+    """What a tool's own server sends, which comes with no browser or cookies."""
+    connection = http.client.HTTPSConnection(host, context=ssl.create_default_context(), timeout=30)
+    headers = {}
+    if secret is not None:
+        pair = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
+        headers["Authorization"] = f"Basic {pair}"
+    if bearer is not None:
+        headers["Authorization"] = f"Bearer {bearer}"
+    body = None
+    if form is not None:
+        body = urllib.parse.urlencode(form)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    connection.request("POST" if form is not None else "GET", path, body, headers)
+    response = Response(connection.getresponse())
+    connection.close()
+    return response
+
+
+def exchange(host, tool, code, secret=None):
+    return tool_request(
+        host,
+        "/identity/o/api/token",
+        client_id=tool["client_id"],
+        secret=tool["secret"] if secret is None else secret,
+        form={"grant_type": "authorization_code", "code": code, "redirect_uri": FAKE_CALLBACK},
+    )
+
+
+def verified_claims(host, tool, id_token):
+    """Check the signature against the key published over HTTPS, as a tool would.
+    PyJWT is inside core, and this script sticks to the standard library."""
+    keys = json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"]
+    code = f"""
+import json, jwt
+token, keys = {id_token!r}, {keys!r}
+try:
+    kid = jwt.get_unverified_header(token)["kid"]
+    key = next(jwt.PyJWK(k).key for k in keys if k["kid"] == kid)
+    print(json.dumps(jwt.decode(token, key, algorithms=["RS256"], audience={tool["client_id"]!r}, issuer={f"https://{host}"!r})))
+except Exception as error:
+    print(json.dumps({{"refused": type(error).__name__}}))
+"""
+    return json.loads(in_core(code).splitlines()[-1])
 
 
 def create_fake_users():
@@ -492,6 +563,143 @@ def check_recovery(host):
     clear_limits()
 
 
+def check_login_service(host, secrets_by_name):
+    section("Login service for other tools")
+    clear_limits()
+    output = kit("tool", "add", FAKE_TOOL, FAKE_CALLBACK)
+    fields = dict(re.findall(r"^\s+(Issuer|Client ID|Secret):\s+(\S+)$", output.stdout, re.M))
+    check("kit tool add prints the settings a tool needs", len(fields) == 3, output.stdout + output.stderr)
+    if len(fields) != 3:
+        return None
+    tool = {"client_id": fields["Client ID"], "secret": fields["Secret"]}
+    check("kit tool add gives the right issuer", fields["Issuer"] == f"https://{host}", fields["Issuer"])
+    again = kit("tool", "add", FAKE_TOOL, FAKE_CALLBACK)
+    check("Adding the same tool twice is refused", again.returncode != 0, again.stdout)
+    check("kit tool list shows it, with no secret", FAKE_TOOL in (listed := kit("tool", "list").stdout) and tool["secret"] not in listed, listed)
+
+    data = json.loads(Browser(host).get("/.well-known/openid-configuration").text)
+    check("Tools can find the service", data.get("issuer") == f"https://{host}", str(data.get("issuer")))
+    check(
+        "Every published address uses HTTPS and this hostname",
+        all(data[k].startswith(f"https://{host}/") for k in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri")),
+    )
+    check("The device flow isn't advertised", "device_authorization_endpoint" not in data)
+    check("Only the code flow is advertised", data.get("grant_types_supported") == ["authorization_code"], str(data.get("grant_types_supported")))
+    keys = json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"]
+    check("One public signing key is published, and no private part", len(keys) == 1 and "d" not in keys[0])
+    for path in ("/identity/o/device", "/identity/o/api/device/code", "/identity/o/api/revoke", "/identity/o/api/introspect", "/identity/o/api/clients"):
+        status = Browser(host).get(path).status
+        posted = Browser(host).send("POST", path, {}).status  # 403: Django's CSRF check comes first
+        check(f"{path} doesn't exist", status == 404 and posted in (403, 404), f"{status} {posted}")
+
+    member = Browser(host)
+    member.log_in(email_of("fake-tool-member"))
+    back = sent_back(member.get(authorize_path(tool["client_id"])))
+    check("Someone already logged in goes straight back to the tool", bool(back and back.get("code")), str(back))
+    if not back or "code" not in back:
+        return tool
+    check("The tool gets its state back", back.get("state") == "state-from-the-tool")
+    answer = exchange(host, tool, back["code"])
+    check("The tool can exchange the code", answer.status == 200, f"{answer.status} {answer.text[:200]}")
+    tokens = json.loads(answer.text)
+    claims = verified_claims(host, tool, tokens["id_token"])
+    check("The signature checks out against the published key", "refused" not in claims, str(claims))
+    check("It says who it is", claims.get("email") == email_of("fake-tool-member"), str(claims.get("email")))
+    check("It passes on the person's groups", claims.get("groups") == ["member"], str(claims.get("groups")))
+    check("It includes the tool's nonce", claims.get("nonce") == "nonce-from-the-tool")
+
+    header, payload, signature = tokens["id_token"].split(".")
+    forged = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    forged["groups"] = ["operator"]
+    forged_payload = base64.urlsafe_b64encode(json.dumps(forged).encode()).rstrip(b"=").decode()
+    refused = verified_claims(host, tool, f"{header}.{forged_payload}.{signature}")
+    check("An altered statement fails the signature check", "refused" in refused, str(refused))
+
+    info = tool_request(host, "/identity/o/api/userinfo", bearer=tokens["access_token"])
+    check("The tool can ask who someone is", info.status == 200 and json.loads(info.text).get("groups") == ["member"], info.text[:200])
+    in_url = tool_request(host, f"/identity/o/api/userinfo?access_token={tokens['access_token']}")
+    check("A token in the address is refused", in_url.status == 401, str(in_url.status))
+    used = exchange(host, tool, back["code"])
+    check("A code works only once", used.status == 400, str(used.status))
+    refresh = tool_request(
+        host,
+        "/identity/o/api/token",
+        client_id=tool["client_id"],
+        secret=tool["secret"],
+        form={"grant_type": "refresh_token", "refresh_token": tokens.get("refresh_token", "")},
+    )
+    check("A refresh token can't be used", refresh.status in (400, 401), f"{refresh.status} {refresh.text[:120]}")
+    fresh = sent_back(member.get(authorize_path(tool["client_id"])))
+    wrong = exchange(host, tool, fresh["code"], secret="not-the-secret")
+    check("A wrong secret is refused", wrong.status == 401, str(wrong.status))
+
+    for label, path in (
+        ("An unregistered return address", authorize_path(tool["client_id"], redirect_uri="https://evil.example.org/callback")),
+        ("An unknown tool", authorize_path("no-such-tool")),
+    ):
+        response = member.get(path)
+        check(f"{label} is refused with no redirect", response.status == 200 and not response.location, f"{response.status} {response.location}")
+
+    board = Browser(host)
+    board.log_in(email_of("fake-board-no2fa"))
+    response = board.get(authorize_path(tool["client_id"]))
+    check("A Board member without 2FA can't reach a tool", sent_back(response) is None and "/accounts/2fa/" in response.location, response.location)
+    silent = sent_back(board.get(authorize_path(tool["client_id"], prompt="none")))
+    check("...not even with a silent check", bool(silent) and silent.get("error") == "login_required" and "code" not in silent, str(silent))
+
+    visitor = Browser(host)
+    response = visitor.get(authorize_path(tool["client_id"]))
+    check("A visitor is sent to log in first", response.location.startswith("/accounts/login/"), response.location)
+    after_password = visitor.post_form(response.location, {"login": email_of("fake-tool-2fa"), "password": PASSWORD})
+    check("With 2FA, a password alone doesn't reach the tool", "/accounts/2fa/authenticate" in after_password.location, after_password.location)
+    after_code = visitor.enter_code(totp(secrets_by_name["fake-tool-2fa"]))
+    back = sent_back(visitor.get(after_code.location)) if after_code.location else None
+    check("With the code too, they go on to the tool", bool(back and back.get("code")), f"{after_code.location} {back}")
+    if back and back.get("code"):
+        answer = exchange(host, tool, back["code"])
+        claims = verified_claims(host, tool, json.loads(answer.text)["id_token"])
+        check("Their own groups come through", claims.get("groups") == ["treasurer"], str(claims.get("groups")))
+
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+get_user_model().objects.get(email={email_of("fake-tool-member")!r}).groups.add(Group.objects.get(role__key="developer"))
+"""
+    )
+    back = sent_back(member.get(authorize_path(tool["client_id"])))
+    claims = verified_claims(host, tool, json.loads(exchange(host, tool, back["code"]).text)["id_token"])
+    check("A group change shows at the next login", claims.get("groups") == ["developer", "member"], str(claims.get("groups")))
+
+    leaving = Browser(host)
+    leaving.log_in(email_of("fake-tool-off"))
+    back = sent_back(leaving.get(authorize_path(tool["client_id"])))
+    access_token = json.loads(exchange(host, tool, back["code"]).text)["access_token"]
+    unused = sent_back(leaving.get(authorize_path(tool["client_id"])))
+    in_core(f"from django.contrib.auth import get_user_model; get_user_model().objects.filter(email={email_of('fake-tool-off')!r}).update(is_active=False)")
+    status = tool_request(host, "/identity/o/api/userinfo", bearer=access_token).status
+    check("A turned-off account's token stops working", status == 401, str(status))
+    status = exchange(host, tool, unused["code"]).status
+    check("A turned-off account's code stops working", status == 400, str(status))
+    response = leaving.get(authorize_path(tool["client_id"]))
+    check("A turned-off account can't reach a tool", sent_back(response) is None, response.location)
+
+    clear_limits()
+    statuses = [
+        tool_request(
+            host,
+            "/identity/o/api/token",
+            client_id=tool["client_id"],
+            secret="a-guess",
+            form={"grant_type": "authorization_code", "code": "x", "redirect_uri": FAKE_CALLBACK},
+        ).status
+        for _ in range(61)
+    ]
+    check("Guessing a tool's secret is limited", statuses[0] == 401 and statuses[-1] == 429, f"{statuses[0]} ... {statuses[-1]}")
+    clear_limits()
+    return tool
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -507,6 +715,7 @@ def prepare():
     check_access(host, operator, secrets_by_name)
     check_links(host, secrets_by_name)
     check_recovery(host)
+    tool = check_login_service(host, secrets_by_name)
 
     keeper = Browser(host)
     keeper.log_in(email_of("fake-member"))
@@ -517,6 +726,8 @@ def prepare():
                 "member_cookies": keeper.cookies,
                 "env": env_fingerprint(),
                 "data": data_snapshot(),
+                "tool": tool,
+                "signing_key": json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"][0]["kid"],
             }
         )
     )
@@ -540,6 +751,14 @@ def verify():
     check("Users and passwords are unchanged", now["users"] == state["data"]["users"])
     check("Groups and permissions are unchanged", now["groups"] == state["data"]["groups"])
     check("The secret key is unchanged", env_fingerprint() == state["env"])
+    published = json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"]
+    check("The signing key is unchanged", [key["kid"] for key in published] == [state["signing_key"]])
+    tool = state["tool"]
+    back = sent_back(member.get(authorize_path(tool["client_id"])))
+    answer = exchange(host, tool, back["code"]) if back and back.get("code") else None
+    check("A registered tool can still log someone in", bool(answer) and answer.status == 200, str(back))
+    if answer:
+        check("...with a signature that still checks out", "refused" not in verified_claims(host, tool, json.loads(answer.text)["id_token"]))
     status = docker_inspect("core")["State"]
     check("Core is healthy", status.get("Health", {}).get("Status") == "healthy", str(status.get("Health", {}).get("Status")))
     check_exposure(host)
@@ -593,6 +812,8 @@ cache.clear()
 """
     )
     STATE.unlink(missing_ok=True)
+    kit("tool", "remove", FAKE_TOOL)
+    print(f"Fake tool left: {FAKE_TOOL in kit('tool', 'list').stdout}")
     remaining = in_core(
         'from django.contrib.auth import get_user_model; print(get_user_model().objects.filter(email__endswith="@example.org").count())'
     )
