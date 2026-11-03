@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` module, the first `kit` commands, and core: Django with accounts, groups, 2FA and an admin page. Login for other tools and the other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` module, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
 
 ## Check a server
 
@@ -38,6 +38,18 @@ kit link someone@example.org   # a new link for someone an Operator has added
 ```
 
 If an Operator is locked out, `kit admin` restores their access and clears any login lockouts. If they've lost both their phone and their recovery codes, `kit admin you@example.org --reset-2fa` also removes their 2FA, so they can set it up again.
+
+## Connect a tool
+
+Core is the login service for every other tool, using OpenID Connect. To register a tool:
+
+```sh
+kit tool add forgejo https://git.example.org/user/oauth2/core/callback   # prints its settings, and the secret once
+kit tool list
+kit tool remove forgejo                                                  # ends its access
+```
+
+A tool can ask for the scopes `openid`, `email`, `profile` and `groups`. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent by name. A tool only hears about changes when someone logs in to it.
 
 ## Tests
 
