@@ -165,7 +165,7 @@ install_packages() {
   step "Installing base packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl git python3 ufw unattended-upgrades >/dev/null
+  apt-get install -y -qq ca-certificates curl git openssl python3 ufw unattended-upgrades >/dev/null
 }
 
 enable_automatic_updates() {
