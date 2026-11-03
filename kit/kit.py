@@ -343,6 +343,19 @@ def _check_email(address: str) -> str:
     return address
 
 
+def _check_tool_name(name: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        raise KitError(f"{name!r} isn't a valid tool name. Use lowercase letters, numbers and dashes.")
+    return name
+
+
+def _check_callback(address: str) -> str:
+    """Django checks the address properly. This only stops it being read as an option."""
+    if not address.startswith("https://"):
+        raise KitError(f"{address!r} must be a full https address.")
+    return address
+
+
 # ---- Sites: config and credentials -------------------------------------------
 
 
@@ -556,6 +569,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
 
+    tool = commands.add_parser("tool", help="manage the tools that can use the login service")
+    tool = tool.add_subparsers(dest="tool_action", required=True)
+    tool_add = tool.add_parser("add", help="register a tool, and show its settings and secret once")
+    tool_add.add_argument("name")
+    tool_add.add_argument("callback", help="the exact https address the tool wants people sent back to")
+    tool.add_parser("list", help="show the registered tools")
+    tool.add_parser("remove", help="remove a tool and end its access").add_argument("name")
+
     site = commands.add_parser("site", help="manage public sites").add_subparsers(dest="action", required=True)
     add = site.add_parser("add", help="add a site and create its deploy key")
     add.add_argument("domain")
@@ -592,6 +613,12 @@ def main(argv: list[str] | None = None) -> int:
             return _manage("create_admin", _check_email(args.email), *(["--reset-2fa"] if args.reset_2fa else []))
         elif args.command == "link":
             return _manage("password_link", _check_email(args.email))
+        elif args.command == "tool":
+            if args.tool_action == "add":
+                return _manage("tool", "add", _check_tool_name(args.name), _check_callback(args.callback))
+            if args.tool_action == "remove":
+                return _manage("tool", "remove", _check_tool_name(args.name))
+            return _manage("tool", "list")
         elif args.command == "status":
             return status(paths)
         elif args.action == "add":
