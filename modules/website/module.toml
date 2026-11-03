@@ -1,0 +1,7 @@
+name        = "website"
+description = "Public websites and domain redirects"
+ram_mb      = 0                 # served by Caddy, which is part of core
+requires    = []
+data        = ["/srv/website"]
+access      = []
+oidc        = false

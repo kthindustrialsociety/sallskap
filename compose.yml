@@ -1,0 +1,21 @@
+name: sallskap
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      # A folder rather than the file: kit replaces the Caddyfile atomically,
+      # and a single-file mount would keep showing the old one.
+      - /etc/sallskap/generated:/etc/caddy:ro
+      - /srv/website:/srv/website:ro
+      - /srv/caddy/data:/data
+      - /srv/caddy/config:/config

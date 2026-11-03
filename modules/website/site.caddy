@@ -1,0 +1,20 @@
+# Imported by every public site. kit writes the site blocks: see kit/kit.py.
+(website_defaults) {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Files named name-HASH.ext under /assets/ never change, so browsers may
+	# keep them. Everything else is rechecked on each visit, so a publish shows
+	# up immediately. The eight character classes require a hash-length suffix.
+	@hashed path_regexp ^/assets/.+[-.][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-]\.[a-z0-9]+$
+	@other not path_regexp ^/assets/.+[-.][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-][A-Za-z0-9_-]\.[a-z0-9]+$
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	header @other Cache-Control "public, max-age=0, must-revalidate"
+}
