@@ -292,8 +292,8 @@ start_core() {
     say "  The server is ready. Next, set your primary domain: kit init example.org"
     return
   fi
-  kit apply
-  ok "Web server is running"
+  kit apply --build
+  ok "Core and the web server are running"
 }
 
 on_error() {

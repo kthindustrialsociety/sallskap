@@ -1,0 +1,39 @@
+{% load i18n %}<!DOCTYPE html>
+<html lang="{{ LANGUAGE_CODE|default:'en' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block head_title %}{% endblock head_title %}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 1rem; padding-bottom: 1rem; margin-bottom: 1.5rem; border-bottom: 1px solid #8884; }
+    h1 { font-size: 1.5rem; }
+    label { display: block; margin-top: .75rem; font-weight: 600; }
+    input:not([type=checkbox]):not([type=submit]) { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; }
+    button, input[type=submit] { margin-top: 1rem; padding: .5rem 1rem; font: inherit; cursor: pointer; }
+    .messages { padding: .75rem 1rem; border: 1px solid #8886; border-radius: .25rem; list-style: none; }
+    .errorlist { color: #c62828; padding-left: 1rem; }
+    .helptext, .helptext ul { font-size: .875rem; }
+    img { max-width: 100%; background: #fff; }
+  </style>
+  {% block extra_head %}{% endblock extra_head %}
+</head>
+<body>
+  {% block body %}
+    {% if user.is_authenticated %}
+      <nav>
+        <a href="{% url 'home' %}">{% translate "Home" %}</a>
+        <a href="{% url 'mfa_index' %}">{% translate "Two-factor authentication" %}</a>
+        <a href="{% url 'account_change_password' %}">{% translate "Change password" %}</a>
+        <a href="{% url 'account_logout' %}">{% translate "Log out" %}</a>
+      </nav>
+    {% endif %}
+    {% if messages %}
+      <ul class="messages">{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% block content %}{% endblock content %}
+  {% endblock body %}
+  {% block extra_body %}{% endblock extra_body %}
+</body>
+</html>

@@ -116,6 +116,15 @@ class RenderCaddyfile(unittest.TestCase):
     def setUp(self):
         self.text = kit.render_caddyfile(kit.parse_config(CONFIG))
 
+    def test_routes_the_app_hostname_to_core(self):
+        block = self.text.split("app.example.org {\n")[1].split("\n}")[0]
+        self.assertIn("reverse_proxy core:8000", block)
+
+    def test_logged_in_pages_do_not_get_the_public_site_caching(self):
+        block = self.text.split("app.example.org {\n")[1].split("\n}")[0]
+        self.assertNotIn("website_defaults", block)
+        self.assertNotIn("Cache-Control", block)
+
     def test_serves_each_site_from_its_current_release(self):
         self.assertIn("root * /srv/website/example.org/current", self.text)
         self.assertIn("root * /srv/website/links.example.org/current", self.text)
@@ -314,6 +323,64 @@ class Sites(unittest.TestCase):
         self.assertEqual([s.domain for s in kit.load_config(self.paths).sites], ["links.example.org"])
 
 
+class Core(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
+        self.config = kit.parse_config(CONFIG)
+
+    def test_secrets_are_private_and_use_the_primary_domain(self):
+        kit.prepare_core(self.paths, self.config)
+        text = self.paths.core_env.read_text()
+        self.assertEqual(self.paths.core_env.stat().st_mode & 0o777, 0o600)
+        self.assertIn("SALLSKAP_DOMAIN=example.org\n", text)
+        self.assertRegex(text, r"DJANGO_SECRET_KEY=[\w-]{60,}\n")
+
+    def test_core_data_folder_is_private(self):
+        kit.prepare_core(self.paths, self.config)
+        self.assertEqual(self.paths.core_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_each_installation_gets_its_own_secret_key(self):
+        other = kit.Paths(self.paths.config_dir / "other", self.paths.website_dir, self.paths.deploy_home, self.paths.core_dir)
+        kit.prepare_core(self.paths, self.config)
+        kit.prepare_core(other, self.config)
+        self.assertNotEqual(self.paths.core_env.read_text(), other.core_env.read_text())
+
+    def test_running_setup_again_changes_nothing(self):
+        kit.prepare_core(self.paths, self.config)
+        before = self.paths.core_env.read_text()
+        modified = self.paths.core_env.stat().st_mtime_ns
+        kit.prepare_core(self.paths, self.config)
+        self.assertEqual(self.paths.core_env.read_text(), before)
+        self.assertEqual(self.paths.core_env.stat().st_mtime_ns, modified)
+
+    def test_changing_the_domain_keeps_the_secret_key(self):
+        kit.prepare_core(self.paths, self.config)
+        key = re.search(r"DJANGO_SECRET_KEY=(.+)", self.paths.core_env.read_text()).group(1)
+        kit.prepare_core(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        text = self.paths.core_env.read_text()
+        self.assertIn("SALLSKAP_DOMAIN=new.org\n", text)
+        self.assertIn(f"DJANGO_SECRET_KEY={key}\n", text)
+
+    def test_secrets_stay_out_of_git(self):
+        tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True).stdout
+        self.assertNotIn("core.env", tracked)
+        self.assertFalse(list(ROOT.glob("**/core.env")))
+
+    def test_email_addresses_are_checked_before_reaching_the_container(self):
+        self.assertEqual(kit._check_email(" First.Admin@Example.org "), "first.admin@example.org")
+        for bad in ("nope", "--settings=x@example.org", "a b@example.org", ""):
+            with self.assertRaisesRegex(kit.KitError, "valid email"):
+                kit._check_email(bad)
+
+    def test_the_uid_given_the_data_folder_is_the_one_core_runs_as(self):
+        dockerfile = (ROOT / "core" / "Dockerfile").read_text()
+        self.assertIn(f"USER {kit.CORE_UID}:{kit.CORE_UID}", dockerfile)
+        self.assertIn(f"--uid {kit.CORE_UID} ", dockerfile)
+
+
 class CommandLine(unittest.TestCase):
     def test_a_problem_gives_a_message_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -326,18 +393,34 @@ class CommandLine(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
 
 
+def compose_services() -> dict[str, str]:
+    """The text of each service in every Compose file. Standard library only,
+    so this reads the layout rather than parsing YAML."""
+    services = {}
+    for compose in [ROOT / "compose.yml", *ROOT.glob("modules/*/compose.yml")]:
+        name, in_services = None, False
+        for line in compose.read_text().splitlines():
+            if line.startswith("services:"):
+                in_services = True
+            elif line and not line.startswith((" ", "#")):
+                in_services, name = False, None
+            elif in_services and re.fullmatch(r"  [\w-]+:\s*", line):
+                name = line.strip().rstrip(":")
+                services[name] = ""
+            elif name:
+                services[name] += line + "\n"
+    return services
+
+
 class Packaging(unittest.TestCase):
+    def test_compose_files_are_read_correctly(self):
+        self.assertLessEqual({"caddy", "core"}, set(compose_services()))
+
     def test_only_caddy_publishes_ports(self):
         """docs/spec.md §7.2 rule 7: Docker's published ports bypass the firewall."""
-        for compose in [ROOT / "compose.yml", *ROOT.glob("modules/*/compose.yml")]:
-            current_service, in_services = None, False
-            for line in compose.read_text().splitlines():
-                if line.startswith("services:"):
-                    in_services = True
-                elif in_services and line.startswith("  ") and not line.startswith("   ") and line.strip().endswith(":"):
-                    current_service = line.strip().rstrip(":")
-                elif line.strip() == "ports:":
-                    self.assertEqual(current_service, "caddy", f"{compose}: {current_service} publishes ports")
+        for name, text in compose_services().items():
+            if name != "caddy":
+                self.assertNotIn("ports:", text, f"{name} publishes ports")
 
     def test_installer_variables_do_not_clash_with_os_release(self):
         """Sourcing /etc/os-release over a readonly variable kills the installer."""
@@ -348,9 +431,15 @@ class Packaging(unittest.TestCase):
 
     def test_every_container_has_a_memory_limit(self):
         """docs/spec.md §7.2 rule 4."""
-        for compose in [ROOT / "compose.yml", *ROOT.glob("modules/*/compose.yml")]:
-            text = compose.read_text()
-            self.assertEqual(text.count("image:"), text.count("mem_limit:"), compose)
+        for name, text in compose_services().items():
+            self.assertIn("mem_limit:", text, f"{name} has no memory limit")
+
+    def test_core_runs_locked_down(self):
+        text = compose_services()["core"]
+        self.assertIn("read_only: true", text)
+        self.assertIn("cap_drop: [ALL]", text)
+        self.assertIn("no-new-privileges:true", text)
+        self.assertRegex((ROOT / "core" / "Dockerfile").read_text(), r"(?m)^USER 10001")
 
 
 if __name__ == "__main__":
