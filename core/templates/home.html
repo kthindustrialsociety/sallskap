@@ -1,0 +1,14 @@
+{% extends "allauth/layouts/base.html" %}
+{% load i18n %}
+{% block head_title %}{% translate "Home" %}{% endblock head_title %}
+{% block content %}
+  <h1>{% blocktranslate with email=user.email %}Logged in as {{ email }}{% endblocktranslate %}</h1>
+  {% if user.needs_2fa_setup %}
+    <p>{% translate "Your group requires two-factor authentication before you can use the admin page." %}</p>
+    <p><a href="{% url 'mfa_index' %}">{% translate "Set up two-factor authentication" %}</a></p>
+  {% elif user.is_staff %}
+    <p><a href="{% url 'admin:index' %}">{% translate "Go to the admin page" %}</a></p>
+  {% else %}
+    <p>{% translate "There's nothing for your account here yet." %}</p>
+  {% endif %}
+{% endblock content %}

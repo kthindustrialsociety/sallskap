@@ -1,6 +1,26 @@
 name: sallskap
 
 services:
+  # No published ports: only Caddy can reach it, over Compose's own network.
+  core:
+    build: ./core
+    image: sallskap-core:local
+    restart: unless-stopped
+    mem_limit: 768m       # four threads, each with room for one 100 MB password check
+    pids_limit: 128
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: /etc/sallskap/core.env
+    volumes:
+      - /srv/core:/srv/core
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped

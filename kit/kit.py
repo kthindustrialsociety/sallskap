@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,7 @@ CADDY_ROOT = "/srv/website"
 RELEASES_KEPT = 5
 MAX_UPLOAD_BYTES = 2 * 1024**3
 MAX_UPLOAD_FILES = 100_000
+CORE_UID = 10001  # the user core runs as: see core/Dockerfile
 
 SITE_HEADER = "[[website.sites]]"
 SITE_FIELDS = {"domain", "aliases", "spa", "www"}
@@ -48,10 +50,15 @@ class Paths:
     config_dir: Path = Path(os.environ.get("SALLSKAP_CONFIG_DIR", "/etc/sallskap"))
     website_dir: Path = Path(os.environ.get("SALLSKAP_WEBSITE_DIR", CADDY_ROOT))
     deploy_home: Path = Path(os.environ.get("SALLSKAP_DEPLOY_HOME", "/var/lib/sallskap-deploy"))
+    core_dir: Path = Path(os.environ.get("SALLSKAP_CORE_DIR", "/srv/core"))
 
     @property
     def config(self) -> Path:
         return self.config_dir / "config.toml"
+
+    @property
+    def core_env(self) -> Path:
+        return self.config_dir / "core.env"
 
     @property
     def caddyfile(self) -> Path:
@@ -220,6 +227,16 @@ def render_caddyfile(config: Config) -> str:
     if config.mail_from:
         parts.append(f"{{\n\temail {config.mail_from}\n}}")
     parts.append((ROOT / "modules" / "website" / "site.caddy").read_text("utf-8").strip())
+    # Not website_defaults: its caching headers are for public pages, and these
+    # are logged-in ones. Django sets its own security headers.
+    parts.append(
+        f"app.{config.domain} {{\n"
+        "\tencode zstd gzip\n"
+        "\theader -Server\n"
+        "\theader -Via\n"
+        "\treverse_proxy core:8000\n"
+        "}"
+    )
     for site in config.sites:
         fallback = "\ttry_files {path} {path}/index.html /index.html\n" if site.spa else ""
         parts.append(
@@ -243,15 +260,38 @@ def _compose(*args: str) -> list[str]:
     return ["docker", "compose", "--project-directory", str(ROOT), *args]
 
 
-def apply(paths: Paths) -> None:
-    """Validate the new Caddy config inside the container, then switch to it."""
-    text = render_caddyfile(load_config(paths))
+def prepare_core(paths: Paths, config: Config) -> None:
+    """Give core its folder and settings. The secret key is made once and then
+    kept: a new one would log everyone out and cancel every password link."""
+    current = {}
+    if paths.core_env.exists():
+        for line in paths.core_env.read_text("utf-8").splitlines():
+            name, _, value = line.partition("=")
+            current[name] = value
+    key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
+    text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\n"
+    if not paths.core_env.exists() or paths.core_env.read_text("utf-8") != text:
+        _write_atomic(paths.core_env, text, 0o600)
+
+    paths.core_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chown(paths.core_dir, CORE_UID, CORE_UID)
+
+
+def apply(paths: Paths, build: bool = False) -> None:
+    """Start the containers. Caddy's new config is validated inside its container
+    before the switch, so a bad one changes nothing."""
+    config = load_config(paths)
+    prepare_core(paths, config)
+    text = render_caddyfile(config)
+    # --wait means that when this returns, core has finished migrating.
+    start = _compose("up", "-d", "--wait", *(["--build"] if build else []), "core", "caddy")
     if not paths.caddyfile.exists():
         _write_atomic(paths.caddyfile, text)
-        subprocess.run(_compose("up", "-d", "caddy"), check=True)
+        subprocess.run(start, check=True)
         return
 
-    subprocess.run(_compose("up", "-d", "caddy"), check=True)
+    subprocess.run(start, check=True)
     candidate = paths.caddyfile.with_name("Caddyfile.new")
     _write_atomic(candidate, text)
     in_container = _compose("exec", "-T", "caddy", "caddy")
@@ -268,6 +308,21 @@ def apply(paths: Paths) -> None:
         [*in_container, "reload", "--adapter", "caddyfile", "--config", "/etc/caddy/Caddyfile"],
         check=True,
     )
+
+
+# ---- Core: accounts ----------------------------------------------------------
+
+
+def _manage(*args: str) -> int:
+    """Run a Django command in the running core container. It prints for itself."""
+    return subprocess.run(_compose("exec", "-T", "core", "python", "manage.py", *args)).returncode
+
+
+def _check_email(address: str) -> str:
+    address = address.strip().lower()
+    if address.startswith("-") or not EMAIL.fullmatch(address):
+        raise KitError(f"{address!r} isn't a valid email address.")
+    return address
 
 
 # ---- Sites: config and credentials -------------------------------------------
@@ -469,7 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kit", description="Operate a Sällskap installation.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="create the first config").add_argument("domain", help="the primary domain")
-    commands.add_parser("apply", help="regenerate the web server config and switch to it")
+    apply_command = commands.add_parser("apply", help="start the containers and switch to the current web server config")
+    apply_command.add_argument("--build", action="store_true", help="rebuild core first, after its code has changed")
+    commands.add_parser("admin", help="create the first admin, or restore someone's Operator access").add_argument("email")
+    commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
 
     site = commands.add_parser("site", help="manage public sites").add_subparsers(dest="action", required=True)
@@ -498,9 +556,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             init_config(paths, args.domain)
             apply(paths)
-            print(f"Created {paths.config}. Add a public site with: kit site add {args.domain}")
+            print(f"Created {paths.config}.")
+            print("Create the first admin with: kit admin you@example.org")
+            print(f"Add a public site with: kit site add {args.domain}")
         elif args.command == "apply":
-            apply(paths)
+            apply(paths, build=args.build)
+        elif args.command == "admin":
+            return _manage("create_admin", _check_email(args.email))
+        elif args.command == "link":
+            return _manage("password_link", _check_email(args.email))
         elif args.command == "status":
             return status(paths)
         elif args.action == "add":
