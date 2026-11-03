@@ -37,11 +37,16 @@ kit admin you@example.org      # create the first admin, and print their link
 kit link someone@example.org   # a new link for someone an Operator has added
 ```
 
+If an Operator is locked out, `kit admin` restores their access and clears any login lockouts. If they've lost both their phone and their recovery codes, `kit admin you@example.org --reset-2fa` also removes their 2FA, so they can set it up again.
+
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests                                     # the kit
-docker compose run --rm --no-deps core python manage.py test              # core, with fake users
+python3 -m unittest discover -s tests     # the kit
+
+docker build --tag sallskap-core:test core     # core, with fake users
+docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \
+  --env DJANGO_SECRET_KEY="$(openssl rand -hex 32)" sallskap-core:test python manage.py test
 ```
 
 `tests/live_check.py` checks a running server from the outside, and creates fake users, so don't run it on an installation with real members.

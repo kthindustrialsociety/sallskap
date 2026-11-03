@@ -317,7 +317,7 @@ An association should never have to ask its provider how the server works. The k
 | Command | Action |
 |---|---|
 | `kit init <domain>` | Create the first config (the setup wizard does this in a browser) |
-| `kit admin <email>` | Create the first admin, or restore someone's Operator access |
+| `kit admin <email>` | Create the first admin, or restore someone's Operator access and clear any login lockouts. `--reset-2fa` also removes their 2FA |
 | `kit link <email>` | Create a one-time link that lets someone choose a password. It doesn't log them in, so it can't get around 2FA |
 | `kit enable <module>` | Ask the setup questions, show any DNS record needed, start the module |
 | `kit disable <module>` | Stop the module and keep its data |
