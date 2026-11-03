@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` module and the first `kit` commands. It hasn't yet been run on a real server. Core (Django, accounts and login) and the other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` module and the first `kit` commands. These have been tested on a real Debian 13 server. Core (Django, accounts and login) and the other modules aren't built yet.
 
 ## Check a server
 
