@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.contrib import admin, messages
+from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.contrib.auth.views import redirect_to_login
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import redirect, resolve_url
@@ -20,7 +21,9 @@ class SallskapAdminSite(admin.AdminSite):
         or the login limits. Everyone logs in through allauth."""
         user = request.user
         if not user.is_authenticated:
-            return redirect_to_login(reverse("admin:index"), resolve_url(settings.LOGIN_URL))
+            # allauth checks this address before using it, so it can't lead to another site.
+            wanted = request.GET.get(REDIRECT_FIELD_NAME) or reverse("admin:index")
+            return redirect_to_login(wanted, resolve_url(settings.LOGIN_URL))
         if self.has_permission(request):
             return redirect("admin:index")
         if user.is_active and user.is_staff:  # staff, so only 2FA can be missing

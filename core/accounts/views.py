@@ -18,6 +18,10 @@ class SetPasswordView(PasswordResetConfirmView):
     template_name = "set_password.html"
     success_url = reverse_lazy("account_login")
 
+    def get_user(self, uidb64):
+        user = super().get_user(uidb64)
+        return user if user is not None and user.is_active else None
+
     def form_valid(self, form):
         response = super().form_valid(form)
         messages.success(self.request, _("Your password is set. Log in to continue."))

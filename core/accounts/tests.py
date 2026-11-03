@@ -1,7 +1,4 @@
-"""Step 1's tests, using fake users. Run inside the container with:
-
-    docker compose run --rm --no-deps core python manage.py test
-"""
+"""Step 1's tests, using fake users. The README shows how to run them in Docker."""
 
 import io
 import logging
@@ -11,15 +8,19 @@ from allauth.account.models import EmailAddress
 from allauth.mfa.models import Authenticator
 from allauth.mfa.recovery_codes.internal.auth import RecoveryCodes
 from allauth.mfa.totp.internal.auth import SECRET_SESSION_KEY, TOTP, format_hotp_value, generate_totp_secret, hotp_value
+from allauth.urls import urlpatterns as allauth_urlpatterns
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import Group
+from django.contrib.auth.password_validation import validate_password
 from django.core import mail
+from django.core.exceptions import ValidationError
 from django.core.management import CommandError, call_command
 from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
-from django.urls import reverse
+from django.urls import resolve, reverse
+from sallskap.urls import not_found
 
 from .links import password_link
 
@@ -162,13 +163,21 @@ class Lockout(Base):
         self.assertContains(response, "Too many failed login attempts")
         self.assert_logged_out()
 
-    def test_lock_applies_from_another_address_too(self):
+    def test_a_lock_only_holds_at_the_address_it_came_from(self):
+        """Otherwise anyone who knows an email address could keep that person out."""
         make_user(password=PASSWORD)
         for _ in range(5):
             self.log_in("person@example.org", "not-the-password-at-all")
         other = CaddyClient(ip="198.51.100.7")
         self.log_in("person@example.org", client=other)
-        self.assert_logged_out(other)
+        self.assert_logged_in(other)
+
+    def test_a_lock_holds_across_browsers_at_the_same_address(self):
+        make_user(password=PASSWORD)
+        for _ in range(5):
+            self.log_in("person@example.org", "not-the-password-at-all", client=CaddyClient(ip="198.51.100.7"))
+        response = self.log_in("person@example.org", client=CaddyClient(ip="198.51.100.7"))
+        self.assertContains(response, "Too many failed login attempts")
 
     def test_locks_after_repeated_wrong_codes(self):
         _, secret = make_user(password=PASSWORD, two_factor=True)
@@ -215,12 +224,49 @@ class ClosedRoutes(Base):
             "/accounts/password/reset/",
             "/accounts/password/reset/done/",
             "/accounts/password/reset/key/1-abc/",
+            "/accounts/password/set/",
             "/accounts/login/code/confirm/",
+            "/accounts/some-future-route/",
         ):
             with self.subTest(path):
                 self.assertEqual(self.client.get(path).status_code, 404)
                 self.assertEqual(self.client.post(path, {"email": "a@example.org"}).status_code, 404)
         self.assertEqual(User.objects.count(), 0)
+
+    def test_only_the_routes_we_use_are_open(self):
+        """If an allauth upgrade adds a route, this fails instead of the route going live."""
+
+        def routes(patterns, prefix=""):
+            for pattern in patterns:
+                if hasattr(pattern, "url_patterns"):
+                    yield from routes(pattern.url_patterns, prefix + str(pattern.pattern))
+                else:
+                    yield prefix + str(pattern.pattern)
+
+        open_routes = {route for route in routes(allauth_urlpatterns) if resolve(f"/accounts/{route}").func is not not_found}
+        self.assertEqual(
+            open_routes,
+            {
+                "login/",
+                "logout/",
+                "inactive/",
+                "reauthenticate/",
+                "password/change/",
+                "2fa/",
+                "2fa/authenticate/",
+                "2fa/reauthenticate/",
+                "2fa/totp/activate/",
+                "2fa/totp/deactivate/",
+                "2fa/recovery-codes/",
+                "2fa/recovery-codes/generate/",
+                "2fa/recovery-codes/download/",
+            },
+        )
+
+    def test_the_routes_we_use_still_work(self):
+        self.assertEqual(self.client.get(reverse("account_login")).status_code, 200)
+        self.assertEqual(self.client.get(reverse("mfa_index")).status_code, 302)  # to login
+        self.assertEqual(self.client.get("/accounts/login").status_code, 301)  # adds the slash
 
     def test_the_login_page_offers_neither_signup_nor_reset(self):
         response = self.client.get(reverse("account_login"))
@@ -304,8 +350,24 @@ class Admin(Base):
         return data
 
     def test_visitors_are_sent_to_the_real_login(self):
-        response = self.client.get(reverse("admin:accounts_user_changelist"), follow=True)
-        self.assertEqual(response.redirect_chain[-1][0], f"{reverse('account_login')}?next={reverse('admin:index')}")
+        target = reverse("admin:accounts_user_changelist")
+        response = self.client.get(target, follow=True)
+        self.assertEqual(response.redirect_chain[-1][0], f"{reverse('account_login')}?next={target}")
+
+    def test_login_returns_to_the_page_asked_for(self):
+        _, secret = make_user(groups=["operator"], password=PASSWORD, two_factor=True)
+        target = reverse("admin:accounts_user_changelist")
+        login_page = self.client.get(target, follow=True).redirect_chain[-1][0]
+        self.client.post(login_page, {"login": "person@example.org", "password": PASSWORD})
+        response = self.enter_code(totp_code(secret))
+        self.assertRedirects(response, target, fetch_redirect_response=False)
+
+    def test_login_never_redirects_to_another_site(self):
+        make_user(password=PASSWORD)
+        login_page = self.client.get(f"{reverse('admin:login')}?next=https://evil.example.org/", follow=True).redirect_chain[-1][0]
+        response = self.client.post(login_page, {"login": "person@example.org", "password": PASSWORD})
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("evil", response.url)
 
     def test_groups_needing_2fa_are_refused_without_it(self):
         for group in ("board", "treasurer", "operator"):
@@ -445,12 +507,67 @@ class Admin(Base):
 
     def test_operator_can_remove_2fa_for_someone_who_lost_their_phone(self):
         other, _ = make_user("other@example.org", ["board"], two_factor=True)
+        RecoveryCodes.activate(other)
         self.assertFalse(other.needs_2fa_setup)
-        authenticator = Authenticator.objects.get(user=other)
+        totp = Authenticator.objects.get(user=other, type=Authenticator.Type.TOTP)
         self.enter(["operator"])
-        response = self.client.post(reverse("admin:mfa_authenticator_delete", args=[authenticator.pk]), {"post": "yes"})
+        response = self.client.post(reverse("admin:mfa_authenticator_delete", args=[totp.pk]), {"post": "yes"})
         self.assertEqual(response.status_code, 302)
         self.assertTrue(other.needs_2fa_setup)
+        self.assertFalse(Authenticator.objects.filter(user=other).exists())
+
+    def test_removing_2fa_in_bulk_removes_all_of_it(self):
+        other, _ = make_user("other@example.org", ["board"], two_factor=True)
+        RecoveryCodes.activate(other)
+        totp = Authenticator.objects.get(user=other, type=Authenticator.Type.TOTP)
+        self.enter(["operator"])
+        self.client.post(
+            reverse("admin:mfa_authenticator_changelist"),
+            {"action": "delete_selected", "_selected_action": [totp.pk], "post": "yes"},
+        )
+        self.assertFalse(Authenticator.objects.filter(user=other).exists())
+
+    def test_removing_2fa_leaves_other_people_alone(self):
+        other, _ = make_user("other@example.org", two_factor=True)
+        bystander, _ = make_user("bystander@example.org", two_factor=True)
+        totp = Authenticator.objects.get(user=other, type=Authenticator.Type.TOTP)
+        self.enter(["operator"])
+        self.client.post(reverse("admin:mfa_authenticator_delete", args=[totp.pk]), {"post": "yes"})
+        self.assertTrue(Authenticator.objects.filter(user=bystander).exists())
+
+    def test_old_recovery_codes_stop_working_after_2fa_is_removed(self):
+        """Otherwise a stolen password and paper code still log in after someone starts over."""
+        other, _ = make_user("lost@example.org", ["board"], password=PASSWORD, two_factor=True)
+        old_code = RecoveryCodes.activate(other).get_unused_codes()[0]
+        totp = Authenticator.objects.get(user=other, type=Authenticator.Type.TOTP)
+        self.enter(["operator"])
+        self.client.post(reverse("admin:mfa_authenticator_delete", args=[totp.pk]), {"post": "yes"})
+
+        phone = CaddyClient(ip="198.51.100.7")
+        self.log_in("lost@example.org", client=phone)
+        phone.post(reverse("account_reauthenticate"), {"password": PASSWORD})
+        phone.get(reverse("mfa_activate_totp"))
+        phone.post(reverse("mfa_activate_totp"), {"code": totp_code(phone.session[SECRET_SESSION_KEY])})
+        self.assertFalse(User.objects.get(pk=other.pk).needs_2fa_setup)
+
+        thief = CaddyClient(ip="198.51.100.66")
+        self.log_in("lost@example.org", client=thief)
+        self.enter_code(old_code, client=thief)
+        self.assert_logged_out(thief)
+
+    def test_operator_cannot_remove_a_superusers_2fa(self):
+        boss, _ = make_user("boss@example.org", two_factor=True)
+        boss.is_superuser = True
+        boss.save()
+        record = Authenticator.objects.get(user=boss)
+        self.enter(["operator"])
+        response = self.client.post(reverse("admin:mfa_authenticator_delete", args=[record.pk]), {"post": "yes"})
+        self.assertEqual(response.status_code, 403)
+        self.client.post(
+            reverse("admin:mfa_authenticator_changelist"),
+            {"action": "delete_selected", "_selected_action": [record.pk], "post": "yes"},
+        )
+        self.assertTrue(Authenticator.objects.filter(user=boss).exists())
 
     def test_nobody_can_copy_or_change_2fa_records_in_the_admin(self):
         other, _ = make_user("other@example.org", two_factor=True)
@@ -565,6 +682,13 @@ class PasswordLinks(Base):
         user, _ = make_user()
         self.assertFalse(self.client.get(set_password_url(password_link(user)), follow=True).context["validlink"])
 
+    def test_a_link_stops_working_when_the_account_is_turned_off(self):
+        user, _ = make_user()
+        link = password_link(user)
+        user.is_active = False
+        user.save()
+        self.assertFalse(self.client.get(set_password_url(link), follow=True).context["validlink"])
+
     def test_a_made_up_link_is_refused(self):
         user, _ = make_user()
         link = password_link(user)
@@ -600,9 +724,9 @@ class PasswordLinks(Base):
 
 
 class Commands(Base):
-    def run_command(self, name, email):
+    def run_command(self, name, *args):
         output = io.StringIO()
-        call_command(name, email, stdout=output)
+        call_command(name, *args, stdout=output)
         return output.getvalue()
 
     def test_create_admin_makes_an_operator_who_must_choose_a_password(self):
@@ -636,6 +760,36 @@ class Commands(Base):
         self.assertTrue(user.is_active)
         self.assertTrue(user.has_role("operator"))
 
+    def test_create_admin_leaves_2fa_alone_unless_asked(self):
+        user, _ = make_user("admin@example.org", ["operator"], two_factor=True)
+        self.run_command("create_admin", "admin@example.org")
+        self.assertFalse(user.needs_2fa_setup)
+
+    def test_reset_2fa_gives_a_sole_operator_a_way_back_in(self):
+        user, _ = make_user("admin@example.org", ["operator"], password=PASSWORD, two_factor=True)
+        RecoveryCodes.activate(user)
+        output = self.run_command("create_admin", "admin@example.org", "--reset-2fa")
+        self.assertIn("2FA", output)
+        self.assertFalse(Authenticator.objects.filter(user=user).exists())
+        self.assertEqual(User.objects.get(pk=user.pk).password, user.password)
+        self.log_in("admin@example.org")
+        self.assert_logged_in()
+        self.assertContains(self.client.get(reverse("home")), reverse("mfa_index"))
+
+    def test_create_admin_clears_a_lockout(self):
+        make_user("admin@example.org", ["operator"], password=PASSWORD)
+        for _ in range(5):
+            self.log_in("admin@example.org", "not-the-password-at-all")
+        self.log_in("admin@example.org")
+        self.assert_logged_out()
+        self.run_command("create_admin", "admin@example.org")
+        self.log_in("admin@example.org")
+        self.assert_logged_in()
+
+    def test_create_admin_accepts_every_address_the_admin_page_does(self):
+        self.run_command("create_admin", "o'brien@kth.se")
+        self.assertTrue(User.objects.filter(email="o'brien@kth.se").exists())
+
     def test_create_admin_refuses_a_bad_address(self):
         with self.assertRaises(CommandError):
             self.run_command("create_admin", "not an address")
@@ -663,6 +817,12 @@ class Deployment(Base):
         self.assertTrue(make_password("anything").startswith("argon2"))
         user, _ = make_user(password=PASSWORD)
         self.assertTrue(user.password.startswith("argon2"))
+
+    def test_passwords_cannot_resemble_the_persons_name_or_email(self):
+        user = User(email="someone@example.org", name="Anna Lindqvist")
+        for password in ("annalindqvist1", "someone@example"):
+            with self.subTest(password), self.assertRaises(ValidationError):
+                validate_password(password, user)
 
     def test_session_cookie_is_secure_and_limited_to_this_host(self):
         make_user(password=PASSWORD)

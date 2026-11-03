@@ -70,7 +70,10 @@ admin.site.unregister(Authenticator)
 @admin.register(Authenticator)
 class AuthenticatorAdmin(admin.ModelAdmin):
     """allauth's version shows the `data` field, which holds the 2FA secret. This
-    one leaves it out, so an Operator can remove someone's 2FA but never copy it."""
+    one leaves it out, so an Operator can remove someone's 2FA but never copy it.
+
+    Removing any record removes all of that person's 2FA. Otherwise their old
+    recovery codes would still log in after they set up 2FA again."""
 
     list_display = fields = readonly_fields = ("user", "type", "created_at", "last_used_at")
     list_filter = ("type",)
@@ -80,3 +83,14 @@ class AuthenticatorAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+    def has_delete_permission(self, request, obj=None):
+        if obj is not None and obj.user.is_superuser and not request.user.is_superuser:
+            return False
+        return super().has_delete_permission(request, obj)
+
+    def delete_model(self, request, obj):
+        Authenticator.objects.filter(user=obj.user).delete()
+
+    def delete_queryset(self, request, queryset):
+        Authenticator.objects.filter(user__in=queryset.values("user")).delete()
