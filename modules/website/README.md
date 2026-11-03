@@ -17,7 +17,7 @@ This updates the config and the web server, then shows the DNS records to add an
 Build the site, then send the output folder over SSH:
 
 ```sh
-tar -C dist -czf - . | ssh -i deploy_key sallskap-deploy@your-server
+tar -C dist -czf - . | ssh -o IdentitiesOnly=yes -i deploy_key sallskap-deploy@your-server
 ```
 
 The key can only publish to its own site. It can't open a shell or reach anything else on the server.

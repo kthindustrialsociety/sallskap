@@ -488,7 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _print_deploy_key(domain: str, private: str) -> None:
     print(f"\nDeploy key for {domain}. Store it as a CI secret now; it isn't kept on this server.\n")
     print(private)
-    print(f"Publish from CI with:\n  tar -C dist -czf - . | ssh -i <key> {DEPLOY_USER}@<server>")
+    print(f"Publish from CI with:\n  tar -C dist -czf - . | ssh -o IdentitiesOnly=yes -i <key> {DEPLOY_USER}@<server>")
 
 
 def main(argv: list[str] | None = None) -> int:
