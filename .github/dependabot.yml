@@ -4,3 +4,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  - package-ecosystem: pip
+    directory: /core
+    schedule:
+      interval: weekly
+    ignore:
+      # Stay on the Django LTS line until the project chooses to move.
+      - dependency-name: django
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: docker
+    directory: /core
+    schedule:
+      interval: weekly

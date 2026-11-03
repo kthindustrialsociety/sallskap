@@ -34,3 +34,20 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck install.sh
+
+  core:
+    name: Core (in Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build --tag sallskap-core:test core
+      - name: Run the tests with the same limits as production
+        run: >-
+          docker run --rm --read-only --tmpfs /tmp --memory 768m --cap-drop ALL
+          --security-opt no-new-privileges
+          --env SALLSKAP_DOMAIN=example.org
+          --env SALLSKAP_DATA_DIR=/tmp
+          --env DJANGO_SECRET_KEY="$(openssl rand -hex 32)"
+          sallskap-core:test python manage.py test
