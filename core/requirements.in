@@ -1,7 +1,8 @@
 # Direct dependencies. Rebuild requirements.txt from this with:
 #   pip-compile --generate-hashes --allow-unsafe requirements.in
 Django==5.2.19
-django-allauth[mfa]==65.21.1
+django-allauth[mfa,idp-oidc]==65.21.1
+requests==2.34.2  # allauth's idp-oidc extra needs this but doesn't declare it
 gunicorn==26.2.0
 whitenoise==6.12.0
 argon2-cffi==25.1.0

@@ -1,6 +1,7 @@
 """Settings for Sällskap core. Everything specific to one installation comes
 from the environment, which `kit` writes to /etc/sallskap/core.env."""
 
+import base64
 import os
 from pathlib import Path
 
@@ -30,6 +31,7 @@ INSTALLED_APPS = [
     "allauth",
     "allauth.account",
     "allauth.mfa",
+    "allauth.idp.oidc",
     "accounts",  # last: it assigns permissions, so every other app's must exist by then
 ]
 
@@ -139,6 +141,15 @@ ACCOUNT_RATE_LIMITS = {"login_failed": "10/m/ip,5/5m/key"}
 MFA_SUPPORTED_TYPES = ["totp", "recovery_codes"]
 MFA_TOTP_ISSUER = APP_HOST
 MFA_TOTP_TOLERANCE = 1  # accepts the neighbouring 30 seconds, for phones with a slightly wrong clock
+
+# The login service for other tools. Its key signs what it tells them, so it has
+# to stay the same: `kit` makes it once, like the secret key.
+IDP_OIDC_ADAPTER = "accounts.login_service.LoginServiceAdapter"
+IDP_OIDC_PRIVATE_KEY = base64.b64decode(os.environ.get("OIDC_SIGNING_KEY", "")).decode()
+IDP_OIDC_AUTH_METHODS = ["client_secret_basic", "client_secret_post"]  # every tool has a secret
+IDP_OIDC_ACCESS_TOKEN_EXPIRES_IN = 10 * 60  # tools only need it just after someone logs in
+IDP_OIDC_REFRESH_TOKEN_EXPIRES_IN = 10 * 60  # always issued, never usable: tools aren't allowed that flow
+IDP_OIDC_RATE_LIMITS = {"token": "60/m/ip"}  # each attempt costs a 100 MB password check
 
 # Nothing sends mail yet. Until it does, people get in with `kit link`.
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"

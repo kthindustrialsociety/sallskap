@@ -1,8 +1,11 @@
+from allauth.core.internal import ratelimit
+from allauth.idp.oidc import views as provider_views
 from django.contrib import admin
 from django.http import Http404
 from django.urls import include, path, re_path
 
 from accounts import views
+from accounts.login_service import AuthorizationView
 
 
 def not_found(request, *args, **kwargs):
@@ -18,4 +21,11 @@ urlpatterns = [
     # templates need the closed routes' names, so they stay defined below.
     re_path(r"^accounts/(?!(login|logout|reauthenticate|password/change|inactive)/?$|2fa(/|$))", not_found),
     path("accounts/", include("allauth.urls")),
+    # The login service for other tools, closed in the same way. The device, revoke,
+    # introspect and registration routes stay shut: the device flow would be a way
+    # around the 2FA rule, and tools are only added through `kit`.
+    re_path(r"^identity/o/(?!(authorize|logout|api/token|api/userinfo)$)", not_found),
+    path("identity/o/authorize", AuthorizationView.as_view()),
+    path("identity/o/api/token", ratelimit.decorator(app="allauth.idp.oidc", action="token")(provider_views.token)),
+    path("", include("allauth.idp.urls")),
 ]
