@@ -24,6 +24,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -34,6 +35,9 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE = Path("/root/.sallskap-live-check.json")
 CONFIG = Path("/etc/sallskap/config.toml")
 CORE_ENV = Path("/etc/sallskap/core.env")
+GIT_ENV = Path("/etc/sallskap/git.env")
+FORGEJO = "sallskap-forgejo-1"
+FORGEJO_SERVICE_USER = "sallskap-admin"
 PASSWORD = "fake-user-long-password-42"
 LOCKED_TEXT = "Too many failed login attempts"
 FAKE = {
@@ -48,7 +52,17 @@ FAKE = {
     "fake-tool-2fa": (["treasurer"], True),
     "fake-tool-member": (["member"], False),
     "fake-tool-off": (["member"], False),
+    "fake-git-dev": (["developer"], False),
+    "fake-git-keeper": (["developer"], False),
+    "fake-git-board": (["board"], True),
+    "fake-git-operator": (["operator"], True),
+    "fake-git-member": (["member"], False),
+    "fake-git-moving": (["member"], True),
+    "fake-git-leaving": (["developer"], False),
+    "fake-git-clash": (["member"], False),
 }
+# These can't be named fake-something, as what's being tested is the name itself.
+FAKE_OTHER = ["fake-git-clash@example.net", f"{FORGEJO_SERVICE_USER}@example.org", "admin@example.org"]
 FAKE_TOOL = "fake-tool"
 FAKE_CALLBACK = "https://tool.example.org/callback"
 
@@ -155,7 +169,7 @@ class Browser:
         visited = [path]
         response = self.get(path)
         for _ in range(8):
-            if response.status not in (301, 302):
+            if response.status not in (301, 302, 303, 307):
                 break
             parsed = urllib.parse.urlparse(response.location)
             next_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
@@ -259,6 +273,8 @@ for name, (roles, two_factor) in FAKE.items():
     if two_factor:
         secrets[name] = generate_totp_secret()
         TOTP.activate(user, secrets[name])
+for email in {FAKE_OTHER!r}:
+    User.objects.create_user(email, {PASSWORD!r})
 cache.clear()
 print(json.dumps(secrets))
 """
@@ -695,6 +711,569 @@ get_user_model().objects.get(email={email_of("fake-tool-member")!r}).groups.add(
     return tool
 
 
+# ---- Forgejo --------------------------------------------------------------------
+
+
+def git_enabled():
+    return tomllib.loads(CONFIG.read_text()).get("modules", {}).get("git", False)
+
+
+def git_host(host):
+    return host.replace("app.", "git.", 1)
+
+
+def org_of(host):
+    return host.split(".")[1]
+
+
+def in_forgejo(*args):
+    return subprocess.run(["docker", "exec", FORGEJO, *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+class Person:
+    """One browser, which keeps separate cookies for core and for Forgejo."""
+
+    def __init__(self, host):
+        self.host = host
+        self.app = Browser(host)
+        self.git = Browser(git_host(host))
+
+    def log_in_to_core(self, email, code_secret=None):
+        self.app.log_in(email)
+        if code_secret:
+            self.app.enter_code(totp(code_secret))
+
+    def sign_in_to_git(self):
+        return self.open_git(f"/user/oauth2/{org_of(self.host)}")
+
+    def open_git(self, path):
+        """Open a page and follow where it goes, across both hostnames. Returns the
+        last place reached, as a hostname and path, and the answer from there."""
+        browser = self.git
+        last = f"{browser.host}{path}"
+        response = browser.get(path)
+        for _ in range(8):
+            if response.status not in (301, 302, 303, 307):
+                return last, response
+            target = urllib.parse.urlparse(response.location)
+            if target.netloc:  # an address with no hostname stays where it is
+                browser = self.git if target.netloc == self.git.host else self.app
+            path = target.path + (f"?{target.query}" if target.query else "")
+            last = f"{browser.host}{path}"
+            response = browser.get(path)
+        return "too many redirects", response
+
+    def in_git(self):
+        """The real settings form, not just a 200: Forgejo answers someone it has
+        blocked with a 200 page that says so."""
+        page = self.git.get("/user/settings")
+        return page.status == 200 and 'name="full_name"' in page.text
+
+    def new_git_session(self):
+        self.git = Browser(git_host(self.host))
+
+    def make_token(self, name="fake-token"):
+        """The way a person gets one: on the settings page, where no password is asked for."""
+        scopes = ["write:repository", "write:organization", "write:user"]
+        answer = self.git.send(
+            "POST",
+            "/user/settings/applications/tokens/new",
+            [("name", name), ("resource", "all"), *[("scope", scope) for scope in scopes]],
+        )
+        found = re.search(r"\b[0-9a-f]{40}\b", self.git.get(answer.location or "/user/settings/applications").text)
+        return found.group(0) if found else None
+
+
+def forgejo_api(host, token, method, path, body=None, basic=None):
+    connection = http.client.HTTPSConnection(git_host(host), context=ssl.create_default_context(), timeout=30)
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    if basic:
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{basic[0]}:{basic[1]}".encode()).decode()
+    connection.request(method, f"/api/v1{path}", json.dumps(body) if body is not None else None, headers)
+    response = Response(connection.getresponse())
+    connection.close()
+    try:
+        return response.status, json.loads(response.text)
+    except ValueError:
+        return response.status, None
+
+
+def button_page(host):
+    """Forgejo's sign-in page, which people only see just after a login error or signing out."""
+    return Browser(git_host(host), cookies={"sallskap_stay": "1"}).get("/user/login")
+
+
+def team_names(host, token):
+    status, teams = forgejo_api(host, token, "GET", "/user/teams")
+    return sorted(team["name"] for team in teams) if status == 200 else f"status {status}"
+
+
+def run_git(*args, cwd=None):
+    environment = {"GIT_TERMINAL_PROMPT": "0", "PATH": "/usr/bin:/bin", "HOME": "/tmp", "GIT_CONFIG_NOSYSTEM": "1"}
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=environment, timeout=120)
+
+
+def repo_url(host, username, secret, repo):
+    return f"https://{username}:{secret}@{git_host(host)}/{org_of(host)}/{repo}.git"
+
+
+def set_groups(email, roles):
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+get_user_model().objects.get(email={email!r}).groups.set(Group.objects.filter(role__key__in={roles!r}))
+"""
+    )
+
+
+def forgejo_tokens():
+    """How many tokens exist, which only the database can say: it's read here, never changed."""
+    code = "import sqlite3; print(sqlite3.connect('file:/srv/git/data/gitea.db?mode=ro', uri=True).execute('select count(*) from access_token').fetchone()[0])"
+    return subprocess.run(["python3", "-c", code], capture_output=True, text=True).stdout.strip()
+
+
+def forgejo_fingerprint():
+    """What must not change when the setup runs again or the server restarts."""
+    return {
+        "secrets": hashlib.sha256(GIT_ENV.read_bytes()).hexdigest(),
+        "login source": in_forgejo("forgejo", "admin", "auth", "list").stdout,
+        "tool in core": kit("tool", "list").stdout,
+        "number of tokens": forgejo_tokens(),
+    }
+
+
+def check_forgejo_exposure(host):
+    section("Forgejo: exposure")
+    info = json.loads(subprocess.run(["docker", "inspect", FORGEJO], capture_output=True, text=True).stdout)[0]
+    config = info["HostConfig"]
+    check("It has no published ports", not config["PortBindings"], str(config["PortBindings"]))
+    check("It has a memory limit", config["Memory"] > 0)
+    check("Its filesystem is read-only", config["ReadonlyRootfs"])
+    check("It drops all capabilities", config["CapDrop"] == ["ALL"], str(config["CapDrop"]))
+    check("It can't gain privileges", "no-new-privileges:true" in config["SecurityOpt"])
+    check("It restarts by itself", config["RestartPolicy"]["Name"] == "unless-stopped")
+    uid = in_forgejo("id", "-u").stdout.strip()
+    check("It runs as non-root", uid == "1000", uid)
+    # Both files: Go's dual-stack listeners only show up in the IPv6 one.
+    listening = in_forgejo("cat", "/proc/net/tcp", "/proc/net/tcp6").stdout
+    check("It listens on its web port, so this can see what's listening", ":0BB8 " in listening)  # port 3000
+    check("Its SSH server isn't running", ":08AE " not in listening)  # port 2222
+    data = subprocess.run(["stat", "-c", "%u %a", "/srv/git"], capture_output=True, text=True).stdout.strip()
+    check("Its data folder is private to it", data == "1000 700", data)
+    secrets_mode = subprocess.run(["stat", "-c", "%u %a", str(GIT_ENV)], capture_output=True, text=True).stdout.strip()
+    check("Its secrets file is readable by root only", secrets_mode == "0 600", secrets_mode)
+    try:
+        socket.create_connection((socket.gethostbyname(git_host(host)), 2222), 3).close()
+        reachable = True
+    except OSError:
+        reachable = False
+    check("Port 2222 can't be reached from the public address", not reachable)
+
+
+def check_forgejo_https(host):
+    section("Forgejo: HTTPS and cookies")
+    page = button_page(host)
+    check("The sign-in page loads over HTTPS with a valid certificate", page.status == 200, str(page.status))
+    plain = http.client.HTTPConnection(git_host(host), 80, timeout=10)
+    plain.request("GET", "/")
+    answer = plain.getresponse()
+    check("Plain HTTP redirects to HTTPS", answer.status in (301, 308) and answer.getheader("Location", "").startswith("https://"), str(answer.status))
+    plain.close()
+    check("HSTS is on", "max-age=" in (page.headers.get("Strict-Transport-Security") or ""))
+    check("The site can't be framed by others", page.headers.get("X-Frame-Options") in ("SAMEORIGIN", "DENY"))
+    check("No server software is advertised", page.headers.get("Server") is None, str(page.headers.get("Server")))
+    check("No proxy software is advertised", page.headers.get("Via") is None, str(page.headers.get("Via")))
+    landing = Browser(git_host(host)).get("/")
+    check("The first page leads to signing in", landing.location.endswith("/user/login"), landing.location)
+
+    person = Person(host)
+    person.log_in_to_core(email_of("fake-git-dev"))
+    start = person.git.get(f"/user/oauth2/{org_of(host)}")
+    cookies = start.set_cookies
+    person.sign_in_to_git()
+    session = next((c for c in person.git.get("/user/settings").set_cookies + cookies if c.startswith("session=")), "")
+    check("Session cookie is Secure", "Secure" in session, session)
+    check("Session cookie is HttpOnly", "HttpOnly" in session, session)
+    check("Session cookie has no Domain, so it stays on this hostname", "domain=" not in session.lower(), session)
+    check("Signing in leaves no long-lived cookie", "persistent" not in person.git.cookies, str(sorted(person.git.cookies)))
+
+
+def check_forgejo_single_login(host, secrets_by_name):
+    section("Forgejo: one login")
+    page = button_page(host)
+    check("The sign-in page offers the login service", f"/user/oauth2/{org_of(host)}" in page.text)
+    check("The sign-in page has no password box", 'type="password"' not in page.text)
+
+    person = Person(host)
+    person.log_in_to_core(email_of("fake-git-dev"))
+    last, final = person.open_git("/")
+    check("Someone logged in to core who opens Forgejo gets in, with nothing to click", person.in_git(), f"{last} {final.status}")
+    home = person.git.get("/")
+    check("Once in, the first page is their dashboard, not the sign-in page", home.status == 200 and "/user/login" not in home.location and 'name="full_name"' not in home.text and "dashboard" in home.text.lower(), f"{home.status} {home.location}")
+    check("...which the logo leads to", 'id="navbar-logo"' in home.text and re.search(r'id="navbar-logo"[^>]*href="/"|href="/"[^>]*id="navbar-logo"', home.text) is not None)
+
+    visitor = Person(host)
+    last, _ = visitor.open_git("/")
+    check("A visitor who opens Forgejo is sent to core's login page", "/accounts/login/" in last, last)
+    check("...and isn't in yet", not visitor.in_git())
+
+    looping = Browser(git_host(host))
+    first = looping.get("/user/login")
+    check("Opening the sign-in page goes straight to the login service", first.status == 302 and urllib.parse.urlparse(first.location).path == f"/user/oauth2/{org_of(host)}", f"{first.status} {first.location}")
+    second = looping.get("/user/login")
+    check("Coming straight back shows the page, so a login error can't loop", second.status == 200, f"{second.status} {second.location}")
+
+    returning = Person(host)
+    returning.log_in_to_core(email_of("fake-git-dev"))
+    last, final = returning.open_git("/user/login?redirect_to=%2Fexplore%2Frepos")
+    check("Signing in from a page returns to that page", last.endswith("/explore/repos") and final.status == 200, f"{last} {final.status}")
+
+    board = Person(host)
+    response = board.git.get(f"/user/oauth2/{org_of(host)}")
+    target = urllib.parse.urlparse(response.location)
+    login = board.app.get(f"{target.path}?{target.query}")
+    after_password = board.app.post_form(login.location, {"login": email_of("fake-git-board"), "password": PASSWORD})
+    check("With 2FA, a password alone goes to the code page", "/accounts/2fa/authenticate" in after_password.location, after_password.location)
+    check("...and doesn't get into Forgejo", not board.in_git())
+    after_code = board.app.enter_code(totp(secrets_by_name["fake-git-board"]))
+    authorize = board.app.get(after_code.location)
+    back = urllib.parse.urlparse(authorize.location)
+    board.git.get(f"{back.path}?{back.query}")
+    check("With the code too, they're in, with nothing more to enter", board.in_git(), authorize.location)
+
+    no_2fa = Person(host)
+    no_2fa.log_in_to_core(email_of("fake-board-no2fa"))
+    last, _ = no_2fa.sign_in_to_git()
+    check("A Board member without 2FA is sent to set it up", "/accounts/2fa/" in last, last)
+    check("...and doesn't get in", not no_2fa.in_git())
+
+    forger = Person(host)
+    forger.git.get(f"/user/oauth2/{org_of(host)}/callback?code=made-up&state=made-up")
+    check("A made-up login code doesn't get in", not forger.in_git())
+
+    # This browser never expires cookies, so the one from signing in has to go first,
+    # or it would hide whether signing out sets its own.
+    person.git.cookies.pop("sallskap_stay", None)
+    person.git.send("POST", "/user/logout", {})
+    check("Signing out of Forgejo works", not person.in_git())
+    check("...and leaves them logged in to core", person.app.logged_in())
+    last, _ = person.open_git("/")
+    check("Opening Forgejo right after doesn't sign them straight back in", not person.in_git(), last)
+    person.git.cookies.pop("sallskap_stay", None)  # as if the few minutes had passed
+    person.open_git("/")
+    check("...but after a few minutes it does, as they're still logged in to core", person.in_git())
+
+
+def check_forgejo_closed_doors(host):
+    section("Forgejo: no way around core")
+    browser = Browser(git_host(host))
+    posted = browser.send("POST", "/user/login", {"user_name": FORGEJO_SERVICE_USER, "password": "not-a-real-password"})
+    check("Local password login is refused", posted.status == 403, str(posted.status))
+    posted = browser.send("POST", "/user/sign_up", {"user_name": "fake-signup", "email": "fake-signup@example.org", "password": PASSWORD, "retype": PASSWORD})
+    check("Signing up directly is refused", posted.status == 403, str(posted.status))
+    check("Signing up made no account", "fake-signup" not in in_forgejo("forgejo", "admin", "user", "list").stdout)
+    # A redirect to the sign-in page wouldn't show this: that's also what the route
+    # does when it's on, for someone who isn't signed in.
+    status = Browser(git_host(host)).get("/.well-known/openid-configuration").status
+    check("Forgejo's own login service isn't available", status == 404, str(status))
+    for path, label in (
+        ("/user/login/openid", "OpenID sign-in"),
+        ("/user/forgot_password", "Password reset"),
+    ):
+        answer = Browser(git_host(host)).get(path)
+        check(f"{label} isn't available", answer.status in (403, 404) or "/user/login" in answer.location or "disabled" in answer.text.lower(), f"{answer.status} {answer.location}")
+    install = Browser(git_host(host)).get("/install")
+    check("The first-run setup page isn't there", install.status == 404 or "/user/login" in install.location, f"{install.status} {install.location}")
+    faked = Browser(git_host(host), headers={"X-WEBAUTH-USER": FORGEJO_SERVICE_USER})
+    check("A faked reverse-proxy login header gets nowhere", faked.get("/user/settings").status != 200)
+    status = faked.get("/api/v1/user").status
+    check("...on the API either", status == 401, str(status))
+
+    section("Forgejo: personal data, to a visitor")
+    people = Browser(git_host(host))
+    explore = people.get("/explore/users")
+    check("The list of people isn't public", explore.status in (303, 403, 404) and "/explore/users" not in explore.location, f"{explore.status} {explore.location}")
+    final, _ = people.follow("/explore/users")
+    check("...and no one's name is where it leads", "fake-git" not in final.text)
+    status, _ = forgejo_api(host, None, "GET", "/users/search?q=fake")
+    check("Searching for people isn't public", status in (401, 403, 404), str(status))
+    check("Someone's page isn't public", Browser(git_host(host)).get("/fake-git-dev").status == 404)
+    check("The organisation's page names no one", "fake-git" not in Browser(git_host(host)).get(f"/{org_of(host)}").text)
+    status, members = forgejo_api(host, None, "GET", f"/orgs/{org_of(host)}/public_members")
+    check("Nor does its public list of members", not members, str(members))
+
+
+def check_forgejo_password_door(host, person, username, token):
+    """A Forgejo password must not open anything, however someone came to have one."""
+    section("Forgejo: a password on someone's account")
+    page = person.git.get("/user/settings/account")
+    check("Their account page doesn't offer to set one", 'name="retype"' not in page.text)
+    check("...or to delete their account", "/user/settings/account/delete" not in page.text)
+    chosen = "fake-forgejo-password-42"
+    set_it = in_forgejo("forgejo", "admin", "user", "change-password", "--username", username, "--password", chosen, "--must-change-password=false")
+    check("One can be set from the server, for this test", set_it.returncode == 0, set_it.stderr[:200])
+    fresh = Browser(git_host(host))
+    posted = fresh.send("POST", "/user/login", {"user_name": username, "password": chosen})
+    check("It doesn't log in on the web", posted.status == 403, str(posted.status))
+    status, _ = forgejo_api(host, None, "GET", "/user", basic=(username, chosen))
+    check("It doesn't work on the API", status == 401, str(status))
+    result = run_git("ls-remote", repo_url(host, username, chosen, "fake-repo"))
+    check("It doesn't work with Git", result.returncode != 0, result.stdout)
+    result = run_git("ls-remote", repo_url(host, username, token, "fake-repo"))
+    check("A token still does", result.returncode == 0, result.stderr)
+
+
+def check_forgejo_groups(host, secrets_by_name):
+    section("Forgejo: groups decide teams")
+    people = {}
+
+    def signed_in(name, code=False):
+        person = Person(host)
+        person.log_in_to_core(email_of(name), secrets_by_name[name] if code else None)
+        person.sign_in_to_git()
+        token = person.make_token()
+        check(f"{name} can make a token on the settings page", bool(token))
+        people[name] = (person, token)
+        return person, token
+
+    _, token = signed_in("fake-git-dev")
+    check("Developer: on the developers team", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    check("Developer: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+
+    _, token = signed_in("fake-git-board", code=True)
+    check("Board: on the board team", team_names(host, token) == ["board"], str(team_names(host, token)))
+    check("Board: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+
+    _, token = signed_in("fake-git-operator", code=True)
+    check("Operator: an owner of the organisation", team_names(host, token) == ["Owners"], str(team_names(host, token)))
+    check("Operator: a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
+
+    _, token = signed_in("fake-git-member")
+    check("Member: on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("Member: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+
+    section("Forgejo: changing someone's groups")
+    moving, token = signed_in("fake-git-moving", code=True)
+    check("They start on no team", team_names(host, token) == [], str(team_names(host, token)))
+
+    def next_login(roles):
+        set_groups(email_of("fake-git-moving"), roles)
+        moving.new_git_session()
+        moving.sign_in_to_git()
+
+    next_login(["developer"])
+    check("Adding them to Developer puts them on the team at next login", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    next_login(["member"])
+    check("Removing them takes them off the team at next login", team_names(host, token) == [], str(team_names(host, token)))
+    next_login(["operator"])
+    check("Adding them to Operator makes them an admin and owner", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True and team_names(host, token) == ["Owners"], str(team_names(host, token)))
+    next_login(["member"])
+    check("Removing them takes both away", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False and team_names(host, token) == [], str(team_names(host, token)))
+    return people
+
+
+def check_forgejo_git(host, people):
+    section("Forgejo: what each team can do with Git")
+    org = org_of(host)
+    developer = people["fake-git-dev"][1]
+    status, _ = forgejo_api(host, developer, "POST", f"/orgs/{org}/repos", {"name": "fake-repo", "private": True})
+    check("A Developer can create a repo in the organisation", status == 201, str(status))
+    form = people["fake-git-dev"][0].git.get("/repo/create").text
+    check("The new repo form starts on private", bool(re.search(r'<input[^>]*name="private"[^>]*checked', form)))
+
+    # Forgejo's API answers this refusal with a 500, so what counts is that no repo appears.
+    status, _ = forgejo_api(host, developer, "POST", "/user/repos", {"name": "fake-personal"})
+    exists = forgejo_api(host, developer, "GET", "/repos/fake-git-dev/fake-personal")[0]
+    check("A Developer can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
+    owners = re.findall(r'data-value="\d+"[^>]*>.*?<span[^>]*>\s*([^<\s]+)', form, re.S)
+    check("The new repo form only offers the organisation", org in owners and "fake-git-dev" not in owners, str(owners))
+    member = people["fake-git-member"][1]
+    status, _ = forgejo_api(host, member, "POST", "/user/repos", {"name": "fake-personal"})
+    exists = forgejo_api(host, member, "GET", "/repos/fake-git-member/fake-personal")[0]
+    check("A Member can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
+    status, _ = forgejo_api(host, member, "POST", f"/orgs/{org}/repos", {"name": "fake-members-repo"})
+    check("A Member can't create a repo in the organisation", status == 403, str(status))
+    status, _ = forgejo_api(host, member, "POST", "/orgs", {"username": "fake-org"})
+    check("A Member can't create an organisation", status in (403, 422), str(status))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp, "work")
+        work.mkdir()
+        (work / "file.txt").write_text("from the live check\n")
+        for args in (("init", "-q", "-b", "main"), ("add", "."), ("-c", "user.name=Fake", "-c", "user.email=fake@example.org", "commit", "-q", "-m", "first")):
+            run_git(*args, cwd=work)
+        pushed = run_git("push", "-q", repo_url(host, "fake-git-dev", developer, "fake-repo"), "main", cwd=work)
+        check("A Developer can push with a token", pushed.returncode == 0, pushed.stderr[:300])
+        cloned = run_git("clone", "-q", repo_url(host, "fake-git-dev", developer, "fake-repo"), str(Path(tmp, "dev")))
+        check("A Developer can clone it", cloned.returncode == 0 and Path(tmp, "dev", "file.txt").exists(), cloned.stderr[:300])
+
+        board = people["fake-git-board"][1]
+        cloned = run_git("clone", "-q", repo_url(host, "fake-git-board", board, "fake-repo"), str(Path(tmp, "board")))
+        check("Board can clone it", cloned.returncode == 0, cloned.stderr[:300])
+        pushed = run_git("push", "-q", repo_url(host, "fake-git-board", board, "fake-repo"), "main:board-branch", cwd=work)
+        check("Board can't push to it", pushed.returncode != 0, pushed.stdout)
+        # After the push, as an empty repo might be refused for being empty.
+        status, _ = forgejo_api(host, board, "POST", f"/repos/{org}/fake-repo/forks", {})
+        exists = forgejo_api(host, board, "GET", "/repos/fake-git-board/fake-repo")[0]
+        check("Board can't fork it into a copy of their own", status != 202 and exists == 404, f"{status} {exists}")
+
+        cloned = run_git("clone", "-q", repo_url(host, "fake-git-member", member, "fake-repo"), str(Path(tmp, "member")))
+        check("A Member can't clone it", cloned.returncode != 0, cloned.stdout)
+        cloned = run_git("ls-remote", f"https://{git_host(host)}/{org}/fake-repo.git")
+        check("Someone not logged in can't reach it", cloned.returncode != 0, cloned.stdout)
+
+        leaving = Person(host)
+        leaving.log_in_to_core(email_of("fake-git-leaving"))
+        leaving.sign_in_to_git()
+        token = leaving.make_token()
+        check("Before leaving the team, they can push", run_git("push", "-q", repo_url(host, "fake-git-leaving", token, "fake-repo"), "main:leaving-branch", cwd=work).returncode == 0)
+        set_groups(email_of("fake-git-leaving"), ["member"])
+        leaving.new_git_session()
+        leaving.sign_in_to_git()
+        pushed = run_git("push", "-q", repo_url(host, "fake-git-leaving", token, "fake-repo"), "main:leaving-branch-2", cwd=work)
+        check("After leaving, at next login, their token can't push", pushed.returncode != 0, pushed.stdout)
+
+
+def check_forgejo_names(host):
+    section("Forgejo: usernames can't take over an account")
+    first = Person(host)
+    first.log_in_to_core(email_of("fake-git-clash"))
+    first.sign_in_to_git()
+    first_token = first.make_token()
+    first_name = forgejo_api(host, first_token, "GET", "/user")[1].get("login")
+    check("The first person gets the plain name", first_name == "fake-git-clash", str(first_name))
+
+    second = Person(host)
+    second.log_in_to_core("fake-git-clash@example.net")
+    second.sign_in_to_git()
+    second_token = second.make_token()
+    second_name = (forgejo_api(host, second_token, "GET", "/user")[1] or {}).get("login", "") if second_token else ""
+    check("Someone with the same name gets their own account", second_name.startswith("fake-git-clash-"), str(second_name))
+
+    for email, label in ((f"{FORGEJO_SERVICE_USER}@example.org", "the account that owns the organisation"), ("admin@example.org", "a name Forgejo reserves")):
+        person = Person(host)
+        person.log_in_to_core(email)
+        _, final = person.sign_in_to_git()
+        check(f"An address matching {label} gets an error, not the account", not person.in_git(), str(final.status))
+        print(f"  info  It answered {final.status}.")
+
+    section("Forgejo: addresses come from core")
+    someone = "fake-git-clash@example.net"
+    answer = first.git.send("POST", "/user/settings/account/email", {"email": someone})
+    check("The form won't add someone else's address", answer.status == 403, f"{answer.status} {answer.location}")
+    for path in ("/user//settings/account/email", "/user/settings/account/email/", "/user/./settings/account/email"):
+        answer = first.git.send("POST", path, {"email": someone})
+        check(f"...not through {path} either", answer.status != 303 or "/user/settings/account" not in answer.location, f"{answer.status} {answer.location}")
+    status, _ = forgejo_api(host, first_token, "POST", "/user/emails", {"emails": [someone]})
+    check("Nor will the API", status == 403, str(status))
+    addresses = [item["email"] for item in forgejo_api(host, first_token, "GET", "/user/emails")[1]]
+    check("...and it hasn't been added", someone not in addresses, str(addresses))
+    check("Their own address is still there", email_of("fake-git-clash") in addresses, str(addresses))
+
+    other = (forgejo_api(host, first_token, "GET", f"/users/{second_name}")[1] or {}).get("email", "")
+    check("A logged-in person can't see someone else's address", "example.net" not in other, other)
+
+
+def check_forgejo_setup_repeats(host):
+    section("Forgejo: running the setup again")
+    before = forgejo_fingerprint()
+    output = kit("enable", "git")
+    check("kit enable git runs again", output.returncode == 0, output.stdout[-300:] + output.stderr[-300:])
+    after = forgejo_fingerprint()
+    for label in before:
+        check(f"Its {label} didn't change", before[label] == after[label], f"{before[label]} {after[label]}")
+
+
+def check_forgejo(host, secrets_by_name):
+    clear_limits()
+    check_forgejo_exposure(host)
+    check_forgejo_https(host)
+    check_forgejo_closed_doors(host)
+    check_forgejo_single_login(host, secrets_by_name)
+    time.sleep(31)  # each code works once, and fake-git-board logs in again below
+    people = check_forgejo_groups(host, secrets_by_name)
+    check_forgejo_git(host, people)
+    check_forgejo_password_door(host, people["fake-git-dev"][0], "fake-git-dev", people["fake-git-dev"][1])
+    check_forgejo_names(host)
+    check_forgejo_setup_repeats(host)
+    clear_limits()
+
+    keeper = Person(host)
+    keeper.log_in_to_core(email_of("fake-git-keeper"))
+    keeper.sign_in_to_git()
+    token = keeper.make_token()
+    fingerprint = forgejo_fingerprint()  # after that token, which is the last one made
+    return {
+        "cookies": keeper.git.cookies,
+        "core_cookies": keeper.app.cookies,
+        "token": token,
+        "operator_token": people["fake-git-operator"][1],
+        "fingerprint": fingerprint,
+    }
+
+
+def verify_forgejo(host, state):
+    section("Forgejo: did logins and data survive?")
+    keeper = Person(host)
+    keeper.git.cookies = dict(state["cookies"])
+    check("A session is still signed in", keeper.in_git())
+    check("A token still works", team_names(host, state["token"]) == ["developers"], str(team_names(host, state["token"])))
+    fresh = Person(host)
+    fresh.app.cookies = dict(state["core_cookies"])
+    fresh.sign_in_to_git()
+    check("A new sign-in still works", fresh.in_git())
+    with tempfile.TemporaryDirectory() as tmp:
+        cloned = run_git("clone", "-q", repo_url(host, "fake-git-keeper", state["token"], "fake-repo"), str(Path(tmp, "check")))
+        check("A repo is still there, with its contents", cloned.returncode == 0 and Path(tmp, "check", "file.txt").exists(), cloned.stderr[:300])
+    now = forgejo_fingerprint()
+    for label, value in now.items():
+        check(f"Its {label} didn't change", value == state["fingerprint"][label], f"{value} {state['fingerprint'][label]}")
+    health = json.loads(subprocess.run(["docker", "inspect", FORGEJO], capture_output=True, text=True).stdout)[0]["State"].get("Health", {})
+    check("It's healthy", health.get("Status") == "healthy", str(health.get("Status")))
+    check_forgejo_exposure(host)
+
+
+def burst_forgejo(host, state):
+    section("Many clones at once")
+    info = json.loads(subprocess.run(["docker", "inspect", FORGEJO], capture_output=True, text=True).stdout)[0]
+    cgroup = Path(f"/sys/fs/cgroup/system.slice/docker-{info['Id']}.scope")
+    oom_before = _oom_kills(cgroup)
+    results = []
+
+    def one_clone(target):
+        results.append(run_git("clone", "-q", repo_url(host, "fake-git-keeper", state["token"], "fake-repo"), target).returncode == 0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        threads = [threading.Thread(target=one_clone, args=(str(Path(tmp, str(n))),)) for n in range(12)]
+        started = time.time()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    limit_mb = info["HostConfig"]["Memory"] / 1024**2
+    peak_file = cgroup / "memory.peak"
+    peak_mb = int(peak_file.read_text()) / 1024**2 if peak_file.exists() else None
+    print(f"  info  12 clones took {time.time() - started:.1f}s. Peak memory {peak_mb and round(peak_mb)} MB of a {limit_mb:.0f} MB limit.")
+    check("All 12 clones succeeded", all(results) and len(results) == 12, f"{sum(results)} of {len(results)}")
+    check("Nothing was killed for using too much memory", _oom_kills(cgroup) == oom_before)
+
+
+def cleanup_forgejo():
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    host = app_host()
+    token = state.get("git", {}).get("operator_token")
+    if token:
+        print("Fake repo:", forgejo_api(host, token, "DELETE", f"/repos/{org_of(host)}/fake-repo")[0])
+    listed = in_forgejo("forgejo", "admin", "user", "list").stdout
+    for name in re.findall(r"^\d+\s+(fake-\S+)", listed, re.M):
+        in_forgejo("forgejo", "admin", "user", "delete", "--username", name, "--purge")
+    left = re.findall(r"^\d+\s+(fake-\S+)", in_forgejo("forgejo", "admin", "user", "list").stdout, re.M)
+    print(f"Fake accounts left in Forgejo: {len(left)}")
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -711,6 +1290,7 @@ def prepare():
     check_links(host, secrets_by_name)
     check_recovery(host)
     tool = check_login_service(host, secrets_by_name)
+    forgejo = check_forgejo(host, secrets_by_name) if git_enabled() else None
 
     keeper = Browser(host)
     keeper.log_in(email_of("fake-member"))
@@ -722,6 +1302,7 @@ def prepare():
                 "env": env_fingerprint(),
                 "data": data_snapshot(),
                 "tool": tool,
+                "git": forgejo,
                 "signing_key": json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"][0]["kid"],
             }
         )
@@ -757,6 +1338,8 @@ def verify():
     status = docker_inspect("core")["State"]
     check("Core is healthy", status.get("Health", {}).get("Status") == "healthy", str(status.get("Health", {}).get("Status")))
     check_exposure(host)
+    if state.get("git"):
+        verify_forgejo(host, state["git"])
 
 
 def burst():
@@ -787,6 +1370,9 @@ def burst():
     check("All 12 logins succeeded", all(results) and len(results) == 12, f"{sum(results)} of {len(results)}")
     check("Nothing was killed for using too much memory", _oom_kills(cgroup) == oom_before)
     clear_limits()
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if state.get("git"):
+        burst_forgejo(host, state["git"])
 
 
 def _oom_kills(cgroup):
@@ -797,12 +1383,15 @@ def _oom_kills(cgroup):
 
 
 def cleanup():
+    if git_enabled():
+        cleanup_forgejo()
     in_core(
-        """
+        f"""
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 print(get_user_model().objects.filter(email__startswith="fake-", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__startswith="nobody", email__endswith="@example.org").delete())
+print(get_user_model().objects.filter(email__in={FAKE_OTHER!r}).delete())
 cache.clear()
 """
     )

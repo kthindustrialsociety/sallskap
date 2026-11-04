@@ -8,6 +8,7 @@ installed. Needs Python 3.11 or newer.
 import argparse
 import base64
 import fcntl
+import json
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
+PROJECT = "sallskap"  # the name in compose.yml: every module joins this Compose project
 DEPLOY_USER = "sallskap-deploy"
 KIT_COMMAND = "/usr/local/bin/kit"
 CADDY_ROOT = "/srv/website"
@@ -31,6 +33,7 @@ RELEASES_KEPT = 5
 MAX_UPLOAD_BYTES = 2 * 1024**3
 MAX_UPLOAD_FILES = 100_000
 CORE_UID = 10001  # the user core runs as: see core/Dockerfile
+FORGEJO_UID = 1000  # the user Forgejo's rootless image runs as
 
 SITE_HEADER = "[[website.sites]]"
 SITE_FIELDS = {"domain", "aliases", "spa", "www"}
@@ -52,6 +55,7 @@ class Paths:
     website_dir: Path = Path(os.environ.get("SALLSKAP_WEBSITE_DIR", CADDY_ROOT))
     deploy_home: Path = Path(os.environ.get("SALLSKAP_DEPLOY_HOME", "/var/lib/sallskap-deploy"))
     core_dir: Path = Path(os.environ.get("SALLSKAP_CORE_DIR", "/srv/core"))
+    git_dir: Path = Path(os.environ.get("SALLSKAP_GIT_DIR", "/srv/git"))
 
     @property
     def config(self) -> Path:
@@ -60,6 +64,10 @@ class Paths:
     @property
     def core_env(self) -> Path:
         return self.config_dir / "core.env"
+
+    @property
+    def git_env(self) -> Path:
+        return self.config_dir / "git.env"
 
     @property
     def caddyfile(self) -> Path:
@@ -96,9 +104,14 @@ class Config:
     domain: str
     mail_from: str | None = None
     sites: tuple[Site, ...] = field(default_factory=tuple)
+    modules: tuple[str, ...] = ()
 
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
+
+    @property
+    def short_name(self) -> str:
+        return self.domain.split(".")[0]
 
 
 def _is_bare_domain(name: str) -> bool:
@@ -113,6 +126,19 @@ def _check_hostname(name: object, what: str) -> str:
 
 
 # ---- Config ------------------------------------------------------------------
+
+
+def module_manifest(name: str) -> dict:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        raise KitError(f"{name!r} isn't a valid module name.")
+    try:
+        return tomllib.loads((ROOT / "modules" / name / "module.toml").read_text("utf-8"))
+    except FileNotFoundError:
+        raise KitError(f"There's no module called {name}.") from None
+
+
+def _has_containers(name: str) -> bool:
+    return (ROOT / "modules" / name / "compose.yml").exists()
 
 
 def service_hostnames(primary: str) -> set[str]:
@@ -152,7 +178,15 @@ def parse_config(text: str) -> Config:
     mail_from = raw.get("mail", {}).get("from")
     if mail_from is not None and not EMAIL.fullmatch(str(mail_from)):
         raise KitError(f"The mail address {mail_from!r} isn't valid.")
-    config = Config(primary, mail_from, tuple(sites))
+
+    modules = raw.get("modules", {})
+    for name, enabled in modules.items():
+        if not isinstance(enabled, bool):
+            raise KitError(f"Under [modules], {name} must be true or false.")
+        if enabled:
+            module_manifest(name)  # refuses one that doesn't exist
+
+    config = Config(primary, mail_from, tuple(sites), tuple(n for n, enabled in modules.items() if enabled))
 
     seen = set()
     services = service_hostnames(primary)
@@ -211,6 +245,23 @@ def remove_site_block(text: str, domain: str) -> str:
     raise KitError(f"No site called {domain}.")
 
 
+def set_module(text: str, name: str, enabled: bool) -> str:
+    """Switch a module as text, so comments elsewhere survive."""
+    line = f"{name} = {str(enabled).lower()}\n"
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, current in enumerate(lines) if current.strip() == "[modules]"), None)
+    if start is None:
+        return text.rstrip("\n") + f"\n\n[modules]\n{line}"
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            break
+        if re.match(rf"\s*{re.escape(name)}\s*=", lines[i]):
+            lines[i] = line
+            return "".join(lines)
+    lines.insert(start + 1, line)
+    return "".join(lines)
+
+
 def init_config(paths: Paths, domain: str) -> None:
     """Create the first config. The setup wizard will do this through a browser."""
     if paths.config.exists():
@@ -238,6 +289,11 @@ def render_caddyfile(config: Config) -> str:
         "\treverse_proxy core:8000\n"
         "}"
     )
+    for name in config.modules:
+        subdomain = module_manifest(name).get("subdomain")
+        if subdomain:
+            routing = (ROOT / "modules" / name / "site.caddy").read_text("utf-8").strip()
+            parts.append(routing.replace("__HOST__", f"{subdomain}.{config.domain}").replace("__SHORT_NAME__", config.short_name))
     for site in config.sites:
         fallback = "\ttry_files {path} {path}/index.html /index.html\n" if site.spa else ""
         parts.append(
@@ -261,6 +317,20 @@ def _compose(*args: str) -> list[str]:
     return ["docker", "compose", "--project-directory", str(ROOT), *args]
 
 
+def _module_compose(name: str, *args: str) -> list[str]:
+    """Each module runs from its own file, in the same Compose project as core, so
+    Caddy can reach it over the project's network. Only the running modules' files
+    are ever needed, and nothing else has to know which those are."""
+    file = ROOT / "modules" / name / "compose.yml"
+    return ["docker", "compose", "--project-name", PROJECT, "--project-directory", str(ROOT), "--file", str(file), *args]
+
+
+# What a module needs beyond starting its containers. Everything here has to be safe
+# to repeat, as running `kit enable` again is how someone finishes after a failure.
+PREPARE: dict = {}  # folders and secrets, before its containers start
+SETUP: dict = {}  # connecting it to core, once its containers are up
+
+
 def _new_signing_key() -> str:
     """The login service signs what it tells other tools with this."""
     command = ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"]
@@ -268,15 +338,17 @@ def _new_signing_key() -> str:
     return base64.b64encode(pem).decode()  # on one line, for the settings file
 
 
+def _read_env(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text("utf-8").splitlines() if "=" in line)
+
+
 def prepare_core(paths: Paths, config: Config) -> None:
     """Give core its folder and settings. The secrets are made once and then kept:
     a new secret key would log everyone out and cancel every password link, and
     a new signing key would make every tool stop trusting the login service."""
-    current = {}
-    if paths.core_env.exists():
-        for line in paths.core_env.read_text("utf-8").splitlines():
-            name, _, value = line.partition("=")
-            current[name] = value
+    current = _read_env(paths.core_env)
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
     signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
     text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\nOIDC_SIGNING_KEY={signing_key}\n"
@@ -321,10 +393,49 @@ def apply_web(paths: Paths) -> None:
 
 
 def apply(paths: Paths, build: bool = False) -> None:
-    """Start everything. Caddy goes first, so a problem with core can't hold up the
-    public sites. With --wait, core has finished migrating when this returns."""
+    """Start everything. Caddy goes first and modules last, so a problem with one can't
+    hold up the public sites or logins. With --wait, core has finished migrating and
+    each module is healthy when this returns."""
     apply_web(paths)
     subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
+    config = load_config(paths)
+    for name in config.modules:
+        if _has_containers(name):
+            if name in PREPARE:
+                PREPARE[name](paths, config)
+            subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+
+
+def enable_module(paths: Paths, name: str) -> None:
+    """Its route goes live before its setup has finished, so a module has to be
+    safe to reach from its first start."""
+    module_manifest(name)
+    if not _has_containers(name):
+        raise KitError(f"{name} has nothing to start, so it can't be switched on or off.")
+    text = paths.config.read_text("utf-8")
+    new_text = set_module(text, name, True)
+    parse_config(new_text)
+    if new_text != text:
+        _write_atomic(paths.config, new_text, 0o600)
+    apply(paths)
+    if name in SETUP:
+        SETUP[name](paths, load_config(paths))
+
+
+def disable_module(paths: Paths, name: str) -> None:
+    """Stop it and keep its data: only an explicit `kit remove` may delete that. It's
+    only marked as off once it has stopped, so running this again can always finish."""
+    module_manifest(name)
+    if not _has_containers(name):
+        raise KitError(f"{name} has nothing to start, so it can't be switched on or off.")
+    if name in load_config(paths).modules:
+        subprocess.run(_module_compose(name, "rm", "--stop", "--force"), check=True)
+        text = set_module(paths.config.read_text("utf-8"), name, False)
+        parse_config(text)
+        _write_atomic(paths.config, text, 0o600)
+    else:
+        print(f"{name} isn't enabled.")
+    apply_web(paths)
 
 
 # ---- Core: accounts ----------------------------------------------------------
@@ -354,6 +465,169 @@ def _check_callback(address: str) -> str:
     if not address.startswith("https://"):
         raise KitError(f"{address!r} must be a full https address.")
     return address
+
+
+# ---- The git module ----------------------------------------------------------
+
+
+FORGEJO_TOOL = "forgejo"  # its name in core's login service
+FORGEJO_SERVICE_USER = "sallskap-admin"  # owns the organisation. Nobody can log in as it
+FORGEJO_UNITS = ["repo.code", "repo.issues", "repo.pulls", "repo.releases", "repo.wiki", "repo.projects"]
+FORGEJO_TEAMS = (
+    {"name": "developers", "permission": "write", "can_create_org_repo": True},
+    {"name": "board", "permission": "read", "can_create_org_repo": False},
+)
+NO_LIMIT = 1_000_000  # repos the organisation may have: 0 would fall back on the limit for people
+
+
+def prepare_git(paths: Paths, config: Config) -> None:
+    """Forgejo's secrets are made once and then kept: a new key would make its stored
+    login secret and 2FA records unreadable."""
+    current = _read_env(paths.git_env)
+    settings = {
+        "FORGEJO__server__DOMAIN": f"git.{config.domain}",
+        "FORGEJO__server__ROOT_URL": f"https://git.{config.domain}/",
+        "FORGEJO__security__SECRET_KEY": current.get("FORGEJO__security__SECRET_KEY") or secrets.token_urlsafe(48),
+        "FORGEJO__security__INTERNAL_TOKEN": current.get("FORGEJO__security__INTERNAL_TOKEN") or secrets.token_urlsafe(48),
+    }
+    text = "".join(f"{name}={value}\n" for name, value in settings.items())
+    if not paths.git_env.exists() or paths.git_env.read_text("utf-8") != text:
+        _write_atomic(paths.git_env, text, 0o600)
+    paths.git_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chown(paths.git_dir, FORGEJO_UID, FORGEJO_UID)
+
+
+def _core_output(*args: str) -> str:
+    """For commands whose output kit needs. A failure doesn't show the command line,
+    as it can carry a secret."""
+    result = subprocess.run(_compose("exec", "-T", "core", "python", "manage.py", *args), capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"Core refused `{' '.join(args[:2])}`: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _forgejo_output(*args: str) -> str:
+    command = _module_compose("git", "exec", "-T", "forgejo", "forgejo", *args)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"Forgejo refused `{' '.join(args[:3])}`: {(result.stderr or result.stdout).strip()}")
+    return result.stdout
+
+
+def _forgejo_api(token: str, method: str, path: str, body: dict | None = None) -> tuple[int, object]:
+    """Forgejo publishes no ports, so this goes through curl inside its container. The
+    token reaches curl on stdin: a command line can be read by anyone on the server."""
+    settings = [f'header = "Authorization: token {token}"', 'header = "Content-Type: application/json"']
+    if body is not None:
+        data = json.dumps(body).replace("\\", "\\\\").replace('"', '\\"')
+        settings.append(f'data-binary = "{data}"')
+    command = _module_compose(
+        "git", "exec", "-T", "forgejo", "curl", "-sS", "--request", method, "--write-out", "\n%{http_code}",
+        "--config", "-", f"http://127.0.0.1:3000/api/v1{path}",
+    )  # fmt: skip
+    result = subprocess.run(command, capture_output=True, text=True, input="\n".join(settings) + "\n")
+    if result.returncode:
+        raise KitError(f"Couldn't reach Forgejo's API: {result.stderr.strip()}")
+    content, _, status = result.stdout.rpartition("\n")
+    try:
+        return int(status), json.loads(content) if content else None
+    except ValueError:
+        raise KitError(f"Forgejo's API gave an answer kit can't read: {result.stdout[:200]}") from None
+
+
+def _expect(answer: tuple[int, object], *statuses: int) -> object:
+    if answer[0] not in statuses:
+        raise KitError(f"Forgejo's API answered {answer[0]}: {answer[1]}")
+    return answer[1]
+
+
+def _create_org_and_teams(config: Config, org: str) -> None:
+    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
+    command for making one, so this uses its API. Forgejo 15 has no way of deleting the
+    token afterwards with password login off, so it stays in its database, where only
+    a hash is stored, and its value is thrown away when this returns. So this only
+    runs until the login is connected."""
+    if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
+        _forgejo_output(
+            "admin", "user", "create", "--username", FORGEJO_SERVICE_USER, "--email", f"{FORGEJO_SERVICE_USER}@git.{config.domain}",
+            "--admin", "--random-password", "--must-change-password=false",
+        )  # fmt: skip
+    token = _forgejo_output(
+        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER,
+        "--token-name", f"kit-{secrets.token_hex(4)}", "--scopes", "write:admin,write:organization", "--raw",
+    ).strip()  # fmt: skip
+    if _forgejo_api(token, "GET", f"/orgs/{org}")[0] == 404:
+        _expect(_forgejo_api(token, "POST", "/orgs", {"username": org, "visibility": "public"}), 201)
+    # The limit on new repos is for people, but organisations are held to it too.
+    _expect(
+        _forgejo_api(token, "PATCH", f"/admin/users/{org}", {"login_name": org, "source_id": 0, "max_repo_creation": NO_LIMIT}),
+        200,
+    )
+    existing = {team["name"] for team in _expect(_forgejo_api(token, "GET", f"/orgs/{org}/teams"), 200)}
+    for team in FORGEJO_TEAMS:
+        if team["name"] not in existing:
+            body = {**team, "includes_all_repositories": True, "units": FORGEJO_UNITS}
+            _expect(_forgejo_api(token, "POST", f"/orgs/{org}/teams", body), 201)
+
+
+def _connect_login(config: Config, org: str, source, registered) -> None:
+    """A tool's secret is only shown when it's made, so if one side is missing, both
+    get a new one."""
+    if registered:
+        _core_output("tool", "remove", FORGEJO_TOOL)
+    output = _core_output("tool", "add", FORGEJO_TOOL, f"https://git.{config.domain}/user/oauth2/{org}/callback")
+    fields = dict(re.findall(r"^\s+(Client ID|Secret):\s+(\S+)$", output, re.M))
+    if len(fields) != 2:
+        raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
+    team_map = {
+        "operator": {org: ["Owners"]},
+        "developer": {org: ["developers"]},
+        "board": {org: ["board"]},
+    }
+    settings = [
+        "--name", org,
+        "--provider", "openidConnect",
+        "--key", fields["Client ID"],
+        "--secret", fields["Secret"],
+        "--auto-discover-url", f"https://app.{config.domain}/.well-known/openid-configuration",
+        "--scopes", "email", "--scopes", "profile", "--scopes", "groups",
+        "--group-claim-name", "groups",
+        "--admin-group", "operator",
+        "--group-team-map", json.dumps(team_map),
+        "--group-team-map-removal",
+        "--skip-local-2fa",  # core has already asked for it
+    ]  # fmt: skip
+    try:
+        if source:
+            _forgejo_output("admin", "auth", "update-oauth", "--id", source.group(1), *settings)
+        else:
+            _forgejo_output("admin", "auth", "add-oauth", *settings)
+        # It reads its login sources when it starts.
+        subprocess.run(_module_compose("git", "restart", "forgejo"), check=True, capture_output=True)
+        subprocess.run(_module_compose("git", "up", "-d", "--wait"), check=True, capture_output=True)
+    except (KitError, subprocess.CalledProcessError):
+        # Core has a secret that Forgejo may not. Without this, the next run would find
+        # both sides present and call it finished, with every sign-in failing.
+        _core_output("tool", "remove", FORGEJO_TOOL)
+        raise
+
+
+def setup_git(paths: Paths, config: Config) -> None:
+    """The login is connected last, so finding it means everything before it finished,
+    and running this again doesn't make another token."""
+    org = config.short_name
+    source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
+    registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
+    if source and registered:
+        return
+    if not source:
+        _create_org_and_teams(config, org)
+    _connect_login(config, org, source, registered)
+
+
+PREPARE["git"] = prepare_git
+SETUP["git"] = setup_git
 
 
 # ---- Sites: config and credentials -------------------------------------------
@@ -545,6 +819,11 @@ def status(paths: Paths) -> int:
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
     print("Login and admin page:")
     problems = _check_dns(f"app.{config.domain}", server_ip)
+    for name in config.modules:
+        manifest = module_manifest(name)
+        if manifest.get("subdomain"):
+            print(f"{manifest['description']}:")
+            problems += _check_dns(f"{manifest['subdomain']}.{config.domain}", server_ip)
     for site in config.sites:
         current = paths.site_dir(site.domain) / "current"
         published = current.resolve().name if current.exists() else "nothing published yet"
@@ -568,6 +847,8 @@ def build_parser() -> argparse.ArgumentParser:
     admin.add_argument("--reset-2fa", action="store_true", help="also remove their 2FA, if they've lost their phone and codes")
     commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
+    commands.add_parser("enable", help="switch on a module, or finish switching it on").add_argument("module")
+    commands.add_parser("disable", help="stop a module and keep its data").add_argument("module")
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -599,6 +880,8 @@ def _print_deploy_key(domain: str, private: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     paths = Paths()
+    # Each module has its own Compose file, so the others always look like leftovers.
+    os.environ["COMPOSE_IGNORE_ORPHANS"] = "true"
     try:
         if args.command == "init":
             init_config(paths, args.domain)
@@ -621,6 +904,12 @@ def main(argv: list[str] | None = None) -> int:
             return _manage("tool", "list")
         elif args.command == "status":
             return status(paths)
+        elif args.command == "enable":
+            enable_module(paths, args.module)
+            print(f"Enabled {args.module}.\n")
+            status(paths)
+        elif args.command == "disable":
+            disable_module(paths, args.module)
         elif args.action == "add":
             site = Site(args.domain, tuple(args.alias), not args.no_spa, args.www)
             add_site(paths, site)

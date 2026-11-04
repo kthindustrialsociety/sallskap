@@ -1,0 +1,35 @@
+__HOST__ {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+		-Via
+	}
+
+	# Someone logged in to core shouldn't have to click anything, and Forgejo has no
+	# setting for it. It sends login errors back to this page, so a short-lived cookie
+	# stops that looping. Signing out sets it for longer, or they'd be signed straight
+	# back in, as they're still logged in to core.
+	@sign_in {
+		method GET
+		path /user/login
+		not header Cookie *sallskap_stay=1*
+	}
+	header @sign_in +Set-Cookie "sallskap_stay=1; Path=/user/login; Max-Age=60; Secure; HttpOnly; SameSite=Lax"
+	redir @sign_in /user/oauth2/__SHORT_NAME__?{query} 302
+
+	@sign_out path /user/logout
+	header @sign_out +Set-Cookie "sallskap_stay=1; Path=/user/login; Max-Age=300; Secure; HttpOnly; SameSite=Lax"
+
+	# Addresses come from core. With no mail to confirm them, anyone could add someone
+	# else's here, which would stop that person signing in. Forgejo has no setting for it.
+	@email {
+		not method GET HEAD
+		path /user/settings/account/email* /api/v1/user/emails*
+	}
+	respond @email "Addresses are managed in core." 403
+
+	reverse_proxy forgejo:3000
+}
