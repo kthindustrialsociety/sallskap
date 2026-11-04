@@ -1119,6 +1119,9 @@ class Packaging(unittest.TestCase):
         """`auto` would give an account to anyone who arrives with the same name."""
         self.assertIn("FORGEJO__oauth2_client__ACCOUNT_LINKING: disabled", compose_services()["forgejo"])
 
+    def test_forgejo_sessions_survive_a_restart(self):
+        self.assertIn("FORGEJO__session__PROVIDER: db", compose_services()["forgejo"])
+
     def test_forgejo_runs_no_ssh_server(self):
         """The rootless image's own template turns it on, and only Caddy may publish ports."""
         text = compose_services()["forgejo"]

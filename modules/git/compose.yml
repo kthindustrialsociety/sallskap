@@ -55,6 +55,7 @@ services:
       FORGEJO__ui__SHOW_USER_EMAIL: "false"
 
       FORGEJO__session__COOKIE_SECURE: "true"
+      FORGEJO__session__PROVIDER: db    # by default, a restart would sign everyone out
 
       # Not needed yet. Actions waits for a build runner, and nothing sends mail.
       FORGEJO__actions__ENABLED: "false"
