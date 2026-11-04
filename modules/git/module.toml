@@ -1,7 +1,7 @@
 name        = "git"
 description = "Code hosting and issues (Forgejo)"
 subdomain   = "git"
-ram_mb      = 200
+ram_mb      = 260               # measured: about 215 MB after a burst of clones
 requires    = []
 data        = ["/srv/git"]
 access      = ["developer", "board", "operator"]  # see the team map in kit/kit.py
