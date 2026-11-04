@@ -279,6 +279,19 @@ class Claims(Service):
         self.assertEqual(claims["preferred_username"], "anna.lind")
         self.assertEqual(claims["nonce"], "nonce-from-the-tool")
 
+    def test_two_people_with_the_same_name_get_different_usernames(self):
+        """Forgejo allows one account per name, so the second person would get an error page."""
+        first, _ = make_user("anna@example.org")
+        second, _ = make_user("anna@example.net")
+        self.assertEqual(self.login_claims(first)["preferred_username"], "anna")
+        self.assertEqual(self.login_claims(second)["preferred_username"], f"anna-{second.pk}")
+
+    def test_a_longer_address_does_not_count_as_the_same_name(self):
+        make_user("anna.lind@example.org")
+        make_user("xanna@example.org")
+        user, _ = make_user("anna@example.org")
+        self.assertEqual(self.login_claims(user)["preferred_username"], "anna")
+
     def test_it_passes_on_each_persons_groups(self):
         user, _ = make_user(groups=["board", "treasurer"], two_factor=True)
         self.assertEqual(self.login_claims(user)["groups"], ["board", "treasurer"])

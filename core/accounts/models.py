@@ -79,6 +79,14 @@ class User(AbstractBaseUser, PermissionsMixin):
         groups = self.groups.select_related("role")
         return sorted(group.role.key if hasattr(group, "role") else f"custom:{group.name}" for group in groups)
 
+    def tool_username(self):
+        """The part of the email before the @. Tools like Forgejo allow one account per
+        name, so if an earlier account has the same one, this one gets its id added.
+        It can still change if that earlier account goes, so tools identify people by `sub`."""
+        name = self.email.split("@")[0]
+        taken = User.objects.filter(email__startswith=f"{name}@", pk__lt=self.pk).exists()
+        return f"{name}-{self.pk}" if taken else name
+
     # A property rather than Django's usual stored flag, so groups alone decide:
     # removing someone from a group removes their admin access at their next click.
     @property

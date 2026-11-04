@@ -39,8 +39,7 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
             # Not verified: nothing sends email yet, and an Operator typed it in.
             claims.update(email=user.email, email_verified=False)
         if "profile" in scopes:
-            # Not unique: tools have to identify people by `sub`, as the standard says.
-            claims.update(name=user.get_full_name(), preferred_username=user.email.split("@")[0])
+            claims.update(name=user.get_full_name(), preferred_username=user.tool_username())
         if "groups" in scopes:
             claims["groups"] = user.group_keys()
         return claims
