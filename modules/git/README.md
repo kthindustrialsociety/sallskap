@@ -14,7 +14,7 @@ It's safe to run again, which is also how to finish if something fails partway. 
 
 ## Who gets what
 
-Anyone with an account in core can sign in, which creates their Forgejo account. They get no access until a group gives it to them:
+Opening Forgejo signs someone in through core, with nothing to click if they're already logged in there, which creates their Forgejo account at first. Anyone with an account in core can do this. They get no access until a group gives it to them:
 
 | Group | In Forgejo |
 |---|---|
@@ -35,6 +35,7 @@ git clone https://git.example.org/example/some-repo.git
 
 ## Known limits
 
+- **Signing out of Forgejo doesn't log you out of core.** Opening Forgejo a few minutes later signs you back in. To stay out, log out of core too.
 - **Changes arrive at the next sign-in.** Forgejo only hears about someone's groups when they sign in, so a person removed from a group keeps their team, and their tokens keep working, until then. Turning off someone's account in core doesn't reach Forgejo yet either.
 - **Some addresses can't sign in.** An address whose part before the @ is a name Forgejo reserves, such as `admin@example.org`, gets an error page. So does one matching `sallskap-admin`, the account that owns the organisation. They can't get into anyone else's account, and they can use another address.
 - **Email and name changes aren't passed on.** Forgejo takes them from core when someone first signs in, and keeps them.

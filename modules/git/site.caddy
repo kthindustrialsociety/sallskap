@@ -7,5 +7,21 @@ __HOST__ {
 		-Server
 		-Via
 	}
+
+	# Someone logged in to core shouldn't have to click anything, and Forgejo has no
+	# setting for it. It sends login errors back to this page, so a short-lived cookie
+	# stops that looping. Signing out sets it for longer, or they'd be signed straight
+	# back in, as they're still logged in to core.
+	@sign_in {
+		method GET
+		path /user/login
+		not header Cookie *sallskap_stay=1*
+	}
+	header @sign_in +Set-Cookie "sallskap_stay=1; Path=/user/login; Max-Age=60; Secure; HttpOnly; SameSite=Lax"
+	redir @sign_in /user/oauth2/__SHORT_NAME__ 302
+
+	@sign_out path /user/logout
+	header @sign_out +Set-Cookie "sallskap_stay=1; Path=/user/login; Max-Age=300; Secure; HttpOnly; SameSite=Lax"
+
 	reverse_proxy forgejo:3000
 }

@@ -109,6 +109,10 @@ class Config:
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
 
+    @property
+    def short_name(self) -> str:
+        return self.domain.split(".")[0]
+
 
 def _is_bare_domain(name: str) -> bool:
     # A guess: example.co.uk needs an explicit `www = true`.
@@ -289,7 +293,7 @@ def render_caddyfile(config: Config) -> str:
         subdomain = module_manifest(name).get("subdomain")
         if subdomain:
             routing = (ROOT / "modules" / name / "site.caddy").read_text("utf-8").strip()
-            parts.append(routing.replace("__HOST__", f"{subdomain}.{config.domain}"))
+            parts.append(routing.replace("__HOST__", f"{subdomain}.{config.domain}").replace("__SHORT_NAME__", config.short_name))
     for site in config.sites:
         fallback = "\ttry_files {path} {path}/index.html /index.html\n" if site.spa else ""
         parts.append(
@@ -599,7 +603,7 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
 def setup_git(paths: Paths, config: Config) -> None:
     """The login is connected last, so finding it means everything before it finished,
     and running this again doesn't leave another token behind."""
-    org = config.domain.split(".")[0]
+    org = config.short_name
     source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
     registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
     if source and registered:

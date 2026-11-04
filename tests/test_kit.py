@@ -1144,6 +1144,24 @@ class Packaging(unittest.TestCase):
         self.assertIn("Strict-Transport-Security", block)
         self.assertIn("-Server", block)
 
+    def test_opening_forgejo_goes_straight_to_the_login_service(self):
+        config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}\n")[0]
+        self.assertIn("redir @sign_in /user/oauth2/example 302", block)
+        self.assertNotIn("__SHORT_NAME__", block)
+
+    def test_the_login_it_goes_to_is_the_one_setup_creates(self):
+        """The address in Caddy and the login source's name have to be the same."""
+        config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        self.assertEqual(config.short_name, "example")
+        self.assertIn("org = config.short_name", (ROOT / "kit" / "kit.py").read_text())
+
+    def test_only_opening_the_page_is_redirected(self):
+        """Forgejo answers a posted login itself, which is what refuses local passwords."""
+        routing = (ROOT / "modules" / "git" / "site.caddy").read_text()
+        self.assertIn("method GET", routing)
+        self.assertIn("not header Cookie *sallskap_stay=1*", routing)
+
     def test_the_uid_given_forgejos_data_folder_is_the_images(self):
         """The image's documented default: nothing in the Compose file changes it."""
         self.assertEqual(kit.FORGEJO_UID, 1000)
