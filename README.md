@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` module, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` and `git` modules, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
 
 ## Check a server
 
@@ -25,7 +25,8 @@ bash install.sh --check
 | `kit/` | The `kit` CLI, in progress |
 | `core/` | Django: accounts, login and the admin page. Who sees what is set in `core/accounts/roles.py` |
 | `modules/website/` | Public sites and redirects |
-| `modules/<name>/` | `vault`, `git`, `chat`, `files` (planned) |
+| `modules/git/` | Forgejo, with login through core |
+| `modules/<name>/` | `vault`, `chat`, `files` (planned) |
 | `tests/` | Tests for the kit, and `live_check.py` for a running server |
 
 ## Get people in
@@ -39,14 +40,21 @@ kit link someone@example.org   # a new link for someone an Operator has added
 
 If an Operator is locked out, `kit admin` restores their access and clears any login lockouts. If they've lost both their phone and their recovery codes, `kit admin you@example.org --reset-2fa` also removes their 2FA, so they can set it up again.
 
-## Connect a tool
-
-Core is the login service for every other tool, using OpenID Connect. To register a tool:
+## Turn on a module
 
 ```sh
-kit tool add forgejo https://git.example.org/user/oauth2/core/callback   # prints its settings, and the secret once
+kit enable git     # safe to run again, which is also how to finish after a failure
+kit disable git    # stops it and keeps its data
+```
+
+## Connect a tool
+
+Core is the login service for every other tool, using OpenID Connect. A module does this for itself. To register anything else:
+
+```sh
+kit tool add mytool https://tool.example.org/callback   # prints its settings, and the secret once
 kit tool list
-kit tool remove forgejo                                                  # ends its access
+kit tool remove mytool                                  # ends its access
 ```
 
 A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`. `preferred_username` is unique when it's sent, but can change: it's the part of the email before the @, with the account's id added if an earlier account has the same one. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent as `custom:<name>`. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
