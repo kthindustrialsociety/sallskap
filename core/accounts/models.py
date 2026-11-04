@@ -81,8 +81,9 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def tool_username(self):
         """The part of the email before the @. Tools like Forgejo allow one account per
-        name, so if an earlier account has the same one, this one gets its id added.
-        It can still change if that earlier account goes, so tools identify people by `sub`."""
+        name, so if an earlier account has the same one, this one gets its id added. That
+        covers the usual clash, not all of them: a tool may alter names or reserve some.
+        It can also change if the earlier account goes, so tools identify people by `sub`."""
         name = self.email.split("@")[0]
         taken = User.objects.filter(email__startswith=f"{name}@", pk__lt=self.pk).exists()
         return f"{name}-{self.pk}" if taken else name

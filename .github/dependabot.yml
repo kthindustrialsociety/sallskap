@@ -16,3 +16,11 @@ updates:
     directory: /core
     schedule:
       interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /modules/git
+    schedule:
+      interval: weekly
+    ignore:
+      # Stay on Forgejo's long-term support line until the project chooses to move.
+      - dependency-name: "*forgejo*"
+        update-types: ["version-update:semver-major"]
