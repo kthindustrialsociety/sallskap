@@ -1073,11 +1073,16 @@ def check_forgejo_git(host, people):
     form = people["fake-git-dev"][0].git.get("/repo/create").text
     check("The new repo form starts on private", bool(re.search(r'<input[^>]*name="private"[^>]*checked', form)))
 
+    # Forgejo's API answers this refusal with a 500, so what counts is that no repo appears.
     status, _ = forgejo_api(host, developer, "POST", "/user/repos", {"name": "fake-personal"})
-    check("A Developer can't create a personal repo", status == 403, str(status))
+    exists = forgejo_api(host, developer, "GET", "/repos/fake-git-dev/fake-personal")[0]
+    check("A Developer can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
+    owners = re.findall(r'data-value="\d+"[^>]*>.*?<span[^>]*>\s*([^<\s]+)', form, re.S)
+    check("The new repo form only offers the organisation", org in owners and "fake-git-dev" not in owners, str(owners))
     member = people["fake-git-member"][1]
     status, _ = forgejo_api(host, member, "POST", "/user/repos", {"name": "fake-personal"})
-    check("A Member can't create a personal repo", status == 403, str(status))
+    exists = forgejo_api(host, member, "GET", "/repos/fake-git-member/fake-personal")[0]
+    check("A Member can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
     status, _ = forgejo_api(host, member, "POST", f"/orgs/{org}/repos", {"name": "fake-members-repo"})
     check("A Member can't create a repo in the organisation", status == 403, str(status))
     status, _ = forgejo_api(host, member, "POST", "/orgs", {"username": "fake-org"})
