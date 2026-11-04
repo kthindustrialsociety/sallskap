@@ -517,6 +517,198 @@ class Docker(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class Modules(unittest.TestCase):
+    """Runs against a made-up module, with Docker replaced."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.root = base / "root"
+        (self.root / "modules" / "website").mkdir(parents=True)
+        (self.root / "modules" / "website" / "module.toml").write_text('name = "website"\n')
+        (self.root / "modules" / "website" / "site.caddy").write_text("(website_defaults) {\n}\n")
+        demo = self.root / "modules" / "demo"
+        demo.mkdir()
+        (demo / "module.toml").write_text('name = "demo"\ndescription = "A demo"\nsubdomain = "demo"\n')
+        (demo / "compose.yml").write_text("services:\n")
+        (demo / "site.caddy").write_text("__HOST__ {\n\treverse_proxy demo:80\n}\n")
+
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('# keep this\n[association]\ndomain = "example.org"\n')
+        self.calls = []
+        self.broken = ()
+
+        real_run = subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[0] != "docker":
+                return real_run(command, *args, **kwargs)
+            self.calls.append(command)
+            if "up" in command and any(service in " ".join(command) for service in self.broken):
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.setup_calls = []
+        for patcher in (
+            mock.patch.object(kit, "ROOT", self.root),
+            mock.patch.object(kit.subprocess, "run", fake_run),
+            mock.patch.object(kit, "Paths", return_value=self.paths),
+            mock.patch.object(kit, "status", return_value=0),
+            mock.patch.dict(kit.PREPARE, {"demo": lambda paths, config: self.setup_calls.append("prepare")}),
+            mock.patch.dict(kit.SETUP, {"demo": lambda paths, config: self.setup_calls.append("setup")}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_kit(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kit.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def config(self):
+        return kit.load_config(self.paths)
+
+    def caddyfile(self):
+        return kit.render_caddyfile(self.config())
+
+    def demo_commands(self):
+        return [call for call in self.calls if any(part.endswith("demo/compose.yml") for part in call)]
+
+    def test_config_lists_only_what_is_switched_on(self):
+        text = '[association]\ndomain = "a.org"\n[modules]\ndemo = true\nchat = false\n'
+        self.assertEqual(kit.parse_config(text).modules, ("demo",))
+
+    def test_config_refuses_a_module_that_does_not_exist(self):
+        with self.assertRaisesRegex(kit.KitError, "no module called nope"):
+            kit.parse_config('[association]\ndomain = "a.org"\n[modules]\nnope = true\n')
+
+    def test_config_refuses_something_other_than_true_or_false(self):
+        with self.assertRaisesRegex(kit.KitError, "true or false"):
+            kit.parse_config('[association]\ndomain = "a.org"\n[modules]\ndemo = "yes"\n')
+
+    def test_a_module_name_cannot_walk_out_of_the_modules_folder(self):
+        code, out = self.run_kit("enable", "../../etc")
+        self.assertEqual(code, 1)
+        self.assertIn("isn't a valid module name", out)
+
+    def test_setting_a_module_adds_the_table_and_keeps_comments(self):
+        text = kit.set_module("# keep\n[association]\ndomain = \"a.org\"\n", "demo", True)
+        self.assertIn("# keep", text)
+        self.assertTrue(tomllib.loads(text)["modules"]["demo"])
+
+    def test_setting_a_module_changes_only_its_own_line(self):
+        text = '[modules]\n# keep\nwebsite = true\ndemo = false\n\n[[website.sites]]\ndomain = "a.org"\n'
+        changed = kit.set_module(text, "demo", True)
+        self.assertEqual(changed, text.replace("demo = false", "demo = true"))
+
+    def test_setting_a_module_stays_inside_its_table(self):
+        text = '[modules]\nwebsite = true\n\n[other]\ndemo = "not this one"\n'
+        raw = tomllib.loads(kit.set_module(text, "demo", True))
+        self.assertTrue(raw["modules"]["demo"])
+        self.assertEqual(raw["other"]["demo"], "not this one")
+
+    def test_a_module_is_only_routed_when_enabled(self):
+        self.assertNotIn("demo.example.org", self.caddyfile())
+        self.paths.config.write_text(kit.set_module(self.paths.config.read_text(), "demo", True))
+        self.assertIn("demo.example.org {\n\treverse_proxy demo:80\n}", self.caddyfile())
+        self.assertNotIn("__HOST__", self.caddyfile())
+
+    def test_a_module_hostname_is_reserved_even_when_it_is_off(self):
+        with self.assertRaisesRegex(kit.KitError, "reserved"):
+            kit.parse_config('[association]\ndomain = "example.org"\n[[website.sites]]\ndomain = "demo.example.org"\n')
+
+    def test_enable_starts_everything_in_order_then_runs_setup(self):
+        code, _ = self.run_kit("enable", "demo")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.config().modules, ("demo",))
+        self.assertEqual(self.paths.config.stat().st_mode & 0o777, 0o600)
+        self.assertIn("# keep this", self.paths.config.read_text())
+        starts = [" ".join(call[call.index("up") :]) for call in self.calls if "up" in call]
+        self.assertEqual(starts, ["up -d caddy", "up -d --wait core", "up -d --wait"])
+        self.assertEqual(self.setup_calls, ["prepare", "setup"])
+        self.assertEqual(len(self.demo_commands()), 1)
+
+    def test_a_module_joins_the_same_project_as_core(self):
+        self.run_kit("enable", "demo")
+        self.assertEqual(self.demo_commands()[0][:5], ["docker", "compose", "--project-name", "sallskap", "--project-directory"])
+        self.assertIn("name: sallskap", (ROOT / "compose.yml").read_text())
+
+    def test_enabling_twice_leaves_the_config_alone(self):
+        self.run_kit("enable", "demo")
+        before = self.paths.config.stat().st_mtime_ns
+        self.run_kit("enable", "demo")
+        self.assertEqual(self.paths.config.stat().st_mtime_ns, before)
+
+    def test_a_broken_module_cannot_hold_up_core_or_the_sites(self):
+        self.broken = ("demo",)
+        code, out = self.run_kit("enable", "demo")
+        self.assertEqual(code, 1)
+        self.assertIn("a system command failed", out)
+        starts = [" ".join(call[call.index("up") :]) for call in self.calls if "up" in call]
+        self.assertEqual(starts[:2], ["up -d caddy", "up -d --wait core"])
+        self.assertEqual(self.setup_calls, ["prepare"])
+
+    def test_enabling_again_finishes_after_a_failure(self):
+        self.broken = ("demo",)
+        self.run_kit("enable", "demo")
+        self.broken = ()
+        code, _ = self.run_kit("enable", "demo")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.setup_calls, ["prepare", "prepare", "setup"])
+
+    def test_apply_starts_enabled_modules_last_and_skips_setup(self):
+        self.run_kit("enable", "demo")
+        self.calls.clear()
+        self.setup_calls.clear()
+        self.run_kit("apply")
+        self.assertEqual(self.demo_commands()[-1], self.calls[-1])
+        self.assertEqual(self.setup_calls, ["prepare"])
+
+    def test_apply_ignores_modules_that_are_off(self):
+        self.run_kit("apply")
+        self.assertEqual(self.demo_commands(), [])
+        self.assertEqual(self.setup_calls, [])
+
+    def test_enable_refuses_a_module_with_nothing_to_start(self):
+        code, out = self.run_kit("enable", "website")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to start", out)
+        self.assertEqual(self.calls, [])
+
+    def test_enable_refuses_an_unknown_module_and_changes_nothing(self):
+        before = self.paths.config.read_text()
+        code, out = self.run_kit("enable", "nope")
+        self.assertEqual(code, 1)
+        self.assertIn("no module called nope", out)
+        self.assertEqual(self.paths.config.read_text(), before)
+
+    def test_disable_takes_the_route_away_stops_it_and_keeps_its_data(self):
+        self.run_kit("enable", "demo")
+        self.calls.clear()
+        code, _ = self.run_kit("disable", "demo")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.config().modules, ())
+        self.assertNotIn("demo.example.org", self.paths.caddyfile.read_text())
+        removal = self.demo_commands()[-1]
+        self.assertEqual(removal[-3:], ["rm", "--stop", "--force"])
+        self.assertNotIn("--volumes", removal)
+        self.assertEqual(self.calls[-1], removal)
+
+    def test_disabling_something_that_is_off_does_nothing(self):
+        code, out = self.run_kit("disable", "demo")
+        self.assertEqual(code, 0)
+        self.assertIn("isn't enabled", out)
+        self.assertEqual(self.calls, [])
+
+    def test_leftover_warnings_are_turned_off(self):
+        """Each module has its own Compose file, so the others look like leftovers."""
+        self.run_kit("apply")
+        self.assertEqual(kit.os.environ.get("COMPOSE_IGNORE_ORPHANS"), "true")
+
+
 class Status(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -546,6 +738,26 @@ class Status(unittest.TestCase):
         code, out = self.run_status({"203.0.113.1"})
         self.assertEqual(code, 0)
         self.assertIn("ok   app.example.org", out)
+
+    def fake_module(self):
+        root = Path(self._tmp.name) / "root"
+        (root / "modules" / "demo").mkdir(parents=True)
+        (root / "modules" / "demo" / "module.toml").write_text('description = "A demo"\nsubdomain = "demo"\n')
+        patcher = mock.patch.object(kit, "ROOT", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_enabled_modules_hostname_is_checked(self):
+        self.fake_module()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
+        code, out = self.run_status(set())
+        self.assertEqual(code, 1)
+        self.assertIn("Add this record: demo.example.org A 203.0.113.1", out)
+
+    def test_a_module_that_is_off_needs_no_record(self):
+        self.fake_module()
+        _, out = self.run_status(set())
+        self.assertNotIn("demo.example.org", out)
 
 
 class CommandLine(unittest.TestCase):

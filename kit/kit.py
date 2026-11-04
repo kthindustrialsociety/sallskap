@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
+PROJECT = "sallskap"  # the name in compose.yml: every module joins this Compose project
 DEPLOY_USER = "sallskap-deploy"
 KIT_COMMAND = "/usr/local/bin/kit"
 CADDY_ROOT = "/srv/website"
@@ -96,6 +97,7 @@ class Config:
     domain: str
     mail_from: str | None = None
     sites: tuple[Site, ...] = field(default_factory=tuple)
+    modules: tuple[str, ...] = ()
 
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
@@ -113,6 +115,19 @@ def _check_hostname(name: object, what: str) -> str:
 
 
 # ---- Config ------------------------------------------------------------------
+
+
+def module_manifest(name: str) -> dict:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        raise KitError(f"{name!r} isn't a valid module name.")
+    try:
+        return tomllib.loads((ROOT / "modules" / name / "module.toml").read_text("utf-8"))
+    except FileNotFoundError:
+        raise KitError(f"There's no module called {name}.") from None
+
+
+def _has_containers(name: str) -> bool:
+    return (ROOT / "modules" / name / "compose.yml").exists()
 
 
 def service_hostnames(primary: str) -> set[str]:
@@ -152,7 +167,15 @@ def parse_config(text: str) -> Config:
     mail_from = raw.get("mail", {}).get("from")
     if mail_from is not None and not EMAIL.fullmatch(str(mail_from)):
         raise KitError(f"The mail address {mail_from!r} isn't valid.")
-    config = Config(primary, mail_from, tuple(sites))
+
+    modules = raw.get("modules", {})
+    for name, enabled in modules.items():
+        if not isinstance(enabled, bool):
+            raise KitError(f"Under [modules], {name} must be true or false.")
+        if enabled:
+            module_manifest(name)  # refuses one that doesn't exist
+
+    config = Config(primary, mail_from, tuple(sites), tuple(n for n, enabled in modules.items() if enabled))
 
     seen = set()
     services = service_hostnames(primary)
@@ -211,6 +234,23 @@ def remove_site_block(text: str, domain: str) -> str:
     raise KitError(f"No site called {domain}.")
 
 
+def set_module(text: str, name: str, enabled: bool) -> str:
+    """Switch a module as text, so comments elsewhere survive."""
+    line = f"{name} = {str(enabled).lower()}\n"
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, current in enumerate(lines) if current.strip() == "[modules]"), None)
+    if start is None:
+        return text.rstrip("\n") + f"\n\n[modules]\n{line}"
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            break
+        if re.match(rf"\s*{re.escape(name)}\s*=", lines[i]):
+            lines[i] = line
+            return "".join(lines)
+    lines.insert(start + 1, line)
+    return "".join(lines)
+
+
 def init_config(paths: Paths, domain: str) -> None:
     """Create the first config. The setup wizard will do this through a browser."""
     if paths.config.exists():
@@ -238,6 +278,11 @@ def render_caddyfile(config: Config) -> str:
         "\treverse_proxy core:8000\n"
         "}"
     )
+    for name in config.modules:
+        subdomain = module_manifest(name).get("subdomain")
+        if subdomain:
+            routing = (ROOT / "modules" / name / "site.caddy").read_text("utf-8").strip()
+            parts.append(routing.replace("__HOST__", f"{subdomain}.{config.domain}"))
     for site in config.sites:
         fallback = "\ttry_files {path} {path}/index.html /index.html\n" if site.spa else ""
         parts.append(
@@ -259,6 +304,14 @@ def render_caddyfile(config: Config) -> str:
 
 def _compose(*args: str) -> list[str]:
     return ["docker", "compose", "--project-directory", str(ROOT), *args]
+
+
+def _module_compose(name: str, *args: str) -> list[str]:
+    """Each module runs from its own file, in the same Compose project as core, so
+    Caddy can reach it over the project's network. Only the running modules' files
+    are ever needed, and nothing else has to know which those are."""
+    file = ROOT / "modules" / name / "compose.yml"
+    return ["docker", "compose", "--project-name", PROJECT, "--project-directory", str(ROOT), "--file", str(file), *args]
 
 
 def _new_signing_key() -> str:
@@ -320,11 +373,53 @@ def apply_web(paths: Paths) -> None:
     )
 
 
+# What a module needs beyond starting its containers. Everything here has to be safe
+# to repeat, as running `kit enable` again is how someone finishes after a failure.
+PREPARE: dict = {}  # folders and secrets, before its containers start
+SETUP: dict = {}  # connecting it to core, once its containers are up
+
+
 def apply(paths: Paths, build: bool = False) -> None:
-    """Start everything. Caddy goes first, so a problem with core can't hold up the
-    public sites. With --wait, core has finished migrating when this returns."""
+    """Start everything. Caddy goes first and modules last, so a problem with one can't
+    hold up the public sites or logins. With --wait, core has finished migrating and
+    each module is healthy when this returns."""
     apply_web(paths)
     subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
+    config = load_config(paths)
+    for name in config.modules:
+        if _has_containers(name):
+            if name in PREPARE:
+                PREPARE[name](paths, config)
+            subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+
+
+def enable_module(paths: Paths, name: str) -> None:
+    """Its route goes live before its setup has finished, so a module has to be
+    safe to reach from its first start."""
+    module_manifest(name)
+    if not _has_containers(name):
+        raise KitError(f"{name} has nothing to start, so it can't be switched on or off.")
+    text = paths.config.read_text("utf-8")
+    new_text = set_module(text, name, True)
+    parse_config(new_text)
+    if new_text != text:
+        _write_atomic(paths.config, new_text, 0o600)
+    apply(paths)
+    if name in SETUP:
+        SETUP[name](paths, load_config(paths))
+
+
+def disable_module(paths: Paths, name: str) -> None:
+    """Stop it and keep its data: only an explicit `kit remove` may delete that."""
+    module_manifest(name)
+    if name not in load_config(paths).modules:
+        print(f"{name} isn't enabled.")
+        return
+    text = set_module(paths.config.read_text("utf-8"), name, False)
+    parse_config(text)
+    _write_atomic(paths.config, text, 0o600)
+    apply_web(paths)  # its route goes first, so nobody is sent to something that's gone
+    subprocess.run(_module_compose(name, "rm", "--stop", "--force"), check=True)
 
 
 # ---- Core: accounts ----------------------------------------------------------
@@ -545,6 +640,11 @@ def status(paths: Paths) -> int:
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
     print("Login and admin page:")
     problems = _check_dns(f"app.{config.domain}", server_ip)
+    for name in config.modules:
+        manifest = module_manifest(name)
+        if manifest.get("subdomain"):
+            print(f"{manifest['description']}:")
+            problems += _check_dns(f"{manifest['subdomain']}.{config.domain}", server_ip)
     for site in config.sites:
         current = paths.site_dir(site.domain) / "current"
         published = current.resolve().name if current.exists() else "nothing published yet"
@@ -568,6 +668,8 @@ def build_parser() -> argparse.ArgumentParser:
     admin.add_argument("--reset-2fa", action="store_true", help="also remove their 2FA, if they've lost their phone and codes")
     commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
+    commands.add_parser("enable", help="switch on a module, or finish switching it on").add_argument("module")
+    commands.add_parser("disable", help="stop a module and keep its data").add_argument("module")
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -599,6 +701,8 @@ def _print_deploy_key(domain: str, private: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     paths = Paths()
+    # Each module has its own Compose file, so the others always look like leftovers.
+    os.environ["COMPOSE_IGNORE_ORPHANS"] = "true"
     try:
         if args.command == "init":
             init_config(paths, args.domain)
@@ -621,6 +725,12 @@ def main(argv: list[str] | None = None) -> int:
             return _manage("tool", "list")
         elif args.command == "status":
             return status(paths)
+        elif args.command == "enable":
+            enable_module(paths, args.module)
+            print(f"Enabled {args.module}.\n")
+            status(paths)
+        elif args.command == "disable":
+            disable_module(paths, args.module)
         elif args.action == "add":
             site = Site(args.domain, tuple(args.alias), not args.no_spa, args.www)
             add_site(paths, site)
