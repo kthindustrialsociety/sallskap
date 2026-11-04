@@ -128,7 +128,7 @@ Each module is a folder under `modules/<name>/` containing:
 |---|---|---|
 | `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access group, setup questions |
 | `compose.yml` | yes | The module's containers, with memory limits |
-| `site.caddy` | if web-facing | Caddy routing lines, imported automatically |
+| `site.caddy` | if web-facing | Caddy routing lines, imported automatically, with `__HOST__` for its hostname |
 | `backup.sh` | optional | Pre-backup step, e.g. a database dump |
 | `README.md` | yes | What it does, who should own it, how to restore it |
 
@@ -141,7 +141,7 @@ subdomain   = "git"
 ram_mb      = 1700            # Forgejo ~200 MB + runner capped at 1.5 GB
 requires    = []
 data        = ["/srv/git"]
-access      = ["developers"]  # group mapped via OIDC
+access      = ["developer"]   # group mapped via OIDC
 oidc        = true
 
 [[setup]]

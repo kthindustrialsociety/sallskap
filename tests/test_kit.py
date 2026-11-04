@@ -4,6 +4,7 @@ import base64
 import contextlib
 import importlib.util
 import io
+import json
 import re
 import subprocess
 import tarfile
@@ -90,6 +91,7 @@ class ParseConfig(unittest.TestCase):
 
     def test_refuses_service_hostnames(self):
         self.assert_refused('[[website.sites]]\ndomain = "app.example.org"\n', "reserved")
+        self.assert_refused('[[website.sites]]\ndomain = "git.example.org"\n', "reserved")
 
     def test_refuses_a_www_site_domain(self):
         self.assert_refused('[[website.sites]]\ndomain = "www.a.org"\n', "bare domain")
@@ -384,8 +386,9 @@ class Core(unittest.TestCase):
 
     def test_secrets_stay_out_of_git(self):
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True).stdout
-        self.assertNotIn("core.env", tracked)
-        self.assertFalse(list(ROOT.glob("**/core.env")))
+        for name in ("core.env", "git.env"):
+            self.assertNotIn(name, tracked)
+            self.assertFalse(list(ROOT.glob(f"**/{name}")))
 
     def test_email_addresses_are_checked_before_reaching_the_container(self):
         self.assertEqual(kit._check_email(" First.Admin@Example.org "), "first.admin@example.org")
@@ -685,7 +688,7 @@ class Modules(unittest.TestCase):
         self.assertIn("no module called nope", out)
         self.assertEqual(self.paths.config.read_text(), before)
 
-    def test_disable_takes_the_route_away_stops_it_and_keeps_its_data(self):
+    def test_disable_stops_it_takes_the_route_away_and_keeps_its_data(self):
         self.run_kit("enable", "demo")
         self.calls.clear()
         code, _ = self.run_kit("disable", "demo")
@@ -695,18 +698,370 @@ class Modules(unittest.TestCase):
         removal = self.demo_commands()[-1]
         self.assertEqual(removal[-3:], ["rm", "--stop", "--force"])
         self.assertNotIn("--volumes", removal)
-        self.assertEqual(self.calls[-1], removal)
 
-    def test_disabling_something_that_is_off_does_nothing(self):
+    def test_disabling_something_that_is_off_does_not_touch_it(self):
         code, out = self.run_kit("disable", "demo")
         self.assertEqual(code, 0)
         self.assertIn("isn't enabled", out)
+        self.assertEqual(self.demo_commands(), [])
+
+    def test_a_failed_disable_can_be_finished_by_running_it_again(self):
+        """It's still marked as on, so the next run reaches the container."""
+        self.run_kit("enable", "demo")
+        real_run = kit.subprocess.run
+
+        def broken(command, *args, **kwargs):
+            if "rm" in command:
+                raise subprocess.CalledProcessError(1, command)
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(kit.subprocess, "run", broken):
+            code, _ = self.run_kit("disable", "demo")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.config().modules, ("demo",))
+        self.calls.clear()
+        self.assertEqual(self.run_kit("disable", "demo")[0], 0)
+        self.assertEqual(self.demo_commands()[-1][-3:], ["rm", "--stop", "--force"])
+
+    def test_a_web_server_problem_while_disabling_can_be_finished_too(self):
+        """It's already marked as off, so running it again has to get the route away."""
+        self.run_kit("enable", "demo")
+        real_apply = kit.apply_web
+        with mock.patch.object(kit, "apply_web", side_effect=kit.KitError("no")):
+            self.assertEqual(self.run_kit("disable", "demo")[0], 1)
+        self.assertIn("demo.example.org", self.paths.caddyfile.read_text())
+        self.assertEqual(kit.apply_web, real_apply)
+        self.run_kit("disable", "demo")
+        self.assertNotIn("demo.example.org", self.paths.caddyfile.read_text())
+
+    def test_disable_refuses_a_module_with_nothing_to_start(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nwebsite = true\n')
+        code, out = self.run_kit("disable", "website")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to start", out)
+        self.assertEqual(self.config().modules, ("website",))
         self.assertEqual(self.calls, [])
 
     def test_leftover_warnings_are_turned_off(self):
         """Each module has its own Compose file, so the others look like leftovers."""
         self.run_kit("apply")
         self.assertEqual(kit.os.environ.get("COMPOSE_IGNORE_ORPHANS"), "true")
+
+
+class GitSecrets(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git")
+        self.config = kit.parse_config('[association]\ndomain = "example.org"\n')
+
+    def settings(self):
+        return kit._read_env(self.paths.git_env)
+
+    def test_the_settings_use_the_primary_domain(self):
+        kit.prepare_git(self.paths, self.config)
+        self.assertEqual(self.settings()["FORGEJO__server__DOMAIN"], "git.example.org")
+        self.assertEqual(self.settings()["FORGEJO__server__ROOT_URL"], "https://git.example.org/")
+
+    def test_secrets_are_private_and_long(self):
+        kit.prepare_git(self.paths, self.config)
+        self.assertEqual(self.paths.git_env.stat().st_mode & 0o777, 0o600)
+        self.assertGreater(len(self.settings()["FORGEJO__security__SECRET_KEY"]), 50)
+        self.assertGreater(len(self.settings()["FORGEJO__security__INTERNAL_TOKEN"]), 50)
+
+    def test_the_data_folder_is_private(self):
+        kit.prepare_git(self.paths, self.config)
+        self.assertEqual(self.paths.git_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_running_it_again_changes_nothing(self):
+        kit.prepare_git(self.paths, self.config)
+        before, modified = self.paths.git_env.read_text(), self.paths.git_env.stat().st_mtime_ns
+        kit.prepare_git(self.paths, self.config)
+        self.assertEqual(self.paths.git_env.read_text(), before)
+        self.assertEqual(self.paths.git_env.stat().st_mtime_ns, modified)
+
+    def test_changing_the_domain_keeps_the_secrets(self):
+        """A new key would make Forgejo's stored login secret and 2FA records unreadable."""
+        kit.prepare_git(self.paths, self.config)
+        before = self.settings()
+        kit.prepare_git(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        after = self.settings()
+        self.assertEqual(after["FORGEJO__server__DOMAIN"], "git.new.org")
+        self.assertEqual(after["FORGEJO__security__SECRET_KEY"], before["FORGEJO__security__SECRET_KEY"])
+        self.assertEqual(after["FORGEJO__security__INTERNAL_TOKEN"], before["FORGEJO__security__INTERNAL_TOKEN"])
+
+
+class GitSetup(unittest.TestCase):
+    """Runs the setup with a made-up Forgejo and core, recording what they were asked."""
+
+    def setUp(self):
+        self.calls = []
+        self.sources = ""
+        self.tools = ""
+        self.users = ""
+        self.org_exists = False
+        self.teams = ["Owners"]
+        self.refuse = None  # part of a command to answer with a failure
+
+        def fake_run(command, *args, **kwargs):
+            self.calls.append((command, kwargs.get("input")))
+            return self.answer(command, kwargs.get("input"))
+
+        patcher = mock.patch.object(kit.subprocess, "run", fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = kit.parse_config('[association]\ndomain = "kthis.example"\n')
+
+    def answer(self, command, body):
+        line = " ".join(command)
+        done = lambda out="": subprocess.CompletedProcess(command, 0, out, "")
+        if self.refuse and self.refuse in line:
+            return subprocess.CompletedProcess(command, 1, "", "refused by the fake")
+        if "curl" in command:
+            url = command[-1].removeprefix("http://127.0.0.1:3000/api/v1")
+            method = command[command.index("--request") + 1]
+            if method == "GET" and url == "/orgs/kthis":
+                return done(f"{{}}\n{200 if self.org_exists else 404}")
+            if method == "GET" and url == "/orgs/kthis/teams":
+                return done(json.dumps([{"name": name} for name in self.teams]) + "\n200")
+            if method == "POST":
+                return done("{}\n201")
+            return done("{}\n200")
+        if "auth" in command and "list" in command:
+            return done(self.sources)
+        if "tool" in command and "list" in command:
+            return done(self.tools)
+        if "tool" in command and "add" in command:
+            return done("Registered.\n  Client ID: the-client-id\n  Secret:    the-secret\n")
+        if "user" in command and "list" in command:
+            return done(self.users)
+        if "generate-access-token" in command:
+            return done("the-token\n")
+        return done()
+
+    def lines(self):
+        return [" ".join(command) for command, _ in self.calls]
+
+    def find(self, text):
+        return [line for line in self.lines() if text in line]
+
+    def index(self, text):
+        return next(i for i, line in enumerate(self.lines()) if text in line)
+
+    def bodies(self, text):
+        """What was sent to Forgejo's API, which reaches curl as a setting on stdin."""
+        found = []
+        for command, settings in self.calls:
+            match = re.search(r'^data-binary = "(.*)"$', settings or "", re.M)
+            if match and text in " ".join(command):
+                found.append(json.loads(match.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+        return found
+
+    def setup(self):
+        kit.setup_git(None, self.config)
+
+    def test_the_token_never_goes_on_a_command_line(self):
+        """Anyone on the server can read those, and this token can't be deleted."""
+        self.setup()
+        self.assertFalse(self.find("the-token"))
+        self.assertTrue(any("Authorization: token the-token" in (settings or "") for _, settings in self.calls))
+
+    def test_text_sent_to_the_api_survives_curls_quoting(self):
+        kit._forgejo_api("t", "POST", "/x", {"name": 'a"b\\c'})
+        self.assertEqual(self.bodies("curl"), [{"name": 'a"b\\c'}])
+
+    def test_the_organisation_is_named_after_the_domain(self):
+        self.setup()
+        self.assertEqual(self.bodies("/api/v1/orgs")[0]["username"], "kthis")
+
+    def test_it_creates_a_service_account_that_nobody_gets_a_password_for(self):
+        self.setup()
+        create = self.find("admin user create")[0]
+        self.assertIn("--admin", create)
+        self.assertIn("--random-password", create)
+        self.assertNotIn("--password ", create)
+
+    def test_it_keeps_a_service_account_that_exists(self):
+        self.users = "ID Username\n1 sallskap-admin a@b true true false\n"
+        self.setup()
+        self.assertEqual(self.find("admin user create"), [])
+
+    def test_the_token_can_only_do_what_the_setup_needs(self):
+        self.setup()
+        token = self.find("generate-access-token")[0]
+        self.assertIn("--scopes write:admin,write:organization ", token)
+
+    def test_it_creates_the_teams_a_group_can_lead_to(self):
+        self.setup()
+        teams = {team["name"]: team for team in self.bodies("/orgs/kthis/teams")}
+        self.assertEqual(teams["developers"]["permission"], "write")
+        self.assertTrue(teams["developers"]["can_create_org_repo"])
+        self.assertEqual(teams["board"]["permission"], "read")
+        self.assertFalse(teams["board"]["can_create_org_repo"])
+        for team in teams.values():
+            self.assertTrue(team["includes_all_repositories"])
+
+    def test_it_only_creates_what_is_missing(self):
+        self.org_exists = True
+        self.teams = ["Owners", "developers"]
+        self.setup()
+        self.assertEqual([team["name"] for team in self.bodies("/orgs/kthis/teams")], ["board"])
+        self.assertFalse([b for b in self.bodies("/api/v1/orgs") if "username" in b])
+
+    def test_the_organisation_may_make_repos_when_people_may_not(self):
+        self.setup()
+        limit = self.bodies("/admin/users/kthis")[0]["max_repo_creation"]
+        self.assertGreater(limit, 1000)
+        self.assertIn('FORGEJO__repository__MAX_CREATION_LIMIT: "0"', compose_services()["forgejo"])
+
+    def test_it_registers_the_tool_with_forgejos_exact_return_address(self):
+        self.setup()
+        self.assertIn("tool add forgejo https://git.kthis.example/user/oauth2/kthis/callback", self.find("tool add")[0])
+
+    def source(self):
+        command = next(command for command, _ in self.calls if "add-oauth" in command or "update-oauth" in command)
+        settings, key = {}, None
+        for part in command[command.index("admin") + 3 :]:
+            if part.startswith("--"):
+                key = part
+                settings.setdefault(key, [])
+            else:
+                settings[key].append(part)
+        return settings
+
+    def test_forgejo_is_given_the_tools_settings(self):
+        self.setup()
+        source = self.source()
+        self.assertEqual(source["--name"], ["kthis"])
+        self.assertEqual(source["--provider"], ["openidConnect"])
+        self.assertEqual(source["--key"], ["the-client-id"])
+        self.assertEqual(source["--secret"], ["the-secret"])
+        self.assertEqual(source["--auto-discover-url"], ["https://app.kthis.example/.well-known/openid-configuration"])
+        self.assertEqual(source["--scopes"], ["email", "profile", "groups"])
+
+    def test_groups_decide_teams_and_taking_one_away_counts(self):
+        self.setup()
+        source = self.source()
+        self.assertEqual(source["--group-claim-name"], ["groups"])
+        self.assertEqual(
+            json.loads(source["--group-team-map"][0]),
+            {"operator": {"kthis": ["Owners"]}, "developer": {"kthis": ["developers"]}, "board": {"kthis": ["board"]}},
+        )
+        self.assertIn("--group-team-map-removal", source)
+
+    def test_only_operators_are_forgejo_admins(self):
+        self.setup()
+        self.assertEqual(self.source()["--admin-group"], ["operator"])
+
+    def test_nobody_is_asked_for_a_second_code(self):
+        self.setup()
+        self.assertIn("--skip-local-2fa", self.source())
+
+    def test_the_login_is_connected_last(self):
+        """Finding it is how a later run knows everything before it finished."""
+        self.setup()
+        self.assertLess(self.index("/orgs/kthis/teams"), self.index("add-oauth"))
+
+    def test_forgejo_restarts_to_read_its_new_login(self):
+        self.setup()
+        self.assertLess(self.index("add-oauth"), self.index(" restart forgejo"))
+        self.assertLess(self.index(" restart forgejo"), self.index(" up -d --wait"))
+
+    def test_a_finished_setup_does_nothing_and_makes_no_token(self):
+        self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
+        self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
+        self.setup()
+        self.assertEqual(self.find("generate-access-token"), [])
+        self.assertEqual(self.find("tool add"), [])
+        self.assertEqual(self.find("add-oauth"), [])
+        self.assertEqual(self.find(" restart "), [])
+
+    def test_a_login_source_for_something_else_does_not_count(self):
+        self.sources = "1\tkthis-old\tOAuth2\ttrue\n"
+        self.tools = "forgejo  https://x/callback\n"
+        self.setup()
+        self.assertTrue(self.find("add-oauth"))
+
+    def test_a_tool_with_no_login_source_gets_a_new_secret(self):
+        """Its secret was only shown once, so it can't be given to Forgejo any more."""
+        self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
+        self.setup()
+        self.assertLess(self.index("tool remove forgejo"), self.index("tool add"))
+        self.assertTrue(self.find("add-oauth"))
+
+    def test_a_login_source_with_no_tool_makes_no_new_token(self):
+        """The login is connected last, so the organisation and teams are already there."""
+        self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
+        self.setup()
+        self.assertEqual(self.find("generate-access-token"), [])
+
+    def test_a_failed_login_setup_can_be_finished_by_running_it_again(self):
+        """Core has a new secret by then. If the tool stayed, the next run would find both
+        sides present and call it finished, with every sign-in failing."""
+        self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
+        self.refuse = "update-oauth"
+        with self.assertRaises(kit.KitError):
+            self.setup()
+        self.assertTrue(self.find("tool remove forgejo"))
+
+    def test_a_failed_restart_can_be_finished_by_running_it_again(self):
+        self.refuse = " restart forgejo"
+        real_run = kit.subprocess.run
+
+        def strict(command, *args, **kwargs):
+            result = real_run(command, *args, **kwargs)
+            if kwargs.get("check") and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, command)
+            return result
+
+        with mock.patch.object(kit.subprocess, "run", strict), self.assertRaises(subprocess.CalledProcessError):
+            self.setup()
+        self.assertTrue(self.find("tool remove forgejo"))
+
+    def test_a_login_source_with_no_tool_is_updated_not_duplicated(self):
+        self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
+        self.setup()
+        self.assertEqual(self.find("add-oauth"), [])
+        self.assertIn("update-oauth --id 3 ", self.find("update-oauth")[0])
+
+    def test_a_refused_step_stops_before_the_login_is_connected(self):
+        self.refuse = "/orgs/kthis/teams"
+        with self.assertRaises(kit.KitError):
+            self.setup()
+        self.assertEqual(self.find("tool add"), [])
+        self.assertEqual(self.find("add-oauth"), [])
+
+    def test_an_api_answer_that_is_not_success_is_an_error(self):
+        with mock.patch.object(kit, "_forgejo_api", return_value=(500, {"message": "broken"})):
+            with self.assertRaisesRegex(kit.KitError, "answered 500"):
+                self.setup()
+
+    def test_an_api_answer_it_cannot_read_is_explained(self):
+        real_run = kit.subprocess.run
+
+        def broken(command, *args, **kwargs):
+            if "curl" in command:
+                return subprocess.CompletedProcess(command, 0, "<html>Bad gateway</html>\n502", "")
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(kit.subprocess, "run", broken), self.assertRaisesRegex(kit.KitError, "can't read"):
+            self.setup()
+
+    def test_settings_it_cannot_read_are_explained(self):
+        real_answer = self.answer
+        self.answer = lambda command, body: (
+            subprocess.CompletedProcess(command, 0, "something new\n", "") if "add" in command and "tool" in command else real_answer(command, body)
+        )
+        with self.assertRaisesRegex(kit.KitError, "couldn't read its settings"):
+            self.setup()
+
+    def test_a_failure_never_shows_the_secret(self):
+        self.refuse = "add-oauth"
+        with self.assertRaises(kit.KitError) as caught:
+            self.setup()
+        self.assertNotIn("the-secret", str(caught.exception))
+        self.assertIn("refused by the fake", str(caught.exception))
 
 
 class Status(unittest.TestCase):
@@ -816,6 +1171,97 @@ class Packaging(unittest.TestCase):
     def test_core_refuses_to_start_without_its_signing_key(self):
         """Otherwise it looks fine until the first login to a tool fails."""
         self.assertRegex((ROOT / "core" / "start.sh").read_text(), r"(?m)^: \"\$\{OIDC_SIGNING_KEY:\?")
+
+    def test_forgejo_runs_locked_down(self):
+        text = compose_services()["forgejo"]
+        self.assertIn("read_only: true", text)
+        self.assertIn("cap_drop: [ALL]", text)
+        self.assertIn("no-new-privileges:true", text)
+
+    def test_forgejos_version_is_pinned(self):
+        """So an upgrade only arrives in a version of the kit that it was tested with."""
+        self.assertRegex(compose_services()["forgejo"], r"image: codeberg\.org/forgejo/forgejo:\d+\.\d+\.\d+-rootless\n")
+
+    def test_forgejo_can_only_be_entered_through_core(self):
+        """Each of these would be a way around 2FA."""
+        text = compose_services()["forgejo"]
+        for setting in (
+            'FORGEJO__security__INSTALL_LOCK: "true"',
+            'FORGEJO__service__ENABLE_INTERNAL_SIGNIN: "false"',
+            'FORGEJO__service__ENABLE_BASIC_AUTHENTICATION: "false"',
+            'FORGEJO__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"',
+            'FORGEJO__openid__ENABLE_OPENID_SIGNIN: "false"',
+            'FORGEJO__openid__ENABLE_OPENID_SIGNUP: "false"',
+            'FORGEJO__oauth2__ENABLED: "false"',
+        ):
+            self.assertIn(setting, text)
+
+    def test_a_fork_cannot_get_around_the_limit_on_personal_repos(self):
+        self.assertIn('FORGEJO__repository__ALLOW_FORK_WITHOUT_MAXIMUM_LIMIT: "false"', compose_services()["forgejo"])
+
+    def test_people_cannot_manage_what_comes_from_core(self):
+        self.assertIn("FORGEJO__admin__EXTERNAL_USER_DISABLE_FEATURES: deletion,manage_password,manage_ssh_keys", compose_services()["forgejo"])
+
+    def test_addresses_cannot_be_added_in_forgejo(self):
+        """With no mail to confirm it, someone else's address would stop them signing in."""
+        routing = (ROOT / "modules" / "git" / "site.caddy").read_text()
+        self.assertIn("path /user/settings/account/email* /api/v1/user/emails*", routing)
+        self.assertIn('respond @email "Addresses are managed in core." 403', routing)
+
+    def test_signing_in_keeps_the_page_someone_came_from(self):
+        self.assertIn("/user/oauth2/__SHORT_NAME__?{query} 302", (ROOT / "modules" / "git" / "site.caddy").read_text())
+
+    def test_forgejo_never_hands_someone_an_existing_account(self):
+        """`auto` would give an account to anyone who arrives with the same name."""
+        self.assertIn("FORGEJO__oauth2_client__ACCOUNT_LINKING: disabled", compose_services()["forgejo"])
+
+    def test_forgejo_sessions_survive_a_restart(self):
+        self.assertIn("FORGEJO__session__PROVIDER: db", compose_services()["forgejo"])
+
+    def test_forgejo_runs_no_ssh_server(self):
+        """The rootless image's own template turns it on, and only Caddy may publish ports."""
+        text = compose_services()["forgejo"]
+        self.assertIn('FORGEJO__server__DISABLE_SSH: "true"', text)
+        self.assertIn('FORGEJO__server__START_SSH_SERVER: "false"', text)
+
+    def test_forgejo_keeps_people_private(self):
+        text = compose_services()["forgejo"]
+        for setting in (
+            'FORGEJO__service__DEFAULT_KEEP_EMAIL_PRIVATE: "true"',
+            "FORGEJO__service__DEFAULT_USER_VISIBILITY: limited",
+            'FORGEJO__service_0X2E_explore__DISABLE_USERS_PAGE: "true"',
+        ):
+            self.assertIn(setting, text)
+
+    def test_the_git_module_is_routed_to_forgejo(self):
+        config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}")[0]
+        self.assertIn("reverse_proxy forgejo:3000", block)
+        self.assertIn("Strict-Transport-Security", block)
+        self.assertIn("-Server", block)
+
+    def test_opening_forgejo_goes_straight_to_the_login_service(self):
+        config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}\n")[0]
+        self.assertIn("redir @sign_in /user/oauth2/example?{query} 302", block)
+        self.assertNotIn("__SHORT_NAME__", block)
+
+    def test_the_login_it_goes_to_is_the_one_setup_creates(self):
+        """The address in Caddy and the login source's name have to be the same."""
+        config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        self.assertEqual(config.short_name, "example")
+        self.assertIn("org = config.short_name", (ROOT / "kit" / "kit.py").read_text())
+
+    def test_only_opening_the_page_is_redirected(self):
+        """Forgejo answers a posted login itself, which is what refuses local passwords."""
+        routing = (ROOT / "modules" / "git" / "site.caddy").read_text()
+        self.assertIn("method GET", routing)
+        self.assertIn("not header Cookie *sallskap_stay=1*", routing)
+
+    def test_the_uid_given_forgejos_data_folder_is_the_images(self):
+        """The image's documented default: nothing in the Compose file changes it."""
+        self.assertEqual(kit.FORGEJO_UID, 1000)
+        self.assertNotIn("user:", compose_services()["forgejo"])
 
     def test_core_runs_locked_down(self):
         text = compose_services()["core"]
