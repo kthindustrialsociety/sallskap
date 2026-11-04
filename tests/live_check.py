@@ -744,11 +744,14 @@ class Person:
             self.app.enter_code(totp(code_secret))
 
     def sign_in_to_git(self):
-        """Press the sign-in button and follow where it goes, across both hostnames.
-        Returns the last place reached, as a hostname and path."""
+        return self.open_git(f"/user/oauth2/{org_of(self.host)}")
+
+    def open_git(self, path):
+        """Open a page and follow where it goes, across both hostnames. Returns the
+        last place reached, as a hostname and path, and the answer from there."""
         browser = self.git
-        last = f"{browser.host}/user/oauth2/{org_of(self.host)}"
-        response = browser.get(f"/user/oauth2/{org_of(self.host)}")
+        last = f"{browser.host}{path}"
+        response = browser.get(path)
         for _ in range(8):
             if response.status not in (301, 302, 303, 307):
                 return last, response
@@ -771,7 +774,7 @@ class Person:
 
     def make_token(self, name="fake-token"):
         """The way a person gets one: on the settings page, where no password is asked for."""
-        scopes = ["write:repository", "write:organization", "read:user"]
+        scopes = ["write:repository", "write:organization", "write:user"]
         answer = self.git.send(
             "POST",
             "/user/settings/applications/tokens/new",
@@ -795,6 +798,11 @@ def forgejo_api(host, token, method, path, body=None, basic=None):
         return response.status, json.loads(response.text)
     except ValueError:
         return response.status, None
+
+
+def button_page(host):
+    """Forgejo's sign-in page, which people only see just after a login error or signing out."""
+    return Browser(git_host(host), cookies={"sallskap_stay": "1"}).get("/user/login")
 
 
 def team_names(host, token):
@@ -849,7 +857,9 @@ def check_forgejo_exposure(host):
     check("It restarts by itself", config["RestartPolicy"]["Name"] == "unless-stopped")
     uid = in_forgejo("id", "-u").stdout.strip()
     check("It runs as non-root", uid == "1000", uid)
-    listening = in_forgejo("cat", "/proc/net/tcp").stdout
+    # Both files: Go's dual-stack listeners only show up in the IPv6 one.
+    listening = in_forgejo("cat", "/proc/net/tcp", "/proc/net/tcp6").stdout
+    check("It listens on its web port, so this can see what's listening", ":0BB8 " in listening)  # port 3000
     check("Its SSH server isn't running", ":08AE " not in listening)  # port 2222
     data = subprocess.run(["stat", "-c", "%u %a", "/srv/git"], capture_output=True, text=True).stdout.strip()
     check("Its data folder is private to it", data == "1000 700", data)
@@ -865,8 +875,7 @@ def check_forgejo_exposure(host):
 
 def check_forgejo_https(host):
     section("Forgejo: HTTPS and cookies")
-    browser = Browser(git_host(host))
-    page = browser.get("/user/login")
+    page = button_page(host)
     check("The sign-in page loads over HTTPS with a valid certificate", page.status == 200, str(page.status))
     plain = http.client.HTTPConnection(git_host(host), 80, timeout=10)
     plain.request("GET", "/")
@@ -894,19 +903,28 @@ def check_forgejo_https(host):
 
 def check_forgejo_single_login(host, secrets_by_name):
     section("Forgejo: one login")
-    page = Browser(git_host(host)).get("/user/login")
+    page = button_page(host)
     check("The sign-in page offers the login service", f"/user/oauth2/{org_of(host)}" in page.text)
     check("The sign-in page has no password box", 'type="password"' not in page.text)
 
     person = Person(host)
     person.log_in_to_core(email_of("fake-git-dev"))
-    last, final = person.sign_in_to_git()
-    check("Someone logged in to core gets in with no prompt", person.in_git(), f"{last} {final.status}")
+    last, final = person.open_git("/")
+    check("Someone logged in to core who opens Forgejo gets in, with nothing to click", person.in_git(), f"{last} {final.status}")
+    home = person.git.get("/")
+    check("Once in, the first page is their dashboard, not the sign-in page", home.status == 200 and "/user/login" not in home.location and 'name="full_name"' not in home.text and "dashboard" in home.text.lower(), f"{home.status} {home.location}")
+    check("...which the logo leads to", 'id="navbar-logo"' in home.text and re.search(r'id="navbar-logo"[^>]*href="/"|href="/"[^>]*id="navbar-logo"', home.text) is not None)
 
     visitor = Person(host)
-    last, _ = visitor.sign_in_to_git()
-    check("A visitor is sent to core's login page", "/accounts/login/" in last, last)
+    last, _ = visitor.open_git("/")
+    check("A visitor who opens Forgejo is sent to core's login page", "/accounts/login/" in last, last)
     check("...and isn't in yet", not visitor.in_git())
+
+    looping = Browser(git_host(host))
+    first = looping.get("/user/login")
+    check("Opening the sign-in page goes straight to the login service", first.status == 302 and first.location.endswith(f"/user/oauth2/{org_of(host)}"), f"{first.status} {first.location}")
+    second = looping.get("/user/login")
+    check("Coming straight back shows the page, so a login error can't loop", second.status == 200, f"{second.status} {second.location}")
 
     board = Person(host)
     response = board.git.get(f"/user/oauth2/{org_of(host)}")
@@ -934,6 +952,11 @@ def check_forgejo_single_login(host, secrets_by_name):
     person.git.send("POST", "/user/logout", {})
     check("Signing out of Forgejo works", not person.in_git())
     check("...and leaves them logged in to core", person.app.logged_in())
+    last, _ = person.open_git("/")
+    check("Opening Forgejo right after doesn't sign them straight back in", not person.in_git(), last)
+    person.git.cookies.pop("sallskap_stay", None)  # as if the few minutes had passed
+    person.open_git("/")
+    check("...but after a few minutes it does, as they're still logged in to core", person.in_git())
 
 
 def check_forgejo_closed_doors(host):
@@ -944,9 +967,12 @@ def check_forgejo_closed_doors(host):
     posted = browser.send("POST", "/user/sign_up", {"user_name": "fake-signup", "email": "fake-signup@example.org", "password": PASSWORD, "retype": PASSWORD})
     check("Signing up directly is refused", posted.status == 403, str(posted.status))
     check("Signing up made no account", "fake-signup" not in in_forgejo("forgejo", "admin", "user", "list").stdout)
+    # A redirect to the sign-in page wouldn't show this: that's also what the route
+    # does when it's on, for someone who isn't signed in.
+    status = Browser(git_host(host)).get("/.well-known/openid-configuration").status
+    check("Forgejo's own login service isn't available", status == 404, str(status))
     for path, label in (
         ("/user/login/openid", "OpenID sign-in"),
-        ("/login/oauth/authorize?client_id=x&response_type=code&redirect_uri=https://evil.example.org", "Forgejo's own login service"),
         ("/user/forgot_password", "Password reset"),
     ):
         answer = Browser(git_host(host)).get(path)
@@ -1048,10 +1074,10 @@ def check_forgejo_git(host, people):
     check("The new repo form starts on private", bool(re.search(r'<input[^>]*name="private"[^>]*checked', form)))
 
     status, _ = forgejo_api(host, developer, "POST", "/user/repos", {"name": "fake-personal"})
-    check("A Developer can't create a personal repo", status in (403, 409), str(status))
+    check("A Developer can't create a personal repo", status == 403, str(status))
     member = people["fake-git-member"][1]
     status, _ = forgejo_api(host, member, "POST", "/user/repos", {"name": "fake-personal"})
-    check("A Member can't create a personal repo", status in (403, 409), str(status))
+    check("A Member can't create a personal repo", status == 403, str(status))
     status, _ = forgejo_api(host, member, "POST", f"/orgs/{org}/repos", {"name": "fake-members-repo"})
     check("A Member can't create a repo in the organisation", status == 403, str(status))
     status, _ = forgejo_api(host, member, "POST", "/orgs", {"username": "fake-org"})
