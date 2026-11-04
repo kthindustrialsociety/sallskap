@@ -1126,7 +1126,6 @@ def check_forgejo_setup_repeats(host):
     after = forgejo_fingerprint()
     for label in before:
         check(f"Its {label} didn't change", before[label] == after[label], f"{before[label]} {after[label]}")
-    return after
 
 
 def check_forgejo(host, secrets_by_name):
@@ -1140,13 +1139,14 @@ def check_forgejo(host, secrets_by_name):
     check_forgejo_git(host, people)
     check_forgejo_password_door(host, people["fake-git-dev"][0], "fake-git-dev", people["fake-git-dev"][1])
     check_forgejo_names(host)
-    fingerprint = check_forgejo_setup_repeats(host)
+    check_forgejo_setup_repeats(host)
     clear_limits()
 
     keeper = Person(host)
     keeper.log_in_to_core(email_of("fake-git-keeper"))
     keeper.sign_in_to_git()
     token = keeper.make_token()
+    fingerprint = forgejo_fingerprint()  # after that token, which is the last one made
     return {
         "cookies": keeper.git.cookies,
         "core_cookies": keeper.app.cookies,
