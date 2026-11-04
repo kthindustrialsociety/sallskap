@@ -57,7 +57,7 @@ kit tool list
 kit tool remove mytool                                  # ends its access
 ```
 
-A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`. `preferred_username` is unique when it's sent, but can change: it's the part of the email before the @, with the account's id added if an earlier account has the same one. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent as `custom:<name>`. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
+A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`. `preferred_username` is the part of the email before the @, with the account's id added if an earlier account has the same one. That covers the usual clash, but it isn't guaranteed unique, and it can change. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent as `custom:<name>`. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
 
 ## Tests
 
