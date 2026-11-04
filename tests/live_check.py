@@ -949,6 +949,9 @@ def check_forgejo_single_login(host, secrets_by_name):
     forger.git.get(f"/user/oauth2/{org_of(host)}/callback?code=made-up&state=made-up")
     check("A made-up login code doesn't get in", not forger.in_git())
 
+    # This browser never expires cookies, so the one from signing in has to go first,
+    # or it would hide whether signing out sets its own.
+    person.git.cookies.pop("sallskap_stay", None)
     person.git.send("POST", "/user/logout", {})
     check("Signing out of Forgejo works", not person.in_git())
     check("...and leaves them logged in to core", person.app.logged_in())
