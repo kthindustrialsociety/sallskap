@@ -688,7 +688,7 @@ class Modules(unittest.TestCase):
         self.assertIn("no module called nope", out)
         self.assertEqual(self.paths.config.read_text(), before)
 
-    def test_disable_takes_the_route_away_stops_it_and_keeps_its_data(self):
+    def test_disable_stops_it_takes_the_route_away_and_keeps_its_data(self):
         self.run_kit("enable", "demo")
         self.calls.clear()
         code, _ = self.run_kit("disable", "demo")
@@ -698,12 +698,48 @@ class Modules(unittest.TestCase):
         removal = self.demo_commands()[-1]
         self.assertEqual(removal[-3:], ["rm", "--stop", "--force"])
         self.assertNotIn("--volumes", removal)
-        self.assertEqual(self.calls[-1], removal)
 
-    def test_disabling_something_that_is_off_does_nothing(self):
+    def test_disabling_something_that_is_off_does_not_touch_it(self):
         code, out = self.run_kit("disable", "demo")
         self.assertEqual(code, 0)
         self.assertIn("isn't enabled", out)
+        self.assertEqual(self.demo_commands(), [])
+
+    def test_a_failed_disable_can_be_finished_by_running_it_again(self):
+        """It's still marked as on, so the next run reaches the container."""
+        self.run_kit("enable", "demo")
+        real_run = kit.subprocess.run
+
+        def broken(command, *args, **kwargs):
+            if "rm" in command:
+                raise subprocess.CalledProcessError(1, command)
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(kit.subprocess, "run", broken):
+            code, _ = self.run_kit("disable", "demo")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.config().modules, ("demo",))
+        self.calls.clear()
+        self.assertEqual(self.run_kit("disable", "demo")[0], 0)
+        self.assertEqual(self.demo_commands()[-1][-3:], ["rm", "--stop", "--force"])
+
+    def test_a_web_server_problem_while_disabling_can_be_finished_too(self):
+        """It's already marked as off, so running it again has to get the route away."""
+        self.run_kit("enable", "demo")
+        real_apply = kit.apply_web
+        with mock.patch.object(kit, "apply_web", side_effect=kit.KitError("no")):
+            self.assertEqual(self.run_kit("disable", "demo")[0], 1)
+        self.assertIn("demo.example.org", self.paths.caddyfile.read_text())
+        self.assertEqual(kit.apply_web, real_apply)
+        self.run_kit("disable", "demo")
+        self.assertNotIn("demo.example.org", self.paths.caddyfile.read_text())
+
+    def test_disable_refuses_a_module_with_nothing_to_start(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nwebsite = true\n')
+        code, out = self.run_kit("disable", "website")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to start", out)
+        self.assertEqual(self.config().modules, ("website",))
         self.assertEqual(self.calls, [])
 
     def test_leftover_warnings_are_turned_off(self):
@@ -814,10 +850,26 @@ class GitSetup(unittest.TestCase):
         return next(i for i, line in enumerate(self.lines()) if text in line)
 
     def bodies(self, text):
-        return [json.loads(body) for command, body in self.calls if text in " ".join(command) and body]
+        """What was sent to Forgejo's API, which reaches curl as a setting on stdin."""
+        found = []
+        for command, settings in self.calls:
+            match = re.search(r'^data-binary = "(.*)"$', settings or "", re.M)
+            if match and text in " ".join(command):
+                found.append(json.loads(match.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+        return found
 
     def setup(self):
         kit.setup_git(None, self.config)
+
+    def test_the_token_never_goes_on_a_command_line(self):
+        """Anyone on the server can read those, and this token can't be deleted."""
+        self.setup()
+        self.assertFalse(self.find("the-token"))
+        self.assertTrue(any("Authorization: token the-token" in (settings or "") for _, settings in self.calls))
+
+    def test_text_sent_to_the_api_survives_curls_quoting(self):
+        kit._forgejo_api("t", "POST", "/x", {"name": 'a"b\\c'})
+        self.assertEqual(self.bodies("curl"), [{"name": 'a"b\\c'}])
 
     def test_the_organisation_is_named_after_the_domain(self):
         self.setup()
@@ -937,6 +989,35 @@ class GitSetup(unittest.TestCase):
         self.setup()
         self.assertLess(self.index("tool remove forgejo"), self.index("tool add"))
         self.assertTrue(self.find("add-oauth"))
+
+    def test_a_login_source_with_no_tool_makes_no_new_token(self):
+        """The login is connected last, so the organisation and teams are already there."""
+        self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
+        self.setup()
+        self.assertEqual(self.find("generate-access-token"), [])
+
+    def test_a_failed_login_setup_can_be_finished_by_running_it_again(self):
+        """Core has a new secret by then. If the tool stayed, the next run would find both
+        sides present and call it finished, with every sign-in failing."""
+        self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
+        self.refuse = "update-oauth"
+        with self.assertRaises(kit.KitError):
+            self.setup()
+        self.assertTrue(self.find("tool remove forgejo"))
+
+    def test_a_failed_restart_can_be_finished_by_running_it_again(self):
+        self.refuse = " restart forgejo"
+        real_run = kit.subprocess.run
+
+        def strict(command, *args, **kwargs):
+            result = real_run(command, *args, **kwargs)
+            if kwargs.get("check") and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, command)
+            return result
+
+        with mock.patch.object(kit.subprocess, "run", strict), self.assertRaises(subprocess.CalledProcessError):
+            self.setup()
+        self.assertTrue(self.find("tool remove forgejo"))
 
     def test_a_login_source_with_no_tool_is_updated_not_duplicated(self):
         self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
@@ -1115,6 +1196,21 @@ class Packaging(unittest.TestCase):
         ):
             self.assertIn(setting, text)
 
+    def test_a_fork_cannot_get_around_the_limit_on_personal_repos(self):
+        self.assertIn('FORGEJO__repository__ALLOW_FORK_WITHOUT_MAXIMUM_LIMIT: "false"', compose_services()["forgejo"])
+
+    def test_people_cannot_manage_what_comes_from_core(self):
+        self.assertIn("FORGEJO__admin__EXTERNAL_USER_DISABLE_FEATURES: deletion,manage_password,manage_ssh_keys", compose_services()["forgejo"])
+
+    def test_addresses_cannot_be_added_in_forgejo(self):
+        """With no mail to confirm it, someone else's address would stop them signing in."""
+        routing = (ROOT / "modules" / "git" / "site.caddy").read_text()
+        self.assertIn("path /user/settings/account/email* /api/v1/user/emails*", routing)
+        self.assertIn('respond @email "Addresses are managed in core." 403', routing)
+
+    def test_signing_in_keeps_the_page_someone_came_from(self):
+        self.assertIn("/user/oauth2/__SHORT_NAME__?{query} 302", (ROOT / "modules" / "git" / "site.caddy").read_text())
+
     def test_forgejo_never_hands_someone_an_existing_account(self):
         """`auto` would give an account to anyone who arrives with the same name."""
         self.assertIn("FORGEJO__oauth2_client__ACCOUNT_LINKING: disabled", compose_services()["forgejo"])
@@ -1147,7 +1243,7 @@ class Packaging(unittest.TestCase):
     def test_opening_forgejo_goes_straight_to_the_login_service(self):
         config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
         block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}\n")[0]
-        self.assertIn("redir @sign_in /user/oauth2/example 302", block)
+        self.assertIn("redir @sign_in /user/oauth2/example?{query} 302", block)
         self.assertNotIn("__SHORT_NAME__", block)
 
     def test_the_login_it_goes_to_is_the_one_setup_creates(self):

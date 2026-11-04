@@ -926,6 +926,11 @@ def check_forgejo_single_login(host, secrets_by_name):
     second = looping.get("/user/login")
     check("Coming straight back shows the page, so a login error can't loop", second.status == 200, f"{second.status} {second.location}")
 
+    returning = Person(host)
+    returning.log_in_to_core(email_of("fake-git-dev"))
+    last, final = returning.open_git("/user/login?redirect_to=%2Fexplore%2Frepos")
+    check("Signing in from a page returns to that page", last.endswith("/explore/repos") and final.status == 200, f"{last} {final.status}")
+
     board = Person(host)
     response = board.git.get(f"/user/oauth2/{org_of(host)}")
     target = urllib.parse.urlparse(response.location)
@@ -1002,11 +1007,14 @@ def check_forgejo_closed_doors(host):
 
 
 def check_forgejo_password_door(host, person, username, token):
-    """Someone can set a Forgejo password on their account page. It must not open anything."""
-    section("Forgejo: a password set in its own settings")
+    """A Forgejo password must not open anything, however someone came to have one."""
+    section("Forgejo: a password on someone's account")
+    page = person.git.get("/user/settings/account")
+    check("Their account page doesn't offer to set one", 'name="retype"' not in page.text)
+    check("...or to delete their account", "/user/settings/account/delete" not in page.text)
     chosen = "fake-forgejo-password-42"
-    answer = person.git.send("POST", "/user/settings/account", {"password": chosen, "retype": chosen})
-    print(f"  info  Setting one answered {answer.status} {answer.location}")
+    set_it = in_forgejo("forgejo", "admin", "user", "change-password", "--username", username, "--password", chosen, "--must-change-password=false")
+    check("One can be set from the server, for this test", set_it.returncode == 0, set_it.stderr[:200])
     fresh = Browser(git_host(host))
     posted = fresh.send("POST", "/user/login", {"user_name": username, "password": chosen})
     check("It doesn't log in on the web", posted.status == 403, str(posted.status))
@@ -1107,6 +1115,10 @@ def check_forgejo_git(host, people):
         check("Board can clone it", cloned.returncode == 0, cloned.stderr[:300])
         pushed = run_git("push", "-q", repo_url(host, "fake-git-board", board, "fake-repo"), "main:board-branch", cwd=work)
         check("Board can't push to it", pushed.returncode != 0, pushed.stdout)
+        # After the push, as an empty repo might be refused for being empty.
+        status, _ = forgejo_api(host, board, "POST", f"/repos/{org}/fake-repo/forks", {})
+        exists = forgejo_api(host, board, "GET", "/repos/fake-git-board/fake-repo")[0]
+        check("Board can't fork it into a copy of their own", status != 202 and exists == 404, f"{status} {exists}")
 
         cloned = run_git("clone", "-q", repo_url(host, "fake-git-member", member, "fake-repo"), str(Path(tmp, "member")))
         check("A Member can't clone it", cloned.returncode != 0, cloned.stdout)
@@ -1147,6 +1159,19 @@ def check_forgejo_names(host):
         _, final = person.sign_in_to_git()
         check(f"An address matching {label} gets an error, not the account", not person.in_git(), str(final.status))
         print(f"  info  It answered {final.status}.")
+
+    section("Forgejo: addresses come from core")
+    someone = "fake-git-clash@example.net"
+    answer = first.git.send("POST", "/user/settings/account/email", {"email": someone})
+    check("The form won't add someone else's address", answer.status == 403, f"{answer.status} {answer.location}")
+    for path in ("/user//settings/account/email", "/user/settings/account/email/", "/user/./settings/account/email"):
+        answer = first.git.send("POST", path, {"email": someone})
+        check(f"...not through {path} either", answer.status != 303 or "/user/settings/account" not in answer.location, f"{answer.status} {answer.location}")
+    status, _ = forgejo_api(host, first_token, "POST", "/user/emails", {"emails": [someone]})
+    check("Nor will the API", status == 403, str(status))
+    addresses = [item["email"] for item in forgejo_api(host, first_token, "GET", "/user/emails")[1]]
+    check("...and it hasn't been added", someone not in addresses, str(addresses))
+    check("Their own address is still there", email_of("fake-git-clash") in addresses, str(addresses))
 
     other = (forgejo_api(host, first_token, "GET", f"/users/{second_name}")[1] or {}).get("email", "")
     check("A logged-in person can't see someone else's address", "example.net" not in other, other)
