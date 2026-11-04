@@ -46,6 +46,7 @@ services:
       # can't make its own until a group gives it a team.
       FORGEJO__service__DEFAULT_ALLOW_CREATE_ORGANIZATION: "false"
       FORGEJO__repository__MAX_CREATION_LIMIT: "0"             # kit lifts this for the organisation
+      FORGEJO__repository__ALLOW_FORK_WITHOUT_MAXIMUM_LIMIT: "false"   # or a fork gets around it, even of a private repo
       FORGEJO__repository__DEFAULT_PRIVATE: private
 
       # Who's a member, and their address, is personal data.
@@ -53,6 +54,11 @@ services:
       FORGEJO__service__DEFAULT_USER_VISIBILITY: limited
       FORGEJO__service_0X2E_explore__DISABLE_USERS_PAGE: "true"
       FORGEJO__ui__SHOW_USER_EMAIL: "false"
+
+      # Accounts come from core, so these would do nothing, or worse. There's no SSH
+      # server, a Forgejo password opens nothing, and someone deleting their account
+      # here wouldn't delete it in core.
+      FORGEJO__admin__EXTERNAL_USER_DISABLE_FEATURES: deletion,manage_password,manage_ssh_keys
 
       FORGEJO__session__COOKIE_SECURE: "true"
       FORGEJO__session__PROVIDER: db    # by default, a restart would sign everyone out
