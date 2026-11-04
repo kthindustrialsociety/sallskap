@@ -8,6 +8,7 @@ installed. Needs Python 3.11 or newer.
 import argparse
 import base64
 import fcntl
+import json
 import os
 import re
 import secrets
@@ -32,6 +33,7 @@ RELEASES_KEPT = 5
 MAX_UPLOAD_BYTES = 2 * 1024**3
 MAX_UPLOAD_FILES = 100_000
 CORE_UID = 10001  # the user core runs as: see core/Dockerfile
+FORGEJO_UID = 1000  # the user Forgejo's rootless image runs as
 
 SITE_HEADER = "[[website.sites]]"
 SITE_FIELDS = {"domain", "aliases", "spa", "www"}
@@ -53,6 +55,7 @@ class Paths:
     website_dir: Path = Path(os.environ.get("SALLSKAP_WEBSITE_DIR", CADDY_ROOT))
     deploy_home: Path = Path(os.environ.get("SALLSKAP_DEPLOY_HOME", "/var/lib/sallskap-deploy"))
     core_dir: Path = Path(os.environ.get("SALLSKAP_CORE_DIR", "/srv/core"))
+    git_dir: Path = Path(os.environ.get("SALLSKAP_GIT_DIR", "/srv/git"))
 
     @property
     def config(self) -> Path:
@@ -61,6 +64,10 @@ class Paths:
     @property
     def core_env(self) -> Path:
         return self.config_dir / "core.env"
+
+    @property
+    def git_env(self) -> Path:
+        return self.config_dir / "git.env"
 
     @property
     def caddyfile(self) -> Path:
@@ -314,6 +321,12 @@ def _module_compose(name: str, *args: str) -> list[str]:
     return ["docker", "compose", "--project-name", PROJECT, "--project-directory", str(ROOT), "--file", str(file), *args]
 
 
+# What a module needs beyond starting its containers. Everything here has to be safe
+# to repeat, as running `kit enable` again is how someone finishes after a failure.
+PREPARE: dict = {}  # folders and secrets, before its containers start
+SETUP: dict = {}  # connecting it to core, once its containers are up
+
+
 def _new_signing_key() -> str:
     """The login service signs what it tells other tools with this."""
     command = ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"]
@@ -321,15 +334,17 @@ def _new_signing_key() -> str:
     return base64.b64encode(pem).decode()  # on one line, for the settings file
 
 
+def _read_env(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text("utf-8").splitlines() if "=" in line)
+
+
 def prepare_core(paths: Paths, config: Config) -> None:
     """Give core its folder and settings. The secrets are made once and then kept:
     a new secret key would log everyone out and cancel every password link, and
     a new signing key would make every tool stop trusting the login service."""
-    current = {}
-    if paths.core_env.exists():
-        for line in paths.core_env.read_text("utf-8").splitlines():
-            name, _, value = line.partition("=")
-            current[name] = value
+    current = _read_env(paths.core_env)
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
     signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
     text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\nOIDC_SIGNING_KEY={signing_key}\n"
@@ -371,12 +386,6 @@ def apply_web(paths: Paths) -> None:
         [*in_container, "reload", "--adapter", "caddyfile", "--config", "/etc/caddy/Caddyfile"],
         check=True,
     )
-
-
-# What a module needs beyond starting its containers. Everything here has to be safe
-# to repeat, as running `kit enable` again is how someone finishes after a failure.
-PREPARE: dict = {}  # folders and secrets, before its containers start
-SETUP: dict = {}  # connecting it to core, once its containers are up
 
 
 def apply(paths: Paths, build: bool = False) -> None:
@@ -449,6 +458,158 @@ def _check_callback(address: str) -> str:
     if not address.startswith("https://"):
         raise KitError(f"{address!r} must be a full https address.")
     return address
+
+
+# ---- The git module ----------------------------------------------------------
+
+
+FORGEJO_TOOL = "forgejo"  # its name in core's login service
+FORGEJO_SERVICE_USER = "sallskap-admin"  # owns the organisation. Nobody can log in as it
+FORGEJO_UNITS = ["repo.code", "repo.issues", "repo.pulls", "repo.releases", "repo.wiki", "repo.projects"]
+FORGEJO_TEAMS = (
+    {"name": "developers", "permission": "write", "can_create_org_repo": True},
+    {"name": "board", "permission": "read", "can_create_org_repo": False},
+)
+NO_LIMIT = 1_000_000  # repos the organisation may have: 0 would fall back on the limit for people
+
+
+def prepare_git(paths: Paths, config: Config) -> None:
+    """Forgejo's secrets are made once and then kept: a new key would make its stored
+    login secret and 2FA records unreadable."""
+    current = _read_env(paths.git_env)
+    settings = {
+        "FORGEJO__server__DOMAIN": f"git.{config.domain}",
+        "FORGEJO__server__ROOT_URL": f"https://git.{config.domain}/",
+        "FORGEJO__security__SECRET_KEY": current.get("FORGEJO__security__SECRET_KEY") or secrets.token_urlsafe(48),
+        "FORGEJO__security__INTERNAL_TOKEN": current.get("FORGEJO__security__INTERNAL_TOKEN") or secrets.token_urlsafe(48),
+    }
+    text = "".join(f"{name}={value}\n" for name, value in settings.items())
+    if not paths.git_env.exists() or paths.git_env.read_text("utf-8") != text:
+        _write_atomic(paths.git_env, text, 0o600)
+    paths.git_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chown(paths.git_dir, FORGEJO_UID, FORGEJO_UID)
+
+
+def _core_output(*args: str) -> str:
+    """For commands whose output kit needs. A failure doesn't show the command line,
+    as it can carry a secret."""
+    result = subprocess.run(_compose("exec", "-T", "core", "python", "manage.py", *args), capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"Core refused `{' '.join(args[:2])}`: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _forgejo_output(*args: str) -> str:
+    command = _module_compose("git", "exec", "-T", "forgejo", "forgejo", *args)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"Forgejo refused `{' '.join(args[:3])}`: {(result.stderr or result.stdout).strip()}")
+    return result.stdout
+
+
+def _forgejo_api(token: str, method: str, path: str, body: dict | None = None) -> tuple[int, object]:
+    """Forgejo publishes no ports, so this goes through curl inside its container."""
+    command = _module_compose(
+        "git", "exec", "-T", "forgejo", "curl", "-sS", "--request", method, "--write-out", "\n%{http_code}",
+        "--header", f"Authorization: token {token}", "--header", "Content-Type: application/json",
+        *(["--data-binary", "@-"] if body is not None else []),
+        f"http://127.0.0.1:3000/api/v1{path}",
+    )  # fmt: skip
+    result = subprocess.run(command, capture_output=True, text=True, input=json.dumps(body) if body is not None else None)
+    if result.returncode:
+        raise KitError(f"Couldn't reach Forgejo's API: {result.stderr.strip()}")
+    content, _, status = result.stdout.rpartition("\n")
+    try:
+        return int(status), json.loads(content) if content else None
+    except ValueError:
+        raise KitError(f"Forgejo's API gave an answer kit can't read: {result.stdout[:200]}") from None
+
+
+def _expect(answer: tuple[int, object], *statuses: int) -> object:
+    if answer[0] not in statuses:
+        raise KitError(f"Forgejo's API answered {answer[0]}: {answer[1]}")
+    return answer[1]
+
+
+def _create_org_and_teams(config: Config, org: str) -> None:
+    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
+    command for making one, so this uses its API. Forgejo 15 has no way of deleting the
+    token afterwards with password login off, so it stays in its database, where only
+    a hash is stored, and its value is thrown away when this returns."""
+    if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
+        _forgejo_output(
+            "admin", "user", "create", "--username", FORGEJO_SERVICE_USER, "--email", f"{FORGEJO_SERVICE_USER}@git.{config.domain}",
+            "--admin", "--random-password", "--must-change-password=false",
+        )  # fmt: skip
+    token = _forgejo_output(
+        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER,
+        "--token-name", f"kit-{secrets.token_hex(4)}", "--scopes", "write:admin,write:organization", "--raw",
+    ).strip()  # fmt: skip
+    if _forgejo_api(token, "GET", f"/orgs/{org}")[0] == 404:
+        _expect(_forgejo_api(token, "POST", "/orgs", {"username": org, "visibility": "public"}), 201)
+    # The limit on new repos is for people, but organisations are held to it too.
+    _expect(
+        _forgejo_api(token, "PATCH", f"/admin/users/{org}", {"login_name": org, "source_id": 0, "max_repo_creation": NO_LIMIT}),
+        200,
+    )
+    existing = {team["name"] for team in _expect(_forgejo_api(token, "GET", f"/orgs/{org}/teams"), 200)}
+    for team in FORGEJO_TEAMS:
+        if team["name"] not in existing:
+            body = {**team, "includes_all_repositories": True, "units": FORGEJO_UNITS}
+            _expect(_forgejo_api(token, "POST", f"/orgs/{org}/teams", body), 201)
+
+
+def _connect_login(config: Config, org: str, source, registered) -> None:
+    """A tool's secret is only shown when it's made, so if one side is missing, both
+    get a new one."""
+    if registered:
+        _core_output("tool", "remove", FORGEJO_TOOL)
+    output = _core_output("tool", "add", FORGEJO_TOOL, f"https://git.{config.domain}/user/oauth2/{org}/callback")
+    fields = dict(re.findall(r"^\s+(Client ID|Secret):\s+(\S+)$", output, re.M))
+    if len(fields) != 2:
+        raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
+    team_map = {
+        "operator": {org: ["Owners"]},
+        "developer": {org: ["developers"]},
+        "board": {org: ["board"]},
+    }
+    settings = [
+        "--name", org,
+        "--provider", "openidConnect",
+        "--key", fields["Client ID"],
+        "--secret", fields["Secret"],
+        "--auto-discover-url", f"https://app.{config.domain}/.well-known/openid-configuration",
+        "--scopes", "email", "--scopes", "profile", "--scopes", "groups",
+        "--group-claim-name", "groups",
+        "--admin-group", "operator",
+        "--group-team-map", json.dumps(team_map),
+        "--group-team-map-removal",
+        "--skip-local-2fa",  # core has already asked for it
+    ]  # fmt: skip
+    if source:
+        _forgejo_output("admin", "auth", "update-oauth", "--id", source.group(1), *settings)
+    else:
+        _forgejo_output("admin", "auth", "add-oauth", *settings)
+    # It reads its login sources when it starts.
+    subprocess.run(_module_compose("git", "restart", "forgejo"), check=True, capture_output=True)
+    subprocess.run(_module_compose("git", "up", "-d", "--wait"), check=True, capture_output=True)
+
+
+def setup_git(paths: Paths, config: Config) -> None:
+    """The login is connected last, so finding it means everything before it finished,
+    and running this again doesn't leave another token behind."""
+    org = config.domain.split(".")[0]
+    source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
+    registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
+    if source and registered:
+        return
+    _create_org_and_teams(config, org)
+    _connect_login(config, org, source, registered)
+
+
+PREPARE["git"] = prepare_git
+SETUP["git"] = setup_git
 
 
 # ---- Sites: config and credentials -------------------------------------------

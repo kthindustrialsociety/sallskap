@@ -1,0 +1,71 @@
+name: sallskap
+
+services:
+  # No published ports: only Caddy can reach it, over Compose's own network.
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15.0.11-rootless
+    restart: unless-stopped
+    mem_limit: 512m
+    pids_limit: 256
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: /etc/sallskap/git.env   # the hostname and secrets: see prepare_git in kit/kit.py
+    environment:
+      # Reachable from its first start, before its login is connected, so it never
+      # shows the first-run setup page.
+      FORGEJO__security__INSTALL_LOCK: "true"
+
+      # Core is the only way in. Each of these would otherwise get around 2FA.
+      FORGEJO__service__ENABLE_INTERNAL_SIGNIN: "false"
+      FORGEJO__service__ENABLE_BASIC_AUTHENTICATION: "false"   # passwords only: tokens still work
+      FORGEJO__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
+      FORGEJO__service__SHOW_REGISTRATION_BUTTON: "false"
+      FORGEJO__openid__ENABLE_OPENID_SIGNIN: "false"
+      FORGEJO__openid__ENABLE_OPENID_SIGNUP: "false"
+      FORGEJO__oauth2__ENABLED: "false"                        # Forgejo as a login service for others
+
+      # An account is made at someone's first login. Usernames can clash, and `auto`
+      # linking would hand them the existing account, so linking stays off and a
+      # clash is an error. Core sends unique names, so it should be rare.
+      FORGEJO__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
+      FORGEJO__oauth2_client__ACCOUNT_LINKING: disabled
+      FORGEJO__oauth2_client__USERNAME: nickname               # core's preferred_username
+
+      # Git goes over HTTPS with tokens, as only Caddy may publish ports. The rootless
+      # image's own template turns the SSH server on.
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__server__START_SSH_SERVER: "false"
+
+      # The first page is the sign-in button, one click from being in. Public repos
+      # can still be reached directly.
+      FORGEJO__server__LANDING_PAGE: login
+
+      # Repos belong to the organisation, so they survive a handover. A new account
+      # can't make its own until a group gives it a team.
+      FORGEJO__service__DEFAULT_ALLOW_CREATE_ORGANIZATION: "false"
+      FORGEJO__repository__MAX_CREATION_LIMIT: "0"             # kit lifts this for the organisation
+      FORGEJO__repository__DEFAULT_PRIVATE: private
+
+      # Who's a member, and their address, is personal data.
+      FORGEJO__service__DEFAULT_KEEP_EMAIL_PRIVATE: "true"
+      FORGEJO__service__DEFAULT_USER_VISIBILITY: limited
+      FORGEJO__service_0X2E_explore__DISABLE_USERS_PAGE: "true"
+      FORGEJO__ui__SHOW_USER_EMAIL: "false"
+
+      FORGEJO__session__COOKIE_SECURE: "true"
+
+      # Not needed yet. Actions waits for a build runner, and nothing sends mail.
+      FORGEJO__actions__ENABLED: "false"
+      FORGEJO__packages__ENABLED: "false"
+      FORGEJO__mailer__ENABLED: "false"
+    volumes:
+      - /srv/git:/var/lib/gitea
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/api/healthz"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+      start_interval: 2s
