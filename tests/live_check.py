@@ -922,7 +922,7 @@ def check_forgejo_single_login(host, secrets_by_name):
 
     looping = Browser(git_host(host))
     first = looping.get("/user/login")
-    check("Opening the sign-in page goes straight to the login service", first.status == 302 and first.location.endswith(f"/user/oauth2/{org_of(host)}"), f"{first.status} {first.location}")
+    check("Opening the sign-in page goes straight to the login service", first.status == 302 and urllib.parse.urlparse(first.location).path == f"/user/oauth2/{org_of(host)}", f"{first.status} {first.location}")
     second = looping.get("/user/login")
     check("Coming straight back shows the page, so a login error can't loop", second.status == 200, f"{second.status} {second.location}")
 
