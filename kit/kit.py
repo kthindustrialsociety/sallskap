@@ -423,16 +423,19 @@ def enable_module(paths: Paths, name: str) -> None:
 
 
 def disable_module(paths: Paths, name: str) -> None:
-    """Stop it and keep its data: only an explicit `kit remove` may delete that."""
+    """Stop it and keep its data: only an explicit `kit remove` may delete that. It's
+    only marked as off once it has stopped, so running this again can always finish."""
     module_manifest(name)
-    if name not in load_config(paths).modules:
+    if not _has_containers(name):
+        raise KitError(f"{name} has nothing to start, so it can't be switched on or off.")
+    if name in load_config(paths).modules:
+        subprocess.run(_module_compose(name, "rm", "--stop", "--force"), check=True)
+        text = set_module(paths.config.read_text("utf-8"), name, False)
+        parse_config(text)
+        _write_atomic(paths.config, text, 0o600)
+    else:
         print(f"{name} isn't enabled.")
-        return
-    text = set_module(paths.config.read_text("utf-8"), name, False)
-    parse_config(text)
-    _write_atomic(paths.config, text, 0o600)
-    apply_web(paths)  # its route goes first, so nobody is sent to something that's gone
-    subprocess.run(_module_compose(name, "rm", "--stop", "--force"), check=True)
+    apply_web(paths)
 
 
 # ---- Core: accounts ----------------------------------------------------------
@@ -513,14 +516,17 @@ def _forgejo_output(*args: str) -> str:
 
 
 def _forgejo_api(token: str, method: str, path: str, body: dict | None = None) -> tuple[int, object]:
-    """Forgejo publishes no ports, so this goes through curl inside its container."""
+    """Forgejo publishes no ports, so this goes through curl inside its container. The
+    token reaches curl on stdin: a command line can be read by anyone on the server."""
+    settings = [f'header = "Authorization: token {token}"', 'header = "Content-Type: application/json"']
+    if body is not None:
+        data = json.dumps(body).replace("\\", "\\\\").replace('"', '\\"')
+        settings.append(f'data-binary = "{data}"')
     command = _module_compose(
         "git", "exec", "-T", "forgejo", "curl", "-sS", "--request", method, "--write-out", "\n%{http_code}",
-        "--header", f"Authorization: token {token}", "--header", "Content-Type: application/json",
-        *(["--data-binary", "@-"] if body is not None else []),
-        f"http://127.0.0.1:3000/api/v1{path}",
+        "--config", "-", f"http://127.0.0.1:3000/api/v1{path}",
     )  # fmt: skip
-    result = subprocess.run(command, capture_output=True, text=True, input=json.dumps(body) if body is not None else None)
+    result = subprocess.run(command, capture_output=True, text=True, input="\n".join(settings) + "\n")
     if result.returncode:
         raise KitError(f"Couldn't reach Forgejo's API: {result.stderr.strip()}")
     content, _, status = result.stdout.rpartition("\n")
@@ -540,7 +546,8 @@ def _create_org_and_teams(config: Config, org: str) -> None:
     """Forgejo silently skips a team in its map if it doesn't exist, and there's no
     command for making one, so this uses its API. Forgejo 15 has no way of deleting the
     token afterwards with password login off, so it stays in its database, where only
-    a hash is stored, and its value is thrown away when this returns."""
+    a hash is stored, and its value is thrown away when this returns. So this only
+    runs until the login is connected."""
     if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
         _forgejo_output(
             "admin", "user", "create", "--username", FORGEJO_SERVICE_USER, "--email", f"{FORGEJO_SERVICE_USER}@git.{config.domain}",
@@ -591,24 +598,31 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
         "--group-team-map-removal",
         "--skip-local-2fa",  # core has already asked for it
     ]  # fmt: skip
-    if source:
-        _forgejo_output("admin", "auth", "update-oauth", "--id", source.group(1), *settings)
-    else:
-        _forgejo_output("admin", "auth", "add-oauth", *settings)
-    # It reads its login sources when it starts.
-    subprocess.run(_module_compose("git", "restart", "forgejo"), check=True, capture_output=True)
-    subprocess.run(_module_compose("git", "up", "-d", "--wait"), check=True, capture_output=True)
+    try:
+        if source:
+            _forgejo_output("admin", "auth", "update-oauth", "--id", source.group(1), *settings)
+        else:
+            _forgejo_output("admin", "auth", "add-oauth", *settings)
+        # It reads its login sources when it starts.
+        subprocess.run(_module_compose("git", "restart", "forgejo"), check=True, capture_output=True)
+        subprocess.run(_module_compose("git", "up", "-d", "--wait"), check=True, capture_output=True)
+    except (KitError, subprocess.CalledProcessError):
+        # Core has a secret that Forgejo may not. Without this, the next run would find
+        # both sides present and call it finished, with every sign-in failing.
+        _core_output("tool", "remove", FORGEJO_TOOL)
+        raise
 
 
 def setup_git(paths: Paths, config: Config) -> None:
     """The login is connected last, so finding it means everything before it finished,
-    and running this again doesn't leave another token behind."""
+    and running this again doesn't make another token."""
     org = config.short_name
     source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
     registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
     if source and registered:
         return
-    _create_org_and_teams(config, org)
+    if not source:
+        _create_org_and_teams(config, org)
     _connect_login(config, org, source, registered)
 
 
