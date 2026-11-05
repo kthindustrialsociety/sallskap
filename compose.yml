@@ -23,6 +23,37 @@ services:
       start_period: 120s    # checked every 2 seconds at first, so `kit` doesn't wait long
       start_interval: 2s
 
+  # Tells other tools about changes to people's access straight away: see
+  # core/accounts/sync.py. It's the only container with their admin tokens, so core's
+  # web process, which faces the internet, never has them. It publishes no ports.
+  sync:
+    image: sallskap-core:local   # core's: this has nothing of its own to build
+    pull_policy: never
+    command: ["python", "manage.py", "sync_tools"]
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy   # which has run the migrations
+    mem_limit: 128m
+    pids_limit: 32
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file:
+      - path: /etc/sallskap/sync.env
+        required: false   # so `kit link` and the like still work before the first `kit apply` after an upgrade
+    volumes:
+      - /srv/core:/srv/core
+      - ./modules:/modules:ro   # each module's connector
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/alive') > 60)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped

@@ -68,6 +68,10 @@ class Paths:
         return self.config_dir / "core.env"
 
     @property
+    def sync_env(self) -> Path:
+        return self.config_dir / "sync.env"
+
+    @property
     def git_env(self) -> Path:
         return self.config_dir / "git.env"
 
@@ -364,6 +368,24 @@ def prepare_core(paths: Paths, config: Config) -> None:
     paths.core_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.core_dir, CORE_UID, CORE_UID)
+    _write_sync_env(paths, config)
+
+
+def _write_sync_env(paths: Paths, config: Config, **tokens: str) -> None:
+    """For the worker that tells tools about changes to people's access: see
+    core/accounts/sync.py. Its tokens are only here, so core's web process, which faces
+    the internet, never has them. Nor does it get core's secrets, as it signs nothing."""
+    current = _read_env(paths.sync_env)
+    settings = {
+        **current,
+        "SALLSKAP_DOMAIN": config.domain,
+        "DJANGO_SECRET_KEY": current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50),  # Django insists on one
+        "SYNC_MODULES": ",".join(name for name in config.modules if (ROOT / "modules" / name / "connector.py").exists()),
+        **tokens,
+    }
+    text = "".join(f"{name}={value}\n" for name, value in settings.items())
+    if not paths.sync_env.exists() or paths.sync_env.read_text("utf-8") != text:
+        _write_atomic(paths.sync_env, text, 0o600)
 
 
 def apply_web(paths: Paths) -> None:
@@ -401,7 +423,8 @@ def apply_web(paths: Paths) -> None:
 def apply(paths: Paths, build: bool = False) -> None:
     """Start everything. Caddy goes first and modules last, so a problem with one can't
     hold up the public sites or logins. With --wait, core has finished migrating and
-    each module is healthy when this returns."""
+    each module is healthy when this returns. The worker goes after the modules, as
+    preparing one can give it a new token."""
     apply_web(paths)
     subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
     config = load_config(paths)
@@ -410,6 +433,7 @@ def apply(paths: Paths, build: bool = False) -> None:
             if name in PREPARE:
                 PREPARE[name](paths, config)
             subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+    subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)
 
 
 def enable_module(paths: Paths, name: str) -> None:
@@ -442,6 +466,7 @@ def disable_module(paths: Paths, name: str) -> None:
     else:
         print(f"{name} isn't enabled.")
     apply_web(paths)
+    subprocess.run(_compose("up", "-d", "sync"), check=True)  # so it stops asking that module
 
 
 # ---- Core: accounts ----------------------------------------------------------
