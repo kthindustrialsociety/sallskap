@@ -21,7 +21,7 @@ bash install.sh --check
 | `docs/spec.md` | The specification |
 | `install.sh` | The installer, used by every install path |
 | `cloud-init.yaml` | Runs the installer on providers with a "user data" field |
-| `compose.yml` | Containers for core |
+| `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
 | `kit/` | The `kit` CLI, in progress |
 | `core/` | Django: accounts, login and the admin page. Who sees what is set in `core/accounts/roles.py` |
 | `modules/website/` | Public sites and redirects |
@@ -46,6 +46,7 @@ If an Operator is locked out, `kit admin` restores their access and clears any l
 ```sh
 kit enable git     # safe to run again, which is also how to finish after a failure
 kit disable git    # stops it and keeps its data
+kit emergency vault  # get into a tool while core is down: see its README
 ```
 
 ## Connect a tool
