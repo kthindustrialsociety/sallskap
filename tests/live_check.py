@@ -2968,6 +2968,11 @@ def check_what_is_in_a_backup(host):
     check("It covers the config, core, and every module's data", wanted <= set(snapshot["paths"]), str(sorted(wanted - set(snapshot["paths"]))))
     check("...and nothing else", not set(snapshot["paths"]) - wanted, str(sorted(set(snapshot["paths"]) - wanted)))
     check("It doesn't hold the backups themselves", "/srv/backup" not in snapshot["paths"])
+    # Folders rather than named files, so nothing that lives beside a database — its
+    # write-ahead log above all — can be left behind. Counting rows catches that too,
+    # but only while the log still holds writes the database file hasn't taken in.
+    single_files = [p for p in snapshot["paths"] if Path(p).exists() and not Path(p).is_dir()]
+    check("It holds folders, not single files", not single_files, str(single_files))
 
     tags = set(snapshot["tags"])
     running = {}
