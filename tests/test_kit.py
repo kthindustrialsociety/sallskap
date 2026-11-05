@@ -1558,11 +1558,18 @@ class Backups(unittest.TestCase):
                 continue
             # A module runs from its own Compose file; core and the worker are named.
             module = next((Path(part).parent.name for part in call if part.endswith("compose.yml")), None)
-            for action in ("stop", "start"):
-                if action in call:
-                    order.append(f"{action} {module or ' '.join(call[call.index(action) + 1 :])}")
+            if "stop" in call:
+                order.append(f"stop {module or ' '.join(call[call.index('stop') + 1 :])}")
+            elif "up" in call:
+                order.append(f"start {module or call[-1]}")
         self.assertEqual(order, ["stop sync core", "stop demo", "copy", "start demo", "start core", "start sync"])
         self.assertFalse([c for c in self.docker_calls() if "caddy" in c])
+
+    def test_everything_is_waited_for_so_a_backup_cant_leave_it_down(self):
+        self.run_kit("backup")
+        for call in self.docker_calls():
+            if "up" in call:
+                self.assertIn("--wait", call)
 
     def test_the_vaults_emergency_copy_is_stopped_too(self):
         """It writes to the same data, and it's meant to be short-lived anyway."""
@@ -1574,8 +1581,21 @@ class Backups(unittest.TestCase):
         code, out = self.run_kit("backup")
         self.assertEqual(code, 1)
         self.assertIn("restic backup failed", out)
-        starts = [c for c in self.docker_calls() if "start" in c]
-        self.assertEqual(len(starts), 3)
+        self.assertEqual(len([c for c in self.docker_calls() if "up" in c]), 3)
+
+    def test_something_that_doesnt_come_back_is_reported(self):
+        def fails_to_start(command, *args, **kwargs):
+            self.calls.append(command)
+            if command[0] == "docker" and "up" in command:
+                raise subprocess.CalledProcessError(1, command)
+            return self.fake_restic(command, **kwargs) if command[0] == "restic" else subprocess.CompletedProcess(command, 0, "", "")
+
+        self.run_kit("backup")  # so the repository exists
+        with mock.patch.object(kit.subprocess, "run", fails_to_start):
+            code, out = self.run_kit("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("didn't come back: demo, core, sync", out)
+        self.assertIn("Run: kit apply", out)
 
     def test_a_modules_own_step_runs_while_it_is_still_up(self):
         (self.demo / "backup.sh").write_text("#!/bin/sh\nexit 0\n")

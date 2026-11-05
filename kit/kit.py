@@ -1024,21 +1024,22 @@ def _stop_for_backup(paths: Paths, config: Config) -> None:
 
 
 def _start_after_backup(paths: Paths, config: Config) -> None:
-    """In the same order as `kit apply`, and everything is tried even if one fails, as
-    the rest still has to come back."""
+    """In the same order as `kit apply`, waiting for each to be healthy as that does,
+    so a backup can't quietly leave something down. Everything is tried even if one
+    fails, as the rest still has to come back."""
     problems = []
     for name in _module_containers(config):
         try:
-            subprocess.run(_module_compose(name, "start"), check=True)
+            subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
         except subprocess.CalledProcessError:
             problems.append(name)
     for service in ("core", "sync"):
         try:
-            subprocess.run(_compose("start", service), check=True)
+            subprocess.run(_compose("up", "-d", "--wait", service), check=True)
         except subprocess.CalledProcessError:
             problems.append(service)
     if problems:
-        raise KitError(f"The backup finished, but these didn't start again: {', '.join(problems)}. Run: kit apply")
+        raise KitError(f"The backup finished, but these didn't come back: {', '.join(problems)}. Run: kit apply")
 
 
 def _copy_off_server(paths: Paths, config: Config, password: str) -> None:

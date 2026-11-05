@@ -2884,9 +2884,28 @@ def check_backup_before_the_first_one(host):
         check("`kit status` says nothing has been backed up yet", "no backups have been taken yet" in kit("status").stdout)
 
 
+CADDY = "sallskap-caddy-1"
+
+
+def container_state(name):
+    return json.loads(subprocess.run(["docker", "inspect", name], capture_output=True, text=True).stdout)[0]
+
+
+def module_containers():
+    """By name, as each module runs from its own Compose file and the project-wide
+    `docker compose ps` only knows about core, the worker and Caddy."""
+    containers = {"core": "sallskap-core-1", "the worker": "sallskap-sync-1"}
+    if git_enabled():
+        containers["Forgejo"] = FORGEJO
+    if vault_enabled():
+        containers["the vault"] = VAULT
+    return containers
+
+
 def check_backup_runs(host, sites):
     section("Backups: taking one")
     first_time = not (BACKUP_DIR / "repo").exists()
+    caddy_started = container_state(CADDY)["State"]["StartedAt"]
     stop = threading.Event()
     answers, watcher = watch_while([host, *sites], stop)
     started = time.monotonic()
@@ -2904,18 +2923,20 @@ def check_backup_runs(host, sites):
     for site in sites:
         seen = answers.get(site, [])
         check(f"The public site {site} stayed up throughout", bool(seen) and set(seen) == {200}, f"{len(seen)} requests: {sorted(set(seen))}")
+    # Caddy stays up, so a login during the pause gets its 502 rather than nothing.
     logins = answers.get(host, [])
     check(
         "Logins were paused while the copy was taken",
-        bool(logins) and 0 in logins,
+        bool(logins) and (502 in logins or 0 in logins),
         f"{len(logins)} requests: {sorted(set(logins))}",
     )
-    check("...and answer again afterwards", Browser(host).get("/accounts/login/").status == 200)
-    services = ["core", "sync"] + (["forgejo"] if git_enabled() else []) + (["vaultwarden"] if vault_enabled() else [])
-    for service in services:
-        state = docker_inspect(service)["State"]
+    check("...and nothing in between: either a login page or a plain 502", set(logins) <= {0, 302, 502}, str(sorted(set(logins))))
+    check("...and they answer again afterwards", Browser(host).get("/accounts/login/").status == 200)
+    for name, container in module_containers().items():
+        state = container_state(container)["State"]
         health = state.get("Health", {}).get("Status", state.get("Status"))
-        check(f"{service} is healthy again", health in ("healthy", "running"), str(health))
+        check(f"{name} is healthy again", health in ("healthy", "running"), str(health))
+    check("Caddy never stopped, which is why the public sites didn't", container_state(CADDY)["State"]["StartedAt"] == caddy_started)
     wait_for_sync()
     check("Nothing is left waiting to be sent to a tool", core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0)
     return took
@@ -2943,8 +2964,8 @@ def check_what_is_in_a_backup(host):
 
     tags = set(snapshot["tags"])
     running = {}
-    for service in ("forgejo", "vaultwarden"):
-        image = docker_inspect(service)["Config"]["Image"]
+    for container in (FORGEJO, VAULT):
+        image = container_state(container)["Config"]["Image"]
         running[image.rsplit("/", 1)[-1].split(":")[0]] = image.rsplit(":", 1)[-1]
     for name, version in running.items():
         check(f"It records the {name} version it was taken with", f"image:{name}={version}" in tags, str(sorted(tags)))
