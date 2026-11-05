@@ -2904,7 +2904,9 @@ def module_containers():
 
 def check_backup_runs(host, sites):
     section("Backups: taking one")
-    first_time = not (BACKUP_DIR / "repo").exists()
+    # Whether this run has to make the password, which isn't the same as whether there
+    # are backups: a repository can be gone while its password is still on the server.
+    new_password = "RESTIC_PASSWORD" not in (BACKUP_ENV.read_text() if BACKUP_ENV.exists() else "")
     caddy_started = container_state(CADDY)["State"]["StartedAt"]
     was_started = {name: container_state(c)["State"]["StartedAt"] for name, c in module_containers().items()}
     stop = threading.Event()
@@ -2918,7 +2920,7 @@ def check_backup_runs(host, sites):
     check("`kit backup` finishes without an error", result.returncode == 0, result.stdout[-700:] + result.stderr[-700:])
     check("...and says how long logins were paused", "paused for" in result.stdout, result.stdout[-200:])
     print(f"  ----  the whole command took {took:.0f} s; it reported: {_paused_line(result.stdout)}")
-    if first_time:
+    if new_password:
         check("...and says a backup password was made", "can't be recovered" in result.stdout)
         # The nightly run's output is the system journal, so the password mustn't be in it.
         password = backup_password()
