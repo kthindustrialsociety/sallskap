@@ -732,6 +732,96 @@ def prepare_vault(paths: Paths, config: Config) -> None:
 PREPARE["vault"] = prepare_vault
 
 
+# ---- Getting in while core is down -------------------------------------------
+
+
+VAULT_EMERGENCY = "sallskap-vault-emergency"
+VAULT_EMERGENCY_PORT = 8222  # on the operator's own computer, at the end of their tunnel
+VAULT_EMERGENCY_TLS = "emergency-tls"
+
+
+def _require_module(paths: Paths, name: str) -> None:
+    if name not in load_config(paths).modules:
+        raise KitError(f"The {name} module isn't enabled.")
+
+
+def _vault_emergency_address() -> str | None:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", VAULT_EMERGENCY],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _make_emergency_certificate(paths: Paths) -> None:
+    """In Vaultwarden's own folder, as that's what it can read. It's only good for localhost
+    and for a week, and it goes when the copy stops."""
+    folder = paths.vault_dir / VAULT_EMERGENCY_TLS
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(mode=0o700, parents=True)
+    command = [
+        "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "7",
+        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+        "-keyout", str(folder / "key.pem"), "-out", str(folder / "cert.pem"),
+    ]  # fmt: skip
+    subprocess.run(command, check=True, capture_output=True)
+    if os.geteuid() == 0:
+        for path in (folder, *folder.iterdir()):
+            os.chown(path, VAULT_UID, VAULT_UID)
+
+
+def vault_emergency_on(paths: Paths) -> str:
+    """A second Vaultwarden on the same data, with password login on and no route from
+    Caddy or any published port, so only someone with SSH on the server can reach it. The
+    public address stays core-only throughout, and an account turned off stays turned off.
+    `compose run` gives it no alias on the network, so Caddy can't end up sending anyone
+    here, and it isn't restarted. Nothing about it needs core.
+
+    Its web page refuses any address that isn't HTTPS, even on localhost, so this has a
+    certificate made on the spot. A browser warns about it, and the tunnel is what actually
+    protects the traffic. Its health check shows as failing, as that uses plain HTTP."""
+    _require_module(paths, "vault")
+    if not _vault_emergency_address():
+        _make_emergency_certificate(paths)
+        settings = {
+            "SSO_ENABLED": "false",
+            "SSO_ONLY": "false",
+            "DOMAIN": f"https://localhost:{VAULT_EMERGENCY_PORT}",
+            "ROCKET_TLS": f'{{certs="/data/{VAULT_EMERGENCY_TLS}/cert.pem",key="/data/{VAULT_EMERGENCY_TLS}/key.pem"}}',
+            "ADMIN_TOKEN": "",  # turns off its admin page, which nothing here needs
+        }
+        environment = [item for name, value in settings.items() for item in ("--env", f"{name}={value}")]
+        run = _module_compose("vault", "run", "--detach", "--rm", "--no-deps", "--name", VAULT_EMERGENCY, *environment, "vaultwarden")
+        subprocess.run(run, check=True, capture_output=True)
+    address = _vault_emergency_address()
+    if not address:
+        raise KitError("Its emergency copy didn't start. See: docker logs " + VAULT_EMERGENCY)
+    return address
+
+
+def vault_emergency_off(paths: Paths) -> bool:
+    """Whether there was one to stop: removing nothing still counts as success to Docker."""
+    running = bool(_vault_emergency_address())
+    if running:
+        subprocess.run(["docker", "rm", "--force", VAULT_EMERGENCY], check=True, capture_output=True)
+    shutil.rmtree(paths.vault_dir / VAULT_EMERGENCY_TLS, ignore_errors=True)
+    return running
+
+
+def git_emergency_token(paths: Paths, username: str) -> str:
+    """On that person's own account, so it's in their name. Only a person's own settings
+    page can delete one, once core is back, as Forgejo 15 has no other way with password
+    login off."""
+    _require_module(paths, "git")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", username):
+        raise KitError(f"{username!r} isn't a valid Forgejo username.")
+    return _forgejo_output(
+        "admin", "user", "generate-access-token", "--username", username,
+        "--token-name", f"emergency-{secrets.token_hex(4)}", "--scopes", "all", "--raw",
+    ).strip()  # fmt: skip
+
+
 # ---- Sites: config and credentials -------------------------------------------
 
 
@@ -919,6 +1009,8 @@ def status(paths: Paths) -> int:
         raise KitError(f"Couldn't look up this server's public address: {error}") from error
 
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
+    if "vault" in config.modules and _vault_emergency_address():
+        print("The vault's emergency copy is running, which takes master passwords. Stop it when you're done: kit emergency vault --off\n")
     print("Login and admin page:")
     problems = _check_dns(f"app.{config.domain}", server_ip)
     for name in config.modules:
@@ -951,6 +1043,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="show sites, published releases and DNS problems")
     commands.add_parser("enable", help="switch on a module, or finish switching it on").add_argument("module")
     commands.add_parser("disable", help="stop a module and keep its data").add_argument("module")
+
+    emergency = commands.add_parser("emergency", help="get into a tool while core is down")
+    emergency = emergency.add_subparsers(dest="emergency_tool", required=True)
+    vault = emergency.add_parser("vault", help="start a private copy of the vault that takes master passwords, reached over SSH")
+    vault.add_argument("--off", action="store_true", help="stop it again")
+    emergency.add_parser("git", help="make a token on someone's own Forgejo account").add_argument("username")
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -1017,6 +1115,20 @@ def main(argv: list[str] | None = None) -> int:
             status(paths)
         elif args.command == "disable":
             disable_module(paths, args.module)
+        elif args.command == "emergency" and args.emergency_tool == "git":
+            print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
+            print("Delete it under Settings, Applications once core is back. Nothing else can.")
+        elif args.command == "emergency":
+            if args.off:
+                print("Stopped the vault's emergency copy." if vault_emergency_off(paths) else "It wasn't running.")
+            else:
+                address = vault_emergency_on(paths)
+                print("The vault's emergency copy is running. Only someone with SSH on this server can reach it.\n")
+                print("On your own computer, add this to how you normally connect to this server:\n")
+                print(f"  ssh -L {VAULT_EMERGENCY_PORT}:{address}:8080 ...\n")
+                print(f"Then open https://localhost:{VAULT_EMERGENCY_PORT} and log in with your address and master password.")
+                print("Your browser will warn about the certificate, as it was made just now for this. Go ahead: the tunnel protects it.")
+                print("Stop it when you're done: kit emergency vault --off")
         elif args.action == "add":
             site = Site(args.domain, tuple(args.alias), not args.no_spa, args.www)
             add_site(paths, site)
