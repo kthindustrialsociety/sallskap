@@ -20,7 +20,13 @@ A module can add a step of its own before the copy, as `backup.sh` in its folder
 
 ## The password
 
-Made once, on the first backup, and printed then. It's kept in `/etc/sallskap/backup.env`, which only root can read, and it goes inside the backups as well, so a restored server carries on with the same one.
+Made once, on the first backup. It's kept in `/etc/sallskap/backup.env`, which only root can read, and it goes inside the backups as well, so a restored server carries on with the same one.
+
+It's printed when you run `kit backup` yourself. It is deliberately **not** printed when the output isn't a screen — the nightly run is the first backup on a server nobody has touched, and printing it there would write it into the system journal, where it would outlive the installation and travel in any copy of the logs. If the nightly run got there first, read it on the server:
+
+```sh
+sudo grep RESTIC_PASSWORD /etc/sallskap/backup.env
+```
 
 **Nothing in a backup can be read without it, and nothing can recover it.** So it lives in two places:
 

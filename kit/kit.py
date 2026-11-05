@@ -931,11 +931,18 @@ def backup_password(paths: Paths) -> tuple[str, bool]:
 
 
 def _print_backup_password(paths: Paths, password: str) -> None:
-    print("\nThis installation's backup password, made just now:\n")
-    print(f"  {password}\n")
+    """Only to someone's screen. The nightly run is the first backup on a server nobody
+    has touched, and printing it there would write the password into the system journal,
+    where it would outlive the installation and travel in any copy of the logs."""
+    print("\nThis installation now has a backup password, made just now.")
     print("Nothing in a backup can be read without it, and it can't be recovered.")
-    print("Store it in the vault, and write down an offline copy kept away from the backups.")
-    print(f"It's also in {paths.backup_env}, which only root can read.\n")
+    print("Store it in the vault, and write down an offline copy kept away from the backups.\n")
+    if sys.stdout.isatty():
+        print(f"  {password}\n")
+        print(f"It's also in {paths.backup_env}, which only root can read.\n")
+    else:
+        print(f"It isn't printed here, as this isn't a screen and it would go into the logs.")
+        print(f"Read it on the server with:  sudo grep RESTIC_PASSWORD {paths.backup_env}\n")
 
 
 def backup_paths(paths: Paths, config: Config) -> list[Path]:
@@ -1210,12 +1217,18 @@ def _fix_ownership(paths: Paths, config: Config) -> None:
     if os.geteuid() != 0:
         return
     folders = [paths.deploy_home, *(paths.site_dir(site.domain) for site in config.sites)]
-    for folder in folders:
-        if not folder.exists():
-            continue
-        _chown_to_deploy(folder)
-        for child in folder.rglob("*"):
-            _chown_to_deploy(child)
+    try:
+        for folder in folders:
+            if not folder.exists():
+                continue
+            _chown_to_deploy(folder)
+            for child in folder.rglob("*"):
+                _chown_to_deploy(child)
+    except LookupError:
+        raise KitError(
+            f"There's no {DEPLOY_USER} account on this server, so the publishing folders"
+            " can't be put in its name. Run the installer first, then run this again."
+        ) from None
 
 
 def restore(paths: Paths, source: str | None, force: bool) -> None:
@@ -1471,10 +1484,12 @@ def _backup_status(paths: Paths) -> int:
         print(f"  ok   last backup {_spoken_age(days)}")
 
     note = paths.backup_dir / "last-export"
-    if not note.exists():
+    try:
+        when = float(note.read_text("utf-8").strip())
+    except (OSError, ValueError):
         print(f"  warn no copy has ever left this server. Take one: kit backup export {_export_name()}")
         return problems + 1
-    days = _age_in_days(float(note.read_text("utf-8").strip() or 0))
+    days = _age_in_days(when)
     if days > EXPORT_STALE_DAYS:
         print(f"  warn the last copy off this server was {_spoken_age(days)}. Take one: kit backup export {_export_name()}")
         problems += 1

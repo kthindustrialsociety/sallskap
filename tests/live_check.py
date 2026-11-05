@@ -2919,7 +2919,11 @@ def check_backup_runs(host, sites):
     check("...and says how long logins were paused", "paused for" in result.stdout, result.stdout[-200:])
     print(f"  ----  the whole command took {took:.0f} s; it reported: {_paused_line(result.stdout)}")
     if first_time:
-        check("...and prints the backup password the first time only", "can't be recovered" in result.stdout)
+        check("...and says a backup password was made", "can't be recovered" in result.stdout)
+        # The nightly run's output is the system journal, so the password mustn't be in it.
+        password = backup_password()
+        check("...without printing it, as this isn't a screen", password not in result.stdout + result.stderr)
+        check("...and says where to read it instead", "grep RESTIC_PASSWORD" in result.stdout)
 
     for site in sites:
         seen = answers.get(site, [])

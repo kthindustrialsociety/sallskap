@@ -1466,8 +1466,9 @@ class Backups(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, json.dumps([snapshot]), "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    def run_kit(self, *args):
+    def run_kit(self, *args, a_screen=False):
         out, err = io.StringIO(), io.StringIO()
+        out.isatty = lambda: a_screen  # some output only belongs on someone's screen
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = kit.main(list(args))
         return code, out.getvalue() + err.getvalue()
@@ -1529,13 +1530,23 @@ class Backups(unittest.TestCase):
         self.assertEqual(self.paths.backup_env.stat().st_mode & 0o777, 0o600)
 
     def test_the_password_is_shown_once_and_only_when_it_is_made(self):
-        code, out = self.run_kit("backup")
+        code, out = self.run_kit("backup", a_screen=True)
         self.assertEqual(code, 0)
         password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
         self.assertIn(password, out)
         self.assertIn("can't be recovered", out)
-        _, again = self.run_kit("backup")
+        _, again = self.run_kit("backup", a_screen=True)
         self.assertNotIn(password, again)
+
+    def test_the_password_never_goes_into_the_logs(self):
+        """The nightly run is the first backup on a server nobody has touched, and its
+        output is the system journal."""
+        code, out = self.run_kit("backup")
+        self.assertEqual(code, 0)
+        password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+        self.assertNotIn(password, out)
+        self.assertIn("can't be recovered", out)
+        self.assertIn("grep RESTIC_PASSWORD", out)
 
     def test_a_backup_without_a_password_refuses_rather_than_making_one_silently(self):
         """Only `kit backup` may make the password, as only it prints it."""
