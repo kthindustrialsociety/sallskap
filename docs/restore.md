@@ -45,7 +45,7 @@ Nightly, by `sallskap-backup.timer`, at 03:00 with up to 15 minutes of jitter. B
 kit backup
 ```
 
-Logins and the tools stop for it, so that core's copy agrees with each tool's copy: Forgejo's database runs in WAL mode and has to match its repositories, and Vaultwarden's database has to be still while it's read. **The public websites stay up throughout,** as Caddy depends on none of it. The pause is seconds, and `kit backup` prints how long it was. Someone who opens `app.` during it gets the web server's plain 502.
+Logins and the tools stop for it, so that core's copy agrees with each tool's copy: Forgejo's database runs in WAL mode and has to match its repositories, and Vaultwarden's database has to be still while it's read. **The public websites stay up throughout,** as Caddy depends on none of it. `kit backup` prints how long the pause was: measured at 16 to 18 seconds on a 2-CPU server with 12 MB of data, most of it spent waiting for the containers to be healthy again rather than on the copy. Someone who opens `app.` during it gets the web server's plain 502.
 
 Whole folders are copied, not chosen files, which matters more than it looks: each of these databases keeps its recent writes in a `-wal` file beside it, and stopping the container doesn't always fold that back in. Measured on a real server, Forgejo's held 4 MB of writes its database file knew nothing about. A backup of `*.db` alone would lose them without a word.
 
