@@ -3132,7 +3132,8 @@ def check_a_copy_can_leave_the_server(host):
     # note from an earlier run would otherwise hide an export that records nothing.
     note = BACKUP_DIR / "last-export"
     recorded = float(note.read_text().strip() or 0) if note.exists() else 0
-    check("The export was recorded as having just happened", recorded >= before, f"{recorded} vs {before}")
+    # The note holds whole seconds, so it can read as a fraction before this started.
+    check("The export was recorded as having just happened", recorded >= int(before), f"{recorded} vs {int(before)}")
     status = kit("status").stdout
     check("`kit status` reports the backup as fresh", "ok   last backup" in status, status[-400:])
     check("...and that a copy has left the server", "ok   last copy off this server" in status, status[-400:])
