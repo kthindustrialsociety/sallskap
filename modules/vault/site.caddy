@@ -1,0 +1,40 @@
+__HOST__ {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+		-Via
+	}
+
+	# Vaultwarden has no settings for these, and SSO_ONLY doesn't cover them.
+	# - With mail off, anyone can register an address that has a pending invitation, and
+	#   choose the password and keys for that account. Accounts only come from core.
+	# - A personal API key logs in without core or 2FA, so nobody gets one here. An
+	#   organisation's key would outlast its owner's access.
+	# - The admin page has no business on the internet. Anything that needs it can go
+	#   inside the container.
+	@closed {
+		path /identity/accounts/register* /api/accounts/register*
+		path /api/accounts/api-key* /api/accounts/rotate-api-key*
+		# A * in the middle stops at the next /, and Vaultwarden ignores a trailing one.
+		path /api/organizations/*/api-key* /api/organizations/*/rotate-api-key*
+		path /api/organizations/*/api-key/* /api/organizations/*/rotate-api-key/*
+		path /admin /admin/*
+	}
+	respond @closed 404
+
+	# Someone logged in to core shouldn't have to type their address. Its page starts
+	# signing in by itself when opened like this, and the identifier is the one
+	# Vaultwarden uses for itself. Everything after # stays in the browser, so a cookie
+	# is what stops this repeating, which would also sign someone straight back in
+	# after they log out. It lasts as long as a session.
+	@first_visit {
+		method GET
+		path /
+		not header Cookie *sallskap_stay=1*
+	}
+	header @first_visit +Set-Cookie "sallskap_stay=1; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax"
+	redir @first_visit /#/sso?identifier=00000000-01DC-01DC-01DC-000000000000 302
+
+	reverse_proxy vaultwarden:8080
+}

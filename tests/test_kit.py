@@ -386,7 +386,7 @@ class Core(unittest.TestCase):
 
     def test_secrets_stay_out_of_git(self):
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True).stdout
-        for name in ("core.env", "git.env"):
+        for name in ("core.env", "git.env", "vault.env"):
             self.assertNotIn(name, tracked)
             self.assertFalse(list(ROOT.glob(f"**/{name}")))
 
@@ -502,6 +502,14 @@ class Docker(unittest.TestCase):
         self.assertEqual(self.calls[-1][-2:], ["tool", "list"])
         self.run_kit("tool", "remove", "git")
         self.assertEqual(self.calls[-1][-3:], ["tool", "remove", "git"])
+
+    def test_a_tool_can_be_limited_to_groups(self):
+        self.run_kit("tool", "add", "vault", "https://vault.example.org/callback", "--group", "board", "--group", "operator")
+        self.assertEqual(self.calls[-1][-5:], ["add", "vault", "https://vault.example.org/callback", "--group=board", "--group=operator"])
+
+    def test_a_tool_can_have_longer_sessions(self):
+        self.run_kit("tool", "add", "vault", "https://vault.example.org/callback", "--group", "board", "--session-hours", "12")
+        self.assertEqual(self.calls[-1][-2:], ["--group=board", "--session-hours=12"])
 
     def test_tool_commands_refuse_what_could_be_read_as_an_option(self):
         for args in (
@@ -1064,6 +1072,118 @@ class GitSetup(unittest.TestCase):
         self.assertIn("refused by the fake", str(caught.exception))
 
 
+class VaultSetup(unittest.TestCase):
+    """Runs the setup with a made-up core, recording what it was asked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
+        self.config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        self.calls = []
+        self.tools = ""
+        self.refuse = None
+        self.new_secrets = iter(("first-secret", "second-secret"))
+
+        def fake_run(command, *args, **kwargs):
+            line = " ".join(command)
+            self.calls.append(line)
+            if self.refuse and self.refuse in line:
+                return subprocess.CompletedProcess(command, 1, "", "refused by the fake")
+            if "tool list" in line:
+                return subprocess.CompletedProcess(command, 0, self.tools, "")
+            if "tool add" in line:
+                self.tools = "vaultwarden  https://x  (board, operator)\n"
+                return subprocess.CompletedProcess(command, 0, f"Registered.\n  Client ID: the-id\n  Secret:    {next(self.new_secrets)}\n", "")
+            if "tool remove" in line:
+                self.tools = ""
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        patcher = mock.patch.object(kit.subprocess, "run", fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def settings(self):
+        return kit._read_env(self.paths.vault_env)
+
+    def find(self, text):
+        return [line for line in self.calls if text in line]
+
+    def test_it_registers_with_core_using_the_modules_groups_and_callback(self):
+        kit.prepare_vault(self.paths, self.config)
+        added = self.find("tool add")[0]
+        self.assertIn("vaultwarden https://vault.example.org/identity/connect/oidc-signin", added)
+        self.assertIn("--group=board --group=operator", added)
+        self.assertIn("--session-hours=12", added)
+
+    def test_it_writes_what_vaultwarden_needs(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(
+            self.settings(),
+            {
+                "DOMAIN": "https://vault.example.org",
+                "SSO_AUTHORITY": "https://app.example.org",
+                "SSO_CLIENT_ID": "the-id",
+                "SSO_CLIENT_SECRET": "first-secret",
+            },
+        )
+
+    def test_the_authority_has_no_trailing_slash_as_it_must_match_the_issuer_exactly(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.assertFalse(self.settings()["SSO_AUTHORITY"].endswith("/"))
+
+    def test_its_secrets_and_data_are_private(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.paths.vault_env.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.paths.vault_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_running_it_again_changes_nothing(self):
+        kit.prepare_vault(self.paths, self.config)
+        before = self.settings()
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings(), before)
+        self.assertEqual(len(self.find("tool add")), 1)
+        self.assertEqual(self.find("tool remove"), [])
+
+    def test_a_tool_removed_from_core_gets_a_new_secret_on_both_sides(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.tools = ""
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "second-secret")
+
+    def test_a_lost_secret_gets_a_new_one_on_both_sides(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.paths.vault_env.unlink()
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(len(self.find("tool remove")), 1)
+        self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "second-secret")
+
+    def test_a_failed_registration_leaves_no_secret_so_the_next_run_starts_over(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.tools, self.refuse = "", "tool add"
+        with self.assertRaises(kit.KitError):
+            kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "")
+        self.refuse = None
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "second-secret")
+
+    def test_unreadable_settings_from_core_are_an_error_not_an_empty_secret(self):
+        with mock.patch.object(kit, "_core_output", side_effect=["", "Registered, oddly.\n"]), self.assertRaises(kit.KitError):
+            kit.prepare_vault(self.paths, self.config)
+
+    def test_a_new_hostname_keeps_the_secret(self):
+        kit.prepare_vault(self.paths, self.config)
+        kit.prepare_vault(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        self.assertEqual(self.settings()["DOMAIN"], "https://vault.new.org")
+        self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "first-secret")
+
+    def test_vaultwardens_address_is_a_service_so_no_site_can_take_it(self):
+        with self.assertRaisesRegex(kit.KitError, "reserved"):
+            kit.parse_config('[association]\ndomain = "example.org"\n[[website.sites]]\ndomain = "vault.example.org"\n')
+
+
 class Status(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1149,6 +1269,55 @@ def compose_services() -> dict[str, str]:
 class Packaging(unittest.TestCase):
     def test_compose_files_are_read_correctly(self):
         self.assertLessEqual({"caddy", "core"}, set(compose_services()))
+
+    def test_core_is_the_only_way_into_vaultwarden(self):
+        vault = compose_services()["vaultwarden"]
+        for setting in ('SSO_ENABLED: "true"', 'SSO_ONLY: "true"', 'SIGNUPS_ALLOWED: "false"'):
+            self.assertIn(setting, vault)
+
+    def test_vaultwarden_never_hands_someone_an_existing_account(self):
+        self.assertIn('SSO_SIGNUPS_MATCH_EMAIL: "false"', compose_services()["vaultwarden"])
+
+    def test_vaultwarden_accepts_core_saying_nothing_about_addresses_only_with_matching_off(self):
+        """Its docs warn that the two together open account takeover."""
+        vault = compose_services()["vaultwarden"]
+        self.assertIn('SSO_ALLOW_UNKNOWN_EMAIL_VERIFICATION: "true"', vault)
+        self.assertIn('SSO_SIGNUPS_MATCH_EMAIL: "false"', vault)
+
+    def test_opening_vaultwarden_starts_signing_in_once_per_session(self):
+        routing = (ROOT / "modules" / "vault" / "site.caddy").read_text()
+        self.assertIn("redir @first_visit /#/sso?identifier=00000000-01DC-01DC-01DC-000000000000 302", routing)
+        hours = kit.module_manifest("vault")["session_hours"]
+        self.assertIn(f"Max-Age={hours * 3600};", routing)
+
+    def test_vaultwarden_makes_no_empty_account_for_an_invited_address(self):
+        self.assertIn('INVITATIONS_ALLOWED: "false"', compose_services()["vaultwarden"])
+
+    def test_nobody_gets_a_vaultwarden_key_that_gets_around_core(self):
+        routing = (ROOT / "modules" / "vault" / "site.caddy").read_text()
+        for route in (
+            "/admin ",
+            "/admin/*",
+            "/identity/accounts/register*",
+            "/api/accounts/register*",
+            "/api/accounts/api-key*",
+            "/api/accounts/rotate-api-key*",
+            "/api/organizations/*/api-key*",
+            "/api/organizations/*/rotate-api-key*",
+            "/api/organizations/*/api-key/*",  # a * in the middle stops at the next /
+            "/api/organizations/*/rotate-api-key/*",
+        ):
+            self.assertIn(route, routing)
+        self.assertIn("respond @closed 404", routing)
+
+    def test_vaultwardens_version_is_pinned_and_it_is_not_root(self):
+        vault = compose_services()["vaultwarden"]
+        self.assertRegex(vault, r"image: \S+:\d+\.\d+\.\d+\n")
+        self.assertIn(f'user: "{kit.VAULT_UID}:{kit.VAULT_UID}"', vault)
+
+    def test_vaultwardens_groups_are_the_ones_that_require_2fa(self):
+        """So every login to the vault has passed 2FA."""
+        self.assertEqual(kit.module_manifest("vault")["access"], ["board", "operator"])
 
     def test_only_caddy_publishes_ports(self):
         """docs/spec.md §7.2 rule 7: Docker's published ports bypass the firewall."""

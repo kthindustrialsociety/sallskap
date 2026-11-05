@@ -24,3 +24,7 @@ updates:
       # Stay on Forgejo's long-term support line until the project chooses to move.
       - dependency-name: "*forgejo*"
         update-types: ["version-update:semver-major"]
+  - package-ecosystem: docker-compose
+    directory: /modules/vault
+    schedule:
+      interval: weekly

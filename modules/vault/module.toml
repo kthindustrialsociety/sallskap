@@ -1,0 +1,9 @@
+name        = "vault"
+description = "Password vault (Vaultwarden)"
+subdomain   = "vault"
+ram_mb      = 30                # measured: 22 MB at its peak, with 10 sign-ins at once
+requires    = []
+data        = ["/srv/vault"]
+access      = ["board", "operator"]  # core refuses anyone else: see prepare_vault in kit/kit.py
+session_hours = 12              # how long someone stays signed in, whatever they do
+oidc        = true

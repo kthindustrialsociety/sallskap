@@ -1,0 +1,48 @@
+name: sallskap
+
+services:
+  # No published ports: only Caddy can reach it, over Compose's own network.
+  vaultwarden:
+    image: ghcr.io/dani-garcia/vaultwarden:1.37.5
+    user: "10002:10002"
+    restart: unless-stopped
+    mem_limit: 256m
+    pids_limit: 128
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: /etc/sallskap/vault.env   # the hostname and login secret: see prepare_vault in kit/kit.py
+    environment:
+      ROCKET_PORT: "8080"               # it isn't root, so it can't use its usual port 80
+      IP_HEADER: X-Forwarded-For        # which Caddy sets, so login limits count real addresses
+
+      # Core is the only way in. The master password only decrypts: it opens nothing.
+      SSO_ENABLED: "true"
+      SSO_ONLY: "true"
+      SIGNUPS_ALLOWED: "false"
+      SSO_SIGNUPS_ALLOWED: "true"       # an account is made at someone's first login
+
+      # Matching by address would hand an existing account to anyone arriving with the same one.
+      SSO_SIGNUPS_MATCH_EMAIL: "false"
+      # Core doesn't say whether an address is verified, as nothing has checked it, and
+      # without this nobody could sign up. Its docs only warn about this alongside matching.
+      SSO_ALLOW_UNKNOWN_EMAIL_VERIFICATION: "true"
+
+      # These depend on mail, which is off, or would be ways around core.
+      INVITATIONS_ALLOWED: "false"      # people sign in once before they can be added to an organisation
+      EMERGENCY_ACCESS_ALLOWED: "false" # the only warning that someone's taking over a vault is an email
+      PASSWORD_HINTS_ALLOWED: "false"
+      SENDS_ALLOWED: "false"            # public links to shared files and text
+
+      # Its server would otherwise fetch an icon from each site someone has saved.
+      DISABLE_ICON_DOWNLOAD: "true"
+    volumes:
+      - /srv/vault:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/alive"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
