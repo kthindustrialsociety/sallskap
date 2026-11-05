@@ -106,6 +106,19 @@ class User(AbstractBaseUser, PermissionsMixin):
         return self.requires_2fa and not is_mfa_enabled(self, [Authenticator.Type.TOTP])
 
 
+class ToolAccess(models.Model):
+    """Which groups may log in to a tool through the login service. A tool with no row
+    is open to every account, and decides for itself what they can do."""
+
+    tool = models.OneToOneField("allauth_idp_oidc.Client", on_delete=models.CASCADE, related_name="access")
+    group_keys = models.JSONField(default=list)  # the same keys as User.group_keys
+    # For a tool whose sessions last as long as its access token does. Empty: the usual 10 minutes.
+    session_hours = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.tool}: {', '.join(self.group_keys)}"
+
+
 class GroupRole(models.Model):
     """Ties a group to a built-in role by a key that never changes, so the rules
     in roles.py still apply if the association renames the group."""

@@ -20,6 +20,7 @@ import json
 import re
 import secrets
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -29,6 +30,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +40,14 @@ CORE_ENV = Path("/etc/sallskap/core.env")
 GIT_ENV = Path("/etc/sallskap/git.env")
 FORGEJO = "sallskap-forgejo-1"
 FORGEJO_SERVICE_USER = "sallskap-admin"
+VAULT = "sallskap-vaultwarden-1"
+VAULT_DIR = Path("/srv/vault")
+VAULT_ENV = Path("/etc/sallskap/vault.env")
+VAULT_UID = "10002"
+VAULT_HASH = "bm90LWEtcmVhbC1tYXN0ZXItcGFzc3dvcmQtaGFzaA=="
+VAULT_KEY = "2.bm90LXJlYWw=|bm90LXJlYWw=|bm90LXJlYWw="
+VAULT_IDENTIFIER = "00000000-01DC-01DC-01DC-000000000000"  # the one Vaultwarden uses for itself
+VAULT_SESSION_SECONDS = 12 * 3600
 PASSWORD = "fake-user-long-password-42"
 LOCKED_TEXT = "Too many failed login attempts"
 FAKE = {
@@ -60,6 +70,20 @@ FAKE = {
     "fake-git-moving": (["member"], True),
     "fake-git-leaving": (["developer"], False),
     "fake-git-clash": (["member"], False),
+    "fake-vault-board": (["board"], True),
+    "fake-vault-operator": (["operator"], True),
+    "fake-vault-board-no2fa": (["board"], False),
+    "fake-vault-member": (["member"], False),
+    "fake-vault-dev": (["developer"], False),
+    "fake-vault-treasurer": (["treasurer"], True),
+    "fake-vault-moving": (["member"], True),
+    "fake-vault-newcomer": (["board"], True),
+    "fake-vault-reused": (["operator"], True),
+    "fake-vault-keeper": (["board"], True),
+    "fake-vault-session": (["board"], True),
+    "fake-vault-renamed": (["board"], True),
+    "fake-vault-rules": (["board"], True),
+    "fake-vault-offon": (["board"], True),
 }
 # These can't be named fake-something, as what's being tested is the name itself.
 FAKE_OTHER = ["fake-git-clash@example.net", f"{FORGEJO_SERVICE_USER}@example.org", "admin@example.org"]
@@ -853,7 +877,7 @@ def check_forgejo_exposure(host):
     check("It has a memory limit", config["Memory"] > 0)
     check("Its filesystem is read-only", config["ReadonlyRootfs"])
     check("It drops all capabilities", config["CapDrop"] == ["ALL"], str(config["CapDrop"]))
-    check("It can't gain privileges", "no-new-privileges:true" in config["SecurityOpt"])
+    check("It can't gain privileges", "no-new-privileges:true" in (config["SecurityOpt"] or []))
     check("It restarts by itself", config["RestartPolicy"]["Name"] == "unless-stopped")
     uid = in_forgejo("id", "-u").stdout.strip()
     check("It runs as non-root", uid == "1000", uid)
@@ -1274,6 +1298,684 @@ def cleanup_forgejo():
     print(f"Fake accounts left in Forgejo: {len(left)}")
 
 
+# ---- Vaultwarden ---------------------------------------------------------------
+
+
+def vault_enabled():
+    return tomllib.loads(CONFIG.read_text()).get("modules", {}).get("vault", False)
+
+
+def vault_host(host):
+    return host.replace("app.", "vault.", 1)
+
+
+def in_vault(*args):
+    return subprocess.run(["docker", "exec", VAULT, *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def vault_db(query, *values):
+    """What only its database can say: it's read here, never changed."""
+    connection = sqlite3.connect(f"file:{VAULT_DIR}/db.sqlite3?mode=ro", uri=True)
+    try:
+        return connection.execute(query, values).fetchall()
+    finally:
+        connection.close()
+
+
+def vault_account(email):
+    found = vault_db("select uuid from users where email = ?", email)
+    return found[0][0] if found else None
+
+
+def clear_vault_limits():
+    """Its login limits are kept in memory, and every check here comes from one address."""
+    subprocess.run(["docker", "restart", VAULT], capture_output=True)
+    wait_for_vault()
+
+
+def vault_health():
+    return json.loads(subprocess.run(["docker", "inspect", VAULT], capture_output=True, text=True).stdout)[0]["State"].get("Health", {}).get("Status")
+
+
+def wait_for_vault():
+    for _ in range(40):
+        if vault_health() == "healthy":
+            return
+        time.sleep(1)
+    raise SystemExit("Vaultwarden didn't come back.")
+
+
+class VaultPerson:
+    """One browser, doing what Vaultwarden's web page does with its API. Keys here are
+    placeholders, as the server only stores them, so the real web page can't open these
+    accounts. Real encryption only happens in a real browser, so it's checked in one."""
+
+    def __init__(self, host):
+        self.host = host
+        self.app = Browser(host)
+        self.vault = Browser(vault_host(host))
+        self.device = str(uuid.uuid4())
+        self.tokens = {}
+        self.code = self.verifier = None
+
+    def log_in_to_core(self, email, code_secret=None):
+        self.app.log_in(email)
+        if code_secret:
+            self.app.enter_code(totp(code_secret))
+
+    def start_path(self):
+        """Where the web page sends someone who clicks its sign-in button."""
+        self.code = None
+        self.verifier = secrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(self.verifier.encode()).digest()).rstrip(b"=").decode()
+        query = {
+            "client_id": "web",
+            "redirect_uri": f"https://{self.vault.host}/sso-connector.html",
+            "response_type": "code",
+            "scope": "api offline_access",
+            "state": secrets.token_urlsafe(16),
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_mode": "query",
+        }
+        return f"/identity/connect/authorize?{urllib.parse.urlencode(query)}"
+
+    def click_sign_in(self):
+        """Follow the redirects across both hostnames. Returns the last place reached,
+        as a hostname and path, and the answer from there."""
+        browser, path = self.vault, self.start_path()
+        last, response = f"{browser.host}{path}", None
+        for _ in range(8):
+            response = browser.get(path)
+            if response.status not in (301, 302, 303, 307):
+                return last, response
+            target = urllib.parse.urlparse(response.location)
+            if target.path == "/sso-connector.html":  # back on the web page, which takes it from here
+                self.code = dict(urllib.parse.parse_qsl(target.query)).get("code")
+                return f"{self.vault.host}{target.path}", response
+            if target.netloc:
+                browser = self.vault if target.netloc == self.vault.host else self.app
+            path = target.path + (f"?{target.query}" if target.query else "")
+            last = f"{browser.host}{path}"
+        return "too many redirects", response
+
+    def identity(self, **form):
+        answer = self.vault.send("POST", "/identity/connect/token", {"client_id": "web", **form})
+        try:
+            return answer.status, json.loads(answer.text)
+        except ValueError:
+            return answer.status, {}
+
+    def redeem(self, code=None, verifier=None):
+        status, data = self.identity(
+            grant_type="authorization_code",
+            code=code or self.code or "",
+            code_verifier=verifier or self.verifier or "",
+            redirect_uri=f"https://{self.vault.host}/sso-connector.html",
+            scope="api offline_access",
+            deviceType="9",
+            deviceIdentifier=self.device,
+            deviceName="chrome",
+        )
+        if status == 200:
+            self.tokens = data
+        return status, data
+
+    def sign_in(self):
+        self.click_sign_in()
+        return self.redeem()
+
+    def refresh(self):
+        status, data = self.identity(grant_type="refresh_token", refresh_token=self.tokens.get("refresh_token", ""))
+        if status == 200:
+            self.tokens = {**self.tokens, **data}
+        return status, data
+
+    def api(self, method, path, body=None):
+        connection = http.client.HTTPSConnection(self.vault.host, context=self.vault.context, timeout=30)
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.tokens.get('access_token', '')}"}
+        connection.request(method, path, json.dumps(body) if body is not None else None, headers)
+        response = Response(connection.getresponse())
+        connection.close()
+        try:
+            return response.status, json.loads(response.text)
+        except ValueError:
+            return response.status, response.text
+
+    def set_master_password(self, hint=None):
+        return self.api(
+            "POST",
+            "/api/accounts/set-password",
+            {
+                "masterPasswordHash": VAULT_HASH,
+                "masterPasswordHint": hint,
+                "key": VAULT_KEY,
+                "kdf": 0,
+                "kdfIterations": 600000,
+                "keys": {"encryptedPrivateKey": VAULT_KEY, "publicKey": "not-a-real-public-key"},
+            },
+        )
+
+    def in_vault(self):
+        status, data = self.api("GET", "/api/sync")
+        return status == 200 and isinstance(data, dict) and "profile" in data
+
+    def sync(self):
+        return self.api("GET", "/api/sync")[1]
+
+
+def vault_person(host, name, secrets_by_name, master_password=True):
+    """Someone signed in to core and to Vaultwarden, ready to use it."""
+    person = VaultPerson(host)
+    person.log_in_to_core(email_of(name), secrets_by_name.get(name))
+    person.sign_in()
+    if master_password:
+        person.set_master_password()
+    return person
+
+
+def check_vault_exposure(host):
+    section("Vaultwarden: exposure")
+    info = json.loads(subprocess.run(["docker", "inspect", VAULT], capture_output=True, text=True).stdout)[0]
+    config = info["HostConfig"]
+    check("It has no published ports", not config["PortBindings"], str(config["PortBindings"]))
+    check("It has a memory limit", config["Memory"] > 0)
+    check("Its filesystem is read-only", config["ReadonlyRootfs"])
+    check("It drops all capabilities", config["CapDrop"] == ["ALL"], str(config["CapDrop"]))
+    check("It can't gain privileges", "no-new-privileges:true" in (config["SecurityOpt"] or []))
+    check("It restarts by itself", config["RestartPolicy"]["Name"] == "unless-stopped")
+    uid = in_vault("id", "-u").stdout.strip()
+    check("It runs as non-root", uid == VAULT_UID, uid)
+    check("Its version is pinned", re.fullmatch(r".+:\d+\.\d+\.\d+", info["Config"]["Image"]) is not None, info["Config"]["Image"])
+    data = subprocess.run(["stat", "-c", "%u %a", str(VAULT_DIR)], capture_output=True, text=True).stdout.strip()
+    check("Its data folder is private to it", data == f"{VAULT_UID} 700", data)
+    mode = subprocess.run(["stat", "-c", "%u %a", str(VAULT_ENV)], capture_output=True, text=True).stdout.strip()
+    check("Its secrets file is readable by root only", mode == "0 600", mode)
+    try:
+        socket.create_connection((socket.gethostbyname(vault_host(host)), 8080), 3).close()
+        reachable = True
+    except OSError:
+        reachable = False
+    check("Port 8080 can't be reached from the public address", not reachable)
+
+
+def check_vault_https(host):
+    section("Vaultwarden: HTTPS and cookies")
+    first = Browser(vault_host(host)).get("/")
+    check("Opening its address starts signing in, with no address to type", first.status == 302 and first.location == f"/#/sso?identifier={VAULT_IDENTIFIER}", f"{first.status} {first.location}")
+    stay = first.cookie("sallskap_stay")
+    check("...with a cookie that stops it repeating", "Secure" in stay and "HttpOnly" in stay and "domain=" not in stay.lower(), stay)
+    check("...for as long as a session lasts", f"Max-Age={VAULT_SESSION_SECONDS}" in stay, stay)
+    page = Browser(vault_host(host), cookies={"sallskap_stay": "1"}).get("/")
+    check("Its page loads over HTTPS with a valid certificate", page.status == 200, str(page.status))
+    plain = http.client.HTTPConnection(vault_host(host), 80, timeout=10)
+    plain.request("GET", "/")
+    answer = plain.getresponse()
+    check("Plain HTTP redirects to HTTPS", answer.status in (301, 308) and answer.getheader("Location", "").startswith("https://"), str(answer.status))
+    plain.close()
+    check("HSTS is on", "max-age=" in (page.headers.get("Strict-Transport-Security") or ""))
+    check("The site can't be framed by others", "frame-ancestors" in (page.headers.get("Content-Security-Policy") or "") or page.headers.get("X-Frame-Options") in ("SAMEORIGIN", "DENY"))
+    check("No server software is advertised", page.headers.get("Server") is None, str(page.headers.get("Server")))
+    check("No proxy software is advertised", page.headers.get("Via") is None, str(page.headers.get("Via")))
+
+    person = VaultPerson(host)
+    started = person.vault.get(person.start_path())
+    binding = next((c for c in started.set_cookies if "binding" in c.lower()), "")
+    check("Starting a sign-in sends someone to core", started.location.startswith(f"https://{host}/identity/o/authorize"), started.location)
+    check("It ties the sign-in to this browser, with a Secure cookie", "Secure" in binding and "HttpOnly" in binding, binding)
+    check("...that stays on this hostname", "domain=" not in binding.lower(), binding)
+
+
+def check_vault_single_login(host, secrets_by_name):
+    section("Vaultwarden: one login")
+    visitor = VaultPerson(host)
+    reached, _ = visitor.click_sign_in()
+    check("A visitor is sent to core to log in", reached.startswith(f"{host}/accounts/login/"), reached)
+    check("...and gets no code", visitor.code is None)
+
+    person = VaultPerson(host)
+    person.log_in_to_core(email_of("fake-vault-board"), secrets_by_name["fake-vault-board"])
+    reached, _ = person.click_sign_in()
+    check("Someone logged in to core is sent straight back, with nothing to enter", reached.endswith("/sso-connector.html") and bool(person.code), reached)
+    status, data = person.redeem()
+    check("The code signs them in", status == 200 and "access_token" in data, f"{status} {str(data)[:200]}")
+    check("Their account comes from core", vault_account(email_of("fake-vault-board")) is not None)
+    options = data.get("UserDecryptionOptions") or {}
+    check("A first login asks them to choose a master password", options.get("HasMasterPassword") is False, str(options))
+    status, _ = person.set_master_password(hint="the name of my dog")
+    check("A password hint can't be stored with it", status != 200, str(status))
+    status, _ = person.set_master_password()
+    check("They can choose one", status == 200, str(status))
+    check("They're in", person.in_vault())
+    check("It's their own address", person.sync().get("profile", {}).get("email") == email_of("fake-vault-board"))
+    known = person.api("GET", f"/api/organizations/{VAULT_IDENTIFIER}/policies/master-password")[0]
+    unknown = person.api("GET", "/api/organizations/00000000-0000-0000-0000-000000000000/policies/master-password")[0]
+    check("The identifier its address leads to is the one Vaultwarden uses for itself", known == 200 and unknown != 200, f"{known} {unknown}")
+
+    first_account = vault_account(email_of("fake-vault-board"))
+    again = VaultPerson(host)
+    again.app.cookies = dict(person.app.cookies)
+    status, data = again.sign_in()
+    check("Signing in again works, from another device", status == 200, str(status))
+    check("...and it's the same account", vault_account(email_of("fake-vault-board")) == first_account)
+    check("...which asks for the master password, not a new one", (data.get("UserDecryptionOptions") or {}).get("HasMasterPassword") is True)
+    check("...and hands over only the encrypted key", data.get("Key") == VAULT_KEY, str(data.get("Key"))[:40])
+
+    wrong = VaultPerson(host)
+    wrong.app.cookies = dict(person.app.cookies)
+    wrong.click_sign_in()
+    check("A code needs the secret from the browser that started it", wrong.redeem(verifier="not-the-right-one")[0] == 400)
+    check("A made-up code is refused", VaultPerson(host).redeem(code="made-up", verifier="made-up")[0] == 400)
+
+    # Someone starts a sign-in and tricks a logged-in person into finishing it.
+    tricking = VaultPerson(host)
+    to_core = urllib.parse.urlparse(tricking.vault.get(tricking.start_path()).location)
+    victim = VaultPerson(host)
+    victim.app.cookies = dict(person.app.cookies)
+    back = urllib.parse.urlparse(victim.app.get(f"{to_core.path}?{to_core.query}").location)
+    check("...which core does send back to Vaultwarden, for this next check to mean anything", back.path == "/identity/connect/oidc-signin", back.path)
+    answer = victim.vault.get(f"{back.path}?{back.query}")
+    check("A sign-in started in another browser is refused", answer.status >= 400 and "sso-connector" not in answer.location, f"{answer.status} {answer.location}")
+    return person
+
+
+def check_vault_groups(host, secrets_by_name):
+    section("Vaultwarden: groups decide who gets in")
+    for name in ("fake-vault-member", "fake-vault-dev", "fake-vault-treasurer"):
+        person = VaultPerson(host)
+        person.log_in_to_core(email_of(name), secrets_by_name.get(name))
+        reached, answer = person.click_sign_in()
+        check(f"{name} is told they have no access", answer.status == 403 and "have access" in answer.text, f"{reached} {answer.status}")
+        check("...and gets no code", person.code is None)
+        check("...and no account", vault_account(email_of(name)) is None)
+
+    person = VaultPerson(host)
+    person.log_in_to_core(email_of("fake-vault-board-no2fa"))
+    reached, _ = person.click_sign_in()
+    check("A Board member without 2FA is sent to set it up", "/accounts/2fa" in reached, reached)
+    check("...and gets no code", person.code is None)
+    check("...and no account", vault_account(email_of("fake-vault-board-no2fa")) is None)
+
+    operator = vault_person(host, "fake-vault-operator", secrets_by_name)
+    check("An Operator gets in", operator.in_vault())
+
+    moving = VaultPerson(host)
+    moving.log_in_to_core(email_of("fake-vault-moving"), secrets_by_name["fake-vault-moving"])
+    reached, answer = moving.click_sign_in()
+    check("Someone outside the groups is refused", answer.status == 403, f"{reached} {answer.status}")
+    set_groups(email_of("fake-vault-moving"), ["board"])
+    status, _ = moving.sign_in()
+    check("Joining Board gets them in at the next sign-in", status == 200, str(status))
+    moving.set_master_password()
+    account = vault_account(email_of("fake-vault-moving"))
+    set_groups(email_of("fake-vault-moving"), ["member"])
+    moving.click_sign_in()
+    check("Leaving Board stops the next sign-in", moving.code is None)
+    set_groups(email_of("fake-vault-moving"), ["operator"])
+    status, _ = moving.sign_in()
+    check("Coming back in another allowed group works", status == 200, str(status))
+    check("...with the same account", vault_account(email_of("fake-vault-moving")) == account)
+    return operator
+
+
+def check_closed(person, route, body):
+    """Caddy has to answer for the address itself, as a refusal from Vaultwarden could just
+    be down to what was sent. None of the ways of writing it that Vaultwarden would treat
+    as the same address may get through either."""
+    name = route.rsplit("/", 1)[1]
+    variations = [
+        f"{route}/",
+        f"{route}//",
+        f"{route}%2F",
+        f"{route}?x=1",
+        f"{route}/?x=1",
+        f"/{route}",
+        route.upper(),
+        route.replace(f"/{name}", f"//{name}"),
+        route.replace(name, f"%{ord(name[0]):02x}{name[1:]}"),
+        route.replace(f"/{name}", f"/./{name}"),
+        route.replace(f"/{name}", f"/x/../{name}"),
+    ]
+    itself = person.api("POST", route, body)[0]
+    answers = [person.api("POST", variation, body) for variation in variations]
+    leaked = [a for a in answers if a[0] == 200]
+    check(f"{route} is closed, however it's written", itself == 404 and not leaked, f"{itself} {[a[0] for a in answers]} {str(leaked)[:200]}")
+
+
+def check_vault_closed_doors(host, person):
+    section("Vaultwarden: closed doors")
+    host_name = vault_host(host)
+    email = email_of("fake-vault-board")
+    status, data = person.identity(
+        grant_type="password", username=email, password=VAULT_HASH, scope="api offline_access",
+        deviceType="9", deviceIdentifier=person.device, deviceName="chrome",
+    )  # fmt: skip
+    check("The right master password doesn't log anyone in without core", status != 200 and "access_token" not in data, f"{status} {str(data)[:200]}")
+
+    admin = Browser(host_name).get("/admin")
+    check("The admin page isn't on the internet", admin.status == 404, str(admin.status))
+    check("...nor anything under it", Browser(host_name).get("/admin/users/overview").status == 404)
+
+    organization = person.api(
+        "POST",
+        "/api/organizations",
+        {"name": "Fake organisation", "billingEmail": email, "collectionName": "Fake collection", "key": VAULT_KEY, "planType": 0, "keys": {"encryptedPrivateKey": VAULT_KEY, "publicKey": "not-a-real-public-key"}},
+    )[1]
+    org = organization.get("id") if isinstance(organization, dict) else None
+    body = {"masterPasswordHash": VAULT_HASH, "email": email, "name": "x"}
+    for route in ("/api/accounts/api-key", "/api/accounts/rotate-api-key", f"/api/organizations/{org}/api-key", f"/api/organizations/{org}/rotate-api-key"):
+        check_closed(person, route, body)
+
+    # Without these, the checks above could pass because the routes had moved.
+    inside = in_vault(
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "Content-Type: application/json",
+        "--data", json.dumps({"email": "nobody-at-all@example.org", "name": "x"}),
+        "http://127.0.0.1:8080/identity/accounts/register/send-verification-email",
+    ).stdout  # fmt: skip
+    check("The registration route is there behind Caddy, as it answers on its own", inside == "400", inside)
+    inside = in_vault(
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "Content-Type: application/json",
+        "-H", f"Authorization: Bearer {person.tokens['access_token']}", "--data", json.dumps({"masterPasswordHash": "wrong"}),
+        "http://127.0.0.1:8080/api/accounts/api-key",
+    ).stdout  # fmt: skip
+    check("The API key route is there behind Caddy, as it answers on its own", inside == "400", inside)
+
+    emergency = person.api("POST", "/api/emergency-access/invite", {"email": email_of("fake-vault-operator"), "type": 0, "waitTimeDays": 1})
+    check("Emergency access is off", emergency[0] != 200, str(emergency)[:200])
+    in_a_week = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7 * 86400))
+    send = person.api("POST", "/api/sends", {"type": 0, "name": VAULT_KEY, "key": VAULT_KEY, "deletionDate": in_a_week, "disabled": False, "text": {"text": VAULT_KEY, "hidden": False}})
+    check("Public share links are off", send[0] != 200 and "only able to delete" in str(send), str(send)[:200])
+    icons = [Browser(host_name).get(f"/icons/{site}/icon.png") for site in ("github.com", "no-such-site.example.org")]
+    check("Its server doesn't fetch icons from saved sites", icons[0].text == icons[1].text and icons[0].status == 200, str([i.status for i in icons]))
+    return org
+
+
+def check_vault_sharing(host, owner, org, operator, secrets_by_name):
+    """With no mail, the steps an invitation would have gone through by email."""
+    section("Vaultwarden: sharing passwords without mail")
+    check("Someone can create an organisation", org is not None)
+    status, _ = owner.api("POST", f"/api/organizations/{org}/users/invite", {"emails": [email_of("fake-vault-operator")], "groups": [], "type": 2, "collections": [], "permissions": {}})
+    check("They can add someone who has signed in", status == 200, str(status))
+    members = owner.api("GET", f"/api/organizations/{org}/users")[1].get("data", [])
+    member = next((m for m in members if m["email"] == email_of("fake-vault-operator")), {})
+    check("With no email to answer, they're accepted right away", member.get("status") == 1, str(member.get("status")))
+    status, _ = owner.api("POST", f"/api/organizations/{org}/users/{member.get('id')}/confirm", {"key": VAULT_KEY})
+    check("The owner can confirm them, which gives them the organisation's key", status == 200, str(status))
+    joined = [o["id"] for o in operator.sync().get("profile", {}).get("organizations", [])]
+    check("They now see the organisation", org in joined, str(joined))
+    status, _ = owner.api("POST", f"/api/organizations/{org}/users/invite", {"emails": [email_of("fake-vault-never")], "groups": [], "type": 2, "collections": [], "permissions": {}})
+    check("Someone who has never signed in can't be added", status != 200, str(status))
+    check("...and no empty account is made for them", vault_account(email_of("fake-vault-never")) is None)
+
+    newcomer = VaultPerson(host)
+    newcomer.log_in_to_core(email_of("fake-vault-newcomer"), secrets_by_name["fake-vault-newcomer"])
+    newcomer.sign_in()  # and no master password yet
+    status, _ = owner.api("POST", f"/api/organizations/{org}/users/invite", {"emails": [email_of("fake-vault-newcomer")], "groups": [], "type": 2, "collections": [], "permissions": {}})
+    pending = vault_db("select count(*) from invitations where email = ?", email_of("fake-vault-newcomer"))[0][0]
+    check("Adding someone with no master password yet leaves an invitation, as this next check needs", status == 200 and pending == 1, f"{status} {pending}")
+    stranger = VaultPerson(host)
+    claim = {"email": email_of("fake-vault-newcomer"), "name": "x"}
+    check_closed(stranger, "/identity/accounts/register/send-verification-email", claim)
+    check_closed(stranger, "/identity/accounts/register/finish", claim)
+    hash_after = vault_db("select password_hash from users where email = ?", email_of("fake-vault-newcomer"))[0][0]
+    check("A stranger hasn't claimed that account: it still has no master password", not hash_after)
+
+
+def check_vault_addresses(host, secrets_by_name):
+    section("Vaultwarden: accounts follow core's id, not the address")
+    person = vault_person(host, "fake-vault-reused", secrets_by_name)
+    first = vault_account(email_of("fake-vault-reused"))
+    check("Someone signs in", person.in_vault() and first is not None)
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from allauth.mfa.totp.internal.auth import TOTP
+User = get_user_model()
+User.objects.get(email={email_of("fake-vault-reused")!r}).delete()
+user = User.objects.create_user({email_of("fake-vault-reused")!r}, {PASSWORD!r})
+user.groups.set(Group.objects.filter(role__key__in=["operator"]))
+TOTP.activate(user, {secrets_by_name["fake-vault-reused"]!r})
+"""
+    )
+    time.sleep(31)  # each code works once
+    newcomer = VaultPerson(host)
+    newcomer.log_in_to_core(email_of("fake-vault-reused"), secrets_by_name["fake-vault-reused"])
+    status, data = newcomer.sign_in()
+    check("A new core account with an old address doesn't get the old vault", status != 200, f"{status} {str(data)[:200]}")
+
+    # With no link to core, it's an account that only has a matching address. Nothing
+    # should make one, so this is what the setting protects if something ever does.
+    connection = sqlite3.connect(VAULT_DIR / "db.sqlite3")
+    with connection:
+        connection.execute("delete from sso_users where user_uuid = ?", (first,))
+    connection.close()
+    status, data = newcomer.sign_in()
+    check("...nor an account with a matching address and no link to core", status != 200, f"{status} {str(data)[:200]}")
+
+
+def check_vault_renamed(host, secrets_by_name):
+    section("Vaultwarden: a new address in core")
+    person = vault_person(host, "fake-vault-renamed", secrets_by_name)
+    account = vault_account(email_of("fake-vault-renamed"))
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email_of('fake-vault-renamed')!r}).update(email={email_of('fake-vault-renamed-new')!r})")
+    status, _ = person.sign_in()
+    check("They can still sign in", status == 200, str(status))
+    check("...to the same account, which keeps the old address", vault_account(email_of("fake-vault-renamed")) == account and vault_account(email_of("fake-vault-renamed-new")) is None)
+
+
+def check_vault_sessions(host, secrets_by_name):
+    section("Vaultwarden: how long a session lasts")
+    email = email_of("fake-vault-session")
+    person = vault_person(host, "fake-vault-session", secrets_by_name)
+    lasts = int(person.tokens.get("expires_in", 0))
+    check("A session lasts 12 hours", abs(lasts - VAULT_SESSION_SECONDS) < 60, str(lasts))
+
+    def expires():
+        return json.loads(base64.urlsafe_b64decode(person.tokens["access_token"].split(".")[1] + "=="))["exp"]
+
+    ending = expires()
+    status, _ = person.refresh()
+    check("It can be refreshed", status == 200, str(status))
+    check("...which doesn't extend it", expires() == ending, f"{expires()} {ending}")
+
+    set_groups(email, ["member"])
+    status, _ = person.refresh()
+    check("Leaving the groups ends it at the next refresh, which is every page load", status != 200, str(status))
+    print(f"  info  Used by hand, the token still answers with {person.api('GET', '/api/sync')[0]} until it expires. Step 5's call to Vaultwarden's admin API closes this.")
+    set_groups(email, ["board"])
+    check("...and only core was stopping it", person.refresh()[0] == 200)
+
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=False)")
+    status, _ = person.refresh()
+    check("Turning off the account ends it at the next refresh", status != 200, str(status))
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=True)")
+
+
+def check_vault_limits(host):
+    section("Vaultwarden: login limits count real addresses")
+    faking = VaultPerson(host)
+    statuses = []
+    for number in range(12):
+        faking.vault.headers = {"X-Forwarded-For": f"203.0.113.{number}", "X-Real-IP": f"203.0.113.{number}"}
+        statuses.append(faking.redeem(code="made-up", verifier="made-up")[0])
+    check("Too many tries are stopped, even with a faked address", 429 in statuses, str(statuses))
+    clear_vault_limits()
+    faking.identity(grant_type="refresh_token", refresh_token="not-a-token")
+    answer = subprocess.run(["docker", "logs", "--tail", "20", VAULT], capture_output=True, text=True)
+    found = re.findall(r"refresh_token from (\S+?):", answer.stdout + answer.stderr)
+    public = socket.gethostbyname(vault_host(host))
+    check("It logs the real address, not Caddy's or a faked one", found and found[-1] == public, str(found[-1:]))
+
+
+def vault_fingerprint():
+    """What must not change when the setup runs again or the server restarts."""
+    return {
+        "secrets": hashlib.sha256(VAULT_ENV.read_bytes()).hexdigest(),
+        "signing key": hashlib.sha256((VAULT_DIR / "rsa_key.pem").read_bytes()).hexdigest(),
+        "tool in core": kit("tool", "list").stdout,
+    }
+
+
+def check_vault_changing_rules(host, secrets_by_name):
+    """Changing its groups or session length means registering it again, as its README says."""
+    section("Vaultwarden: registering it again")
+    person = vault_person(host, "fake-vault-rules", secrets_by_name)
+    before = hashlib.sha256(VAULT_ENV.read_bytes()).hexdigest()
+    kit("tool", "remove", "vaultwarden")
+    done = kit("enable", "vault")
+    check("It works", done.returncode == 0, done.stderr[-300:])
+    check("...with a new secret on both sides", hashlib.sha256(VAULT_ENV.read_bytes()).hexdigest() != before)
+    check("An open session ends at its next refresh", person.refresh()[0] != 200)
+    status, _ = person.sign_in()
+    check("Signing in again works", status == 200, str(status))
+    check("...and they're in", person.in_vault())
+
+
+def check_vault_off_and_on(host, secrets_by_name):
+    section("Vaultwarden: switching it off and on")
+    person = vault_person(host, "fake-vault-offon", secrets_by_name)
+    account, secrets_file = vault_account(email_of("fake-vault-offon")), VAULT_ENV.read_bytes()
+    done = kit("disable", "vault")
+    check("`kit disable` works", done.returncode == 0, done.stderr[-300:])
+    running = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True).stdout
+    check("It's stopped", VAULT not in running, running)
+    check("Its data stays", (VAULT_DIR / "db.sqlite3").exists() and VAULT_ENV.exists())
+    try:
+        Browser(vault_host(host), cookies={"sallskap_stay": "1"}).get("/")
+        reachable = True
+    except (ssl.SSLError, OSError):
+        reachable = False
+    check("Its address no longer answers", not reachable)
+    done = kit("enable", "vault")
+    check("`kit enable` brings it back", done.returncode == 0, done.stderr[-300:])
+    check("...with the same secret", VAULT_ENV.read_bytes() == secrets_file)
+    wait_for_vault()
+    check("...and the same account", vault_account(email_of("fake-vault-offon")) == account)
+    check("...and the session still works", person.in_vault())
+
+
+def check_vault_setup_repeats():
+    section("Vaultwarden: running the setup again")
+    before = vault_fingerprint()
+    done = kit("enable", "vault")
+    check("It works", done.returncode == 0, done.stderr[-300:])
+    check("...and changes nothing", vault_fingerprint() == before)
+    check("Core lists it, for its groups only", "(board, operator, 12 hour sessions)" in before["tool in core"], before["tool in core"])
+
+
+def check_vault(host, secrets_by_name):
+    clear_limits()
+    clear_vault_limits()
+    check_vault_exposure(host)
+    check_vault_https(host)
+    owner = check_vault_single_login(host, secrets_by_name)
+    clear_vault_limits()
+    operator = check_vault_groups(host, secrets_by_name)
+    clear_vault_limits()
+    org = check_vault_closed_doors(host, owner)
+    clear_vault_limits()
+    check_vault_sharing(host, owner, org, operator, secrets_by_name)
+    clear_vault_limits()
+    check_vault_addresses(host, secrets_by_name)
+    clear_vault_limits()
+    check_vault_renamed(host, secrets_by_name)
+    check_vault_sessions(host, secrets_by_name)
+    clear_vault_limits()
+    check_vault_limits(host)
+    clear_vault_limits()
+    check_vault_changing_rules(host, secrets_by_name)
+    clear_vault_limits()
+    check_vault_off_and_on(host, secrets_by_name)
+    clear_vault_limits()
+    check_vault_setup_repeats()
+    clear_limits()
+
+    keeper = vault_person(host, "fake-vault-keeper", secrets_by_name)
+    return {
+        "core_cookies": keeper.app.cookies,
+        "tokens": keeper.tokens,
+        "org": org,
+        "fingerprint": vault_fingerprint(),
+    }
+
+
+def verify_vault(host, state):
+    section("Vaultwarden: did logins and data survive?")
+    clear_vault_limits()
+    keeper = VaultPerson(host)
+    keeper.tokens = state["tokens"]
+    check("A session is still signed in", keeper.in_vault())
+    person = VaultPerson(host)
+    person.app.cookies = dict(state["core_cookies"])
+    status, _ = person.sign_in()
+    check("A new sign-in still works", status == 200, str(status))
+    check("...into the same account, with its master password", (person.tokens.get("UserDecryptionOptions") or {}).get("HasMasterPassword") is True)
+    orgs = vault_db("select count(*) from organizations where uuid = ?", state["org"])[0][0]
+    check("Its data is still there", orgs == 1, str(orgs))
+    now = vault_fingerprint()
+    for label, value in now.items():
+        check(f"Its {label} didn't change", value == state["fingerprint"][label], f"{value} {state['fingerprint'][label]}")
+    check("It's healthy", vault_health() == "healthy", str(vault_health()))
+    check_vault_exposure(host)
+
+
+def burst_vault(host, state):
+    section("Many sign-ins to Vaultwarden at once")
+    clear_vault_limits()
+    info = json.loads(subprocess.run(["docker", "inspect", VAULT], capture_output=True, text=True).stdout)[0]
+    cgroup = Path(f"/sys/fs/cgroup/system.slice/docker-{info['Id']}.scope")
+    oom_before = _oom_kills(cgroup)
+    results = []
+
+    def one_sign_in():
+        person = VaultPerson(host)
+        person.app.cookies = dict(state["core_cookies"])
+        results.append(person.sign_in()[0] == 200 and person.in_vault())
+
+    # Its limit lets 10 through at once from one address, so more would only test that.
+    threads = [threading.Thread(target=one_sign_in) for _ in range(10)]
+    started = time.time()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    peak_file = cgroup / "memory.peak"
+    peak_mb = int(peak_file.read_text()) / 1024**2 if peak_file.exists() else None
+    print(f"  info  10 sign-ins took {time.time() - started:.1f}s. Peak memory {peak_mb and round(peak_mb)} MB of a {info['HostConfig']['Memory'] / 1024**2:.0f} MB limit.")
+    check("All 10 sign-ins succeeded", all(results) and len(results) == 10, f"{sum(results)} of {len(results)}")
+    check("Nothing was killed for using too much memory", _oom_kills(cgroup) == oom_before)
+
+
+def cleanup_vault():
+    """Through its database with it stopped, as nothing else can remove someone else's
+    account: the admin page is off. Only what belongs to fake accounts goes."""
+    subprocess.run(["docker", "stop", VAULT], capture_output=True)
+    connection = sqlite3.connect(VAULT_DIR / "db.sqlite3")
+    try:
+        people = [row[0] for row in connection.execute("select uuid from users where email like 'fake-%@example.org'")]
+        marks = ",".join("?" * len(people))
+        orgs = [row[0] for row in connection.execute(f"select distinct org_uuid from users_organizations where atype = 0 and user_uuid in ({marks})", people)]
+        org_marks = ",".join("?" * len(orgs))
+        tables = [row[0] for row in connection.execute("select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name != '__diesel_schema_migrations'")]
+        for table in tables:
+            columns = {row[1] for row in connection.execute(f"pragma table_info({table})")}
+            if "user_uuid" in columns:
+                connection.execute(f"delete from {table} where user_uuid in ({marks})", people)
+            for column in ("org_uuid", "organization_uuid"):
+                if column in columns:
+                    connection.execute(f"delete from {table} where {column} in ({org_marks})", orgs)
+        connection.execute(f"delete from organizations where uuid in ({org_marks})", orgs)
+        connection.execute(f"delete from users where uuid in ({marks})", people)
+        connection.execute("delete from invitations where email like 'fake-%@example.org'")
+        connection.commit()
+        left = connection.execute("select count(*) from users where email like 'fake-%@example.org'").fetchone()[0]
+    finally:
+        connection.close()
+    subprocess.run(["docker", "start", VAULT], capture_output=True)
+    print(f"Fake accounts left in Vaultwarden: {left}, removed {len(people)} and {len(orgs)} organisations")
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -1291,6 +1993,7 @@ def prepare():
     check_recovery(host)
     tool = check_login_service(host, secrets_by_name)
     forgejo = check_forgejo(host, secrets_by_name) if git_enabled() else None
+    vault = check_vault(host, secrets_by_name) if vault_enabled() else None
 
     keeper = Browser(host)
     keeper.log_in(email_of("fake-member"))
@@ -1303,6 +2006,7 @@ def prepare():
                 "data": data_snapshot(),
                 "tool": tool,
                 "git": forgejo,
+                "vault": vault,
                 "signing_key": json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"][0]["kid"],
             }
         )
@@ -1340,6 +2044,8 @@ def verify():
     check_exposure(host)
     if state.get("git"):
         verify_forgejo(host, state["git"])
+    if state.get("vault"):
+        verify_vault(host, state["vault"])
 
 
 def burst():
@@ -1373,6 +2079,8 @@ def burst():
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if state.get("git"):
         burst_forgejo(host, state["git"])
+    if state.get("vault"):
+        burst_vault(host, state["vault"])
 
 
 def _oom_kills(cgroup):
@@ -1385,6 +2093,8 @@ def _oom_kills(cgroup):
 def cleanup():
     if git_enabled():
         cleanup_forgejo()
+    if vault_enabled():
+        cleanup_vault()
     in_core(
         f"""
 from django.contrib.auth import get_user_model

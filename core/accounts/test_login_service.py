@@ -22,6 +22,7 @@ from django.utils import timezone
 from sallskap.urls import not_found
 
 from .login_service import SCOPES
+from .models import ToolAccess
 from .tests import PASSWORD, Base, CaddyClient, User, make_user, totp_code
 
 SIGNING_KEY = (
@@ -274,7 +275,7 @@ class Claims(Service):
         claims = self.login_claims(user)
         self.assertEqual(claims["sub"], str(user.pk))
         self.assertEqual(claims["email"], "anna.lind@example.org")
-        self.assertIs(claims["email_verified"], False)
+        self.assertNotIn("email_verified", claims)  # nothing has checked it, so core doesn't say
         self.assertEqual(claims["name"], "Anna Lind")
         self.assertEqual(claims["preferred_username"], "anna.lind")
         self.assertEqual(claims["nonce"], "nonce-from-the-tool")
@@ -524,7 +525,7 @@ class Logout(Service):
         self.assert_logged_in()
 
 
-class Tools(Service):
+class ToolCommand(Service):
     """The commands behind `kit tool`."""
 
     def run_command(self, *args):
@@ -535,6 +536,8 @@ class Tools(Service):
     def read(self, output, label):
         return next(line.split(":", 1)[1].strip() for line in output.splitlines() if line.strip().startswith(label))
 
+
+class Tools(ToolCommand):
     def test_adding_a_tool_prints_its_settings_and_the_secret_works(self):
         output = self.run_command("add", "git", "https://git.example.org/callback")
         self.assertEqual(self.read(output, "Issuer"), f"https://{settings.APP_HOST}")
@@ -612,6 +615,200 @@ class Tools(Service):
     def test_removing_an_unknown_tool_is_refused(self):
         with self.assertRaisesRegex(CommandError, "No tool"):
             self.run_command("remove", "nope")
+
+
+class ToolGroups(Service):
+    """A tool limited to certain groups, as Vaultwarden is. It can't check for itself."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        ToolAccess.objects.create(tool=cls.tool, group_keys=["board", "operator"])
+
+    def test_someone_in_a_listed_group_gets_through(self):
+        for group in ("board", "operator"):
+            with self.subTest(group):
+                user, _ = make_user(f"{group}@example.org", [group], two_factor=True)
+                self.assertEqual(self.login_claims(user)["sub"], str(user.pk))
+
+    def test_someone_with_another_group_is_refused_with_no_code(self):
+        for groups in (["member"], ["developer"], ["treasurer"], []):
+            with self.subTest(groups):
+                user, _ = make_user(f"{'-'.join(groups) or 'nobody'}@example.org", groups, two_factor=True)
+                self.client.force_login(user)
+                response = self.client.get(self.authorize_url())
+                self.assertEqual(response.status_code, 403)
+                self.assertContains(response, "access to tool", status_code=403)
+                self.assertIsNone(self.sent_back(response))
+
+    def test_a_silent_check_tells_the_tool_no(self):
+        user, _ = make_user(groups=["member"])
+        self.client.force_login(user)
+        back = self.sent_back(self.client.get(self.authorize_url(prompt="none")))
+        self.assertEqual(back["error"], "login_required")
+        self.assertNotIn("code", back)
+
+    def test_a_form_post_cannot_get_around_the_check(self):
+        user, _ = make_user(groups=["member"])
+        self.client.force_login(user)
+        response = self.client.post(self.authorize_url(), follow=True)
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Token.objects.exists())
+
+    def test_a_visitor_logs_in_first_and_is_refused_after(self):
+        user, _ = make_user(groups=["member"])
+        response = self.client.get(self.authorize_url())
+        self.assertIn(reverse("account_login"), response.headers["Location"])
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_being_refused_comes_before_being_asked_to_set_up_2fa(self):
+        user, _ = make_user(groups=["treasurer"])
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_a_listed_group_still_needs_2fa(self):
+        user, _ = make_user(groups=["board"])
+        self.client.force_login(user)
+        self.assertRedirects(self.client.get(self.authorize_url()), reverse("mfa_index"), fetch_redirect_response=False)
+
+    def test_a_superuser_outside_the_groups_is_refused(self):
+        user, _ = make_user(two_factor=True)
+        user.is_superuser = True
+        user.save()
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_a_custom_group_named_after_a_listed_one_is_refused(self):
+        """It goes by custom:board, so this is the rule that protects the group list."""
+        user, _ = make_user()
+        user.groups.add(Group.objects.create(name="board"))
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_renaming_a_listed_group_keeps_its_people_in(self):
+        user, _ = make_user(groups=["board"], two_factor=True)
+        Group.objects.filter(role__key="board").update(name="Styrelsen")
+        self.assertEqual(self.login_claims(user)["sub"], str(user.pk))
+
+    def test_joining_a_listed_group_gives_access_at_the_next_login(self):
+        user, _ = make_user(groups=["member"], two_factor=True)
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+        user.groups.add(Group.objects.get(role__key="board"))
+        self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
+
+    def test_leaving_the_groups_stops_a_code_already_issued(self):
+        user, _ = make_user(groups=["board"], two_factor=True)
+        self.client.force_login(user)
+        code = self.get_code()
+        user.groups.clear()
+        response = self.exchange(code)
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("access_token", response.json())
+
+    def test_leaving_the_groups_stops_a_token_already_issued(self):
+        user, _ = make_user(groups=["board"], two_factor=True)
+        self.client.force_login(user)
+        access_token = self.exchange(self.get_code()).json()["access_token"]
+        asking = CaddyClient()
+        self.assertEqual(asking.get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}).status_code, 200)
+        user.groups.clear()
+        self.assertEqual(asking.get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}).status_code, 401)
+
+    def test_a_tool_with_no_list_stays_open_to_every_account(self):
+        other = make_tool("other", "https://other.example.org/callback")
+        user, _ = make_user(groups=["member"])
+        self.client.force_login(user)
+        response = self.client.get(self.authorize_url(client_id=other.id, redirect_uri="https://other.example.org/callback"))
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].startswith("https://other.example.org/callback"))
+
+    def test_an_empty_list_lets_nobody_in(self):
+        ToolAccess.objects.filter(tool=self.tool).update(group_keys=[])
+        user, _ = make_user(groups=["board"], two_factor=True)
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_removing_a_tool_removes_its_list(self):
+        self.tool.delete()
+        self.assertFalse(ToolAccess.objects.exists())
+
+    def seconds_until_expiry(self, data):
+        token = Token.objects.by_value(data["access_token"]).get()
+        return (token.expires_at - timezone.now()).total_seconds()
+
+    def test_a_token_lasts_the_tools_session_length(self):
+        ToolAccess.objects.filter(tool=self.tool).update(session_hours=12)
+        user, _ = make_user(groups=["board"], two_factor=True)
+        self.client.force_login(user)
+        data = self.exchange(self.get_code()).json()
+        self.assertEqual(data["expires_in"], 12 * 3600)
+        self.assertAlmostEqual(self.seconds_until_expiry(data), 12 * 3600, delta=30)
+
+    def test_with_no_session_length_a_token_is_short_lived(self):
+        user, _ = make_user(groups=["board"], two_factor=True)
+        self.client.force_login(user)
+        data = self.exchange(self.get_code()).json()
+        self.assertEqual(data["expires_in"], 600)
+        self.assertAlmostEqual(self.seconds_until_expiry(data), 600, delta=30)
+
+    def test_another_tools_session_length_does_not_change_this_ones(self):
+        ToolAccess.objects.filter(tool=self.tool).update(session_hours=12)
+        other = make_tool("other", "https://other.example.org/callback")
+        user, _ = make_user(groups=["member"])
+        self.client.force_login(user)
+        response = self.client.get(self.authorize_url(client_id=other.id, redirect_uri="https://other.example.org/callback"))
+        code = parse_qs(urlparse(response.headers["Location"]).query)["code"][0]
+        data = self.exchange(code, client_id=other.id, redirect_uri="https://other.example.org/callback").json()
+        self.assertEqual(data["expires_in"], 600)
+
+
+class ToolGroupCommands(ToolCommand):
+    def access_of(self, name):
+        return Client.objects.get(name=name).access.group_keys
+
+    def test_adding_a_tool_with_groups_limits_it(self):
+        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=board", "--group=operator")
+        self.assertEqual(self.access_of("vault"), ["board", "operator"])
+
+    def test_adding_a_tool_with_no_groups_leaves_it_open(self):
+        self.run_command("add", "git", "https://git.example.org/callback")
+        self.assertFalse(ToolAccess.objects.filter(tool__name="git").exists())
+
+    def test_a_custom_group_goes_by_its_marked_name(self):
+        Group.objects.create(name="Alumni")
+        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=custom:Alumni")
+        self.assertEqual(self.access_of("vault"), ["custom:Alumni"])
+
+    def test_a_group_that_does_not_exist_is_refused_with_no_tool_left_behind(self):
+        for group in ("bord", "custom:Nobody", "custom:board", ""):
+            with self.subTest(group), self.assertRaisesRegex(CommandError, "No such group"):
+                self.run_command("add", "vault", "https://vault.example.org/callback", f"--group={group}")
+        self.assertFalse(Client.objects.filter(name="vault").exists())
+
+    def test_listing_shows_who_can_use_each_tool(self):
+        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=board", "--group=operator")
+        self.run_command("add", "git", "https://git.example.org/callback")
+        output = self.run_command("list")
+        self.assertIn("https://vault.example.org/callback  (board, operator)", output)
+        self.assertIn("https://git.example.org/callback  (any account)", output)
+
+    def test_a_limited_tool_can_have_longer_sessions(self):
+        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=board", "--session-hours=12")
+        self.assertEqual(Client.objects.get(name="vault").access.session_hours, 12)
+        self.assertIn("(board, 12 hour sessions)", self.run_command("list"))
+
+    def test_only_a_limited_tool_can_have_longer_sessions(self):
+        with self.assertRaisesRegex(CommandError, "limited"):
+            self.run_command("add", "vault", "https://vault.example.org/callback", "--session-hours=12")
+        self.assertFalse(Client.objects.filter(name="vault").exists())
+
+    def test_a_session_can_last_at_most_a_day(self):
+        for hours in (0, 25, -1):
+            with self.subTest(hours), self.assertRaisesRegex(CommandError, "1 to 24"):
+                self.run_command("add", "vault", "https://vault.example.org/callback", "--group=board", f"--session-hours={hours}")
+        self.assertFalse(Client.objects.filter(name="vault").exists())
 
 
 class OperatorsAndTools(Service):

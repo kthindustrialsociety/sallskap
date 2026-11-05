@@ -126,7 +126,7 @@ Each module is a folder under `modules/<name>/` containing:
 
 | File | Required | Content |
 |---|---|---|
-| `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access group, setup questions |
+| `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access group, session length if it needs its own, setup questions |
 | `compose.yml` | yes | The module's containers, with memory limits |
 | `site.caddy` | if web-facing | Caddy routing lines, imported automatically, with `__HOST__` for its hostname |
 | `backup.sh` | optional | Pre-backup step, e.g. a database dump |
@@ -242,7 +242,7 @@ An installation has one **primary domain** and any number of **site domains**.
 ## 8. Identity and access
 
 - **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect).
-- **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
+- **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. A tool that can't do this, such as Vaultwarden, can be limited to certain groups in core instead. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
 - **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access at their next login everywhere.
 - **Sessions:** short lifetimes for sensitive modules (vault: 8–24 h).
 - **Two-factor authentication:** required for the board, treasurer and operator groups; optional for members.
@@ -320,7 +320,7 @@ An association should never have to ask its provider how the server works. The k
 | `kit init <domain>` | Create the first config (the setup wizard does this in a browser) |
 | `kit admin <email>` | Create the first admin, or restore someone's Operator access and clear any login lockouts. `--reset-2fa` also removes their 2FA |
 | `kit link <email>` | Create a one-time link that lets someone choose a password. It doesn't log them in, so it can't get around 2FA |
-| `kit tool add <name> <callback>` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once; list tools; remove a tool and end its access |
+| `kit tool add <name> <callback> [--group <group>] [--session-hours <1-24>]` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once, optionally limited to certain groups; list tools; remove a tool and end its access |
 | `kit enable <module>` | Ask the setup questions, show any DNS record needed, start the module |
 | `kit disable <module>` | Stop the module and keep its data |
 | `kit remove <module>` | Delete its data after confirmation |
@@ -412,6 +412,6 @@ Moving to another server or provider is `kit restore` onto a fresh installation 
 
 1. **Name.** "Sällskap" is a working title.
 2. **Chat:** Zulip (better UX; phone notifications need Zulip's relay service) or Matrix (fully FOSS, lighter, federated)?
-3. **Vaultwarden login through core:** is its OpenID Connect support mature enough for phase 1?
+3. **Vaultwarden login through core:** answered at step 4 of the build: yes, without a fork. See `modules/vault/README.md` for its limits.
 4. **Payments:** membership fees via Swish, reconciled manually or through an integration? Out of scope for v1 unless decided otherwise.
 5. **Setup link on cloud-init installs:** nobody sees the installer's output when it runs from a "user data" field, so the one-time link needs another route. One option is a token the person generates and includes in the pasted snippet.

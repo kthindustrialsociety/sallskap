@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website` and `git` modules, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
 
 ## Check a server
 
@@ -26,7 +26,8 @@ bash install.sh --check
 | `core/` | Django: accounts, login and the admin page. Who sees what is set in `core/accounts/roles.py` |
 | `modules/website/` | Public sites and redirects |
 | `modules/git/` | Forgejo, with login through core |
-| `modules/<name>/` | `vault`, `chat`, `files` (planned) |
+| `modules/vault/` | Vaultwarden, with login through core |
+| `modules/<name>/` | `chat`, `files` (planned) |
 | `tests/` | Tests for the kit, and `live_check.py` for a running server |
 
 ## Get people in
@@ -53,6 +54,7 @@ Core is the login service for every other tool, using OpenID Connect. A module d
 
 ```sh
 kit tool add mytool https://tool.example.org/callback   # prints its settings, and the secret once
+kit tool add mytool https://tool.example.org/callback --group board --group operator   # only these groups can log in
 kit tool list
 kit tool remove mytool                                  # ends its access
 ```

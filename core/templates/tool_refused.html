@@ -1,0 +1,7 @@
+{% extends "allauth/layouts/base.html" %}
+{% load i18n %}
+{% block head_title %}{% translate "No access" %}{% endblock head_title %}
+{% block content %}
+  <h1>{% translate "No access" %}</h1>
+  <p>{% blocktranslate with name=tool.name email=request.user.email %}{{ email }} doesn't have access to {{ name }}. An Operator can give you access by adding you to the right group.{% endblocktranslate %}</p>
+{% endblock content %}

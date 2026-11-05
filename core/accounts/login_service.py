@@ -16,10 +16,25 @@ from django.shortcuts import redirect, render
 from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
-from oauthlib.oauth2.rfc6749.errors import MismatchingRedirectURIError
+from oauthlib.oauth2.rfc6749.errors import InvalidTokenError, MismatchingRedirectURIError
+
+from .models import ToolAccess
 
 SCOPES = ["openid", "email", "profile", "groups"]
-CLAIMS = ["sub", "email", "email_verified", "name", "preferred_username", "groups"]
+CLAIMS = ["sub", "email", "name", "preferred_username", "groups"]
+
+
+ACCESS_TOKEN_SECONDS = 10 * 60  # most tools only need it just after someone logs in
+
+
+def may_use(user, tool):
+    access = ToolAccess.objects.filter(tool=tool).first()
+    return access is None or bool(set(access.group_keys) & set(user.group_keys()))
+
+
+def access_token_seconds(request):
+    access = ToolAccess.objects.filter(tool=request.client).first()
+    return access.session_hours * 3600 if access and access.session_hours else ACCESS_TOKEN_SECONDS
 
 
 class LoginServiceAdapter(DefaultOIDCAdapter):
@@ -34,10 +49,16 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
         return secrets.token_urlsafe(48)
 
     def get_claims(self, purpose, user, client, scopes, email=None, **kwargs):
+        # Every token and every question about one comes through here, so someone who
+        # has left a tool's groups since logging in gets no further either.
+        if not may_use(user, client):
+            raise InvalidTokenError()
         claims = {"sub": self.get_user_sub(client, user)}
         if "email" in scopes:
-            # Not verified: nothing sends email yet, and an Operator typed it in.
-            claims.update(email=user.email, email_verified=False)
+            # No email_verified: nothing sends email yet, and an Operator typed it in, so
+            # core doesn't know. Tools read an explicit false as a claim that it's wrong,
+            # and Vaultwarden refuses the person. Mail can start sending true.
+            claims["email"] = user.email
         if "profile" in scopes:
             claims.update(name=user.get_full_name(), preferred_username=user.tool_username())
         if "groups" in scopes:
@@ -59,18 +80,26 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
 @method_decorator(csrf_exempt, name="dispatch")  # as on the view this extends
 class AuthorizationView(ProviderAuthorizationView):
     """The door other tools send people through. Someone whose group requires 2FA
-    can't get through without it, or every other tool would be a way around the rule."""
+    can't get through without it, or every other tool would be a way around the rule.
+    A tool can also be limited to certain groups: the group check comes first, as
+    there's no point in setting up 2FA for a tool someone can't use."""
 
     def dispatch(self, request, *args, **kwargs):
         if self.has_wrong_return_address(request):
             return render(request, "idp/oidc/error.html", {"error": MismatchingRedirectURIError()})
-        if request.user.is_authenticated and request.user.needs_2fa_setup:
-            if "none" in request.GET.get("prompt", "").split():
-                # The tool asked us not to show anything, so it has to be told no.
-                request.user = AnonymousUser()
-            else:
-                messages.warning(request, _("Set up two-factor authentication, then log in to the tool again."))
-                return redirect("mfa_index")
+        if request.user.is_authenticated:
+            # A form post carries no tool here, but it's sent back to this address first.
+            tool = Client.objects.filter(pk=request.GET.get("client_id")).first()
+            refused = tool is not None and not may_use(request.user, tool)
+            if refused or request.user.needs_2fa_setup:
+                if "none" in request.GET.get("prompt", "").split():
+                    # The tool asked us not to show anything, so it has to be told no.
+                    request.user = AnonymousUser()
+                elif refused:
+                    return render(request, "tool_refused.html", {"tool": tool}, status=403)
+                else:
+                    messages.warning(request, _("Set up two-factor authentication, then log in to the tool again."))
+                    return redirect("mfa_index")
         return super().dispatch(request, *args, **kwargs)
 
     def has_wrong_return_address(self, request):

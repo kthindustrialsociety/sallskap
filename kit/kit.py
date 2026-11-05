@@ -34,6 +34,7 @@ MAX_UPLOAD_BYTES = 2 * 1024**3
 MAX_UPLOAD_FILES = 100_000
 CORE_UID = 10001  # the user core runs as: see core/Dockerfile
 FORGEJO_UID = 1000  # the user Forgejo's rootless image runs as
+VAULT_UID = 10002  # the user Vaultwarden runs as: see modules/vault/compose.yml
 
 SITE_HEADER = "[[website.sites]]"
 SITE_FIELDS = {"domain", "aliases", "spa", "www"}
@@ -56,6 +57,7 @@ class Paths:
     deploy_home: Path = Path(os.environ.get("SALLSKAP_DEPLOY_HOME", "/var/lib/sallskap-deploy"))
     core_dir: Path = Path(os.environ.get("SALLSKAP_CORE_DIR", "/srv/core"))
     git_dir: Path = Path(os.environ.get("SALLSKAP_GIT_DIR", "/srv/git"))
+    vault_dir: Path = Path(os.environ.get("SALLSKAP_VAULT_DIR", "/srv/vault"))
 
     @property
     def config(self) -> Path:
@@ -68,6 +70,10 @@ class Paths:
     @property
     def git_env(self) -> Path:
         return self.config_dir / "git.env"
+
+    @property
+    def vault_env(self) -> Path:
+        return self.config_dir / "vault.env"
 
     @property
     def caddyfile(self) -> Path:
@@ -630,6 +636,49 @@ PREPARE["git"] = prepare_git
 SETUP["git"] = setup_git
 
 
+# ---- The vault module --------------------------------------------------------
+
+
+VAULT_TOOL = "vaultwarden"  # its name in core's login service
+
+
+def _write_vault_env(paths: Paths, config: Config, client_id: str = "", secret: str = "") -> None:
+    settings = {
+        "DOMAIN": f"https://vault.{config.domain}",
+        "SSO_AUTHORITY": f"https://app.{config.domain}",
+        "SSO_CLIENT_ID": client_id,
+        "SSO_CLIENT_SECRET": secret,
+    }
+    _write_atomic(paths.vault_env, "".join(f"{name}={value}\n" for name, value in settings.items()), 0o600)
+
+
+def prepare_vault(paths: Paths, config: Config) -> None:
+    """Core is already up when this runs, so the login is connected before Vaultwarden
+    first starts, and it's never reachable without one. A tool's secret is only shown
+    when it's made, so if one side is missing, both get a new one. The old secret goes
+    first, so stopping partway can only leave a side missing."""
+    current = _read_env(paths.vault_env)
+    registered = re.search(rf"^{VAULT_TOOL}\s", _core_output("tool", "list"), re.M)
+    if not (registered and current.get("SSO_CLIENT_SECRET")):
+        _write_vault_env(paths, config)
+        if registered:
+            _core_output("tool", "remove", VAULT_TOOL)
+        manifest = module_manifest("vault")
+        rules = [f"--group={group}" for group in manifest["access"]] + [f"--session-hours={manifest['session_hours']}"]
+        output = _core_output("tool", "add", VAULT_TOOL, f"https://vault.{config.domain}/identity/connect/oidc-signin", *rules)
+        fields = dict(re.findall(r"^\s+(Client ID|Secret):\s+(\S+)$", output, re.M))
+        if len(fields) != 2:
+            raise KitError("Core registered Vaultwarden, but kit couldn't read its settings. Run this again.")
+        current = {"SSO_CLIENT_ID": fields["Client ID"], "SSO_CLIENT_SECRET": fields["Secret"]}
+    _write_vault_env(paths, config, current["SSO_CLIENT_ID"], current["SSO_CLIENT_SECRET"])
+    paths.vault_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chown(paths.vault_dir, VAULT_UID, VAULT_UID)
+
+
+PREPARE["vault"] = prepare_vault
+
+
 # ---- Sites: config and credentials -------------------------------------------
 
 
@@ -855,6 +904,8 @@ def build_parser() -> argparse.ArgumentParser:
     tool_add = tool.add_parser("add", help="register a tool, and show its settings and secret once")
     tool_add.add_argument("name")
     tool_add.add_argument("callback", help="the exact https address the tool wants people sent back to")
+    tool_add.add_argument("--group", action="append", default=[], help="only this group may log in (repeatable). Without any, every account can")
+    tool_add.add_argument("--session-hours", type=int, help="for a tool limited to groups whose sessions last as long as its access token (1-24)")
     tool.add_parser("list", help="show the registered tools")
     tool.add_parser("remove", help="remove a tool and end its access").add_argument("name")
 
@@ -898,7 +949,10 @@ def main(argv: list[str] | None = None) -> int:
             return _manage("password_link", _check_email(args.email))
         elif args.command == "tool":
             if args.tool_action == "add":
-                return _manage("tool", "add", _check_tool_name(args.name), _check_callback(args.callback))
+                rules = [f"--group={group}" for group in args.group]  # the = stops it being read as an option
+                if args.session_hours is not None:
+                    rules.append(f"--session-hours={args.session_hours}")
+                return _manage("tool", "add", _check_tool_name(args.name), _check_callback(args.callback), *rules)
             if args.tool_action == "remove":
                 return _manage("tool", "remove", _check_tool_name(args.name))
             return _manage("tool", "list")
