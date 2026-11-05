@@ -21,7 +21,7 @@ from oauthlib.oauth2.rfc6749.errors import InvalidTokenError, MismatchingRedirec
 from .models import ToolAccess
 
 SCOPES = ["openid", "email", "profile", "groups"]
-CLAIMS = ["sub", "email", "email_verified", "name", "preferred_username", "groups"]
+CLAIMS = ["sub", "email", "name", "preferred_username", "groups"]
 
 
 ACCESS_TOKEN_SECONDS = 10 * 60  # most tools only need it just after someone logs in
@@ -55,8 +55,10 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
             raise InvalidTokenError()
         claims = {"sub": self.get_user_sub(client, user)}
         if "email" in scopes:
-            # Not verified: nothing sends email yet, and an Operator typed it in.
-            claims.update(email=user.email, email_verified=False)
+            # No email_verified: nothing sends email yet, and an Operator typed it in, so
+            # core doesn't know. Tools read an explicit false as a claim that it's wrong,
+            # and Vaultwarden refuses the person. Mail can start sending true.
+            claims["email"] = user.email
         if "profile" in scopes:
             claims.update(name=user.get_full_name(), preferred_username=user.tool_username())
         if "groups" in scopes:

@@ -275,7 +275,7 @@ class Claims(Service):
         claims = self.login_claims(user)
         self.assertEqual(claims["sub"], str(user.pk))
         self.assertEqual(claims["email"], "anna.lind@example.org")
-        self.assertIs(claims["email_verified"], False)
+        self.assertNotIn("email_verified", claims)  # nothing has checked it, so core doesn't say
         self.assertEqual(claims["name"], "Anna Lind")
         self.assertEqual(claims["preferred_username"], "anna.lind")
         self.assertEqual(claims["nonce"], "nonce-from-the-tool")
