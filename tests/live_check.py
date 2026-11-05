@@ -3024,11 +3024,15 @@ def check_the_copy_can_be_read_back(host):
         check(f"{name}'s database came back", copy.exists(), str(copy))
         if not copy.exists():
             continue
-        # Copied with the container stopped, so it needs no -wal file to be whole.
-        for extra in ("-wal", "-shm"):
-            if (copy.parent / (copy.name + extra)).exists():
-                (copy.parent / (copy.name + extra)).unlink()
-        connection = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        # These run in WAL mode, and a stopped container doesn't always leave the log
+        # checkpointed: Forgejo's held 4 MB of recent writes. So the log has to be in the
+        # backup beside the database, or hours of work would go missing without a word.
+        if Path(path + "-wal").exists():
+            in_backup = (copy.parent / (copy.name + "-wal")).exists()
+            check(f"...so did {name}'s write-ahead log, where its recent writes are", in_backup)
+        # Opened read-write, on this copy only, so SQLite replays the log as it would
+        # on a restored server.
+        connection = sqlite3.connect(str(copy))
         try:
             sound = connection.execute("pragma integrity_check").fetchone()[0]
             rows = connection.execute(f'select count(*) from "{table}"').fetchone()[0]
