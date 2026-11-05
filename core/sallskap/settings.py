@@ -150,7 +150,16 @@ MFA_TOTP_TOLERANCE = 1  # accepts the neighbouring 30 seconds, for phones with a
 IDP_OIDC_ADAPTER = "accounts.login_service.LoginServiceAdapter"
 IDP_OIDC_PRIVATE_KEY = base64.b64decode(os.environ.get("OIDC_SIGNING_KEY", "")).decode()
 IDP_OIDC_AUTH_METHODS = ["client_secret_basic", "client_secret_post"]  # every tool has a secret
-IDP_OIDC_ACCESS_TOKEN_EXPIRES_IN = 10 * 60  # tools only need it just after someone logs in
+
+
+def _access_token_seconds(request):
+    """A function, as this differs by tool. The import has to wait until the apps are loaded."""
+    from accounts.login_service import access_token_seconds
+
+    return access_token_seconds(request)
+
+
+IDP_OIDC_ACCESS_TOKEN_EXPIRES_IN = _access_token_seconds
 
 # Nothing sends mail yet. Until it does, people get in with `kit link`.
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
