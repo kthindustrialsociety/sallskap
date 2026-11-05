@@ -2906,6 +2906,7 @@ def check_backup_runs(host, sites):
     section("Backups: taking one")
     first_time = not (BACKUP_DIR / "repo").exists()
     caddy_started = container_state(CADDY)["State"]["StartedAt"]
+    was_started = {name: container_state(c)["State"]["StartedAt"] for name, c in module_containers().items()}
     stop = threading.Event()
     answers, watcher = watch_while([host, *sites], stop)
     started = time.monotonic()
@@ -2936,6 +2937,8 @@ def check_backup_runs(host, sites):
         state = container_state(container)["State"]
         health = state.get("Health", {}).get("Status", state.get("Status"))
         check(f"{name} is healthy again", health in ("healthy", "running"), str(health))
+        # The whole point of the pause: nothing was writing while its files were read.
+        check(f"...and {name} was stopped for the copy, not read while running", state["StartedAt"] != was_started[name])
     check("Caddy never stopped, which is why the public sites didn't", container_state(CADDY)["State"]["StartedAt"] == caddy_started)
     wait_for_sync()
     check("Nothing is left waiting to be sent to a tool", core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0)
@@ -3126,13 +3129,21 @@ def check_the_vaults_emergency_copy_is_stopped(host):
     check("`kit status` no longer mentions it", "emergency copy is running" not in kit("status").stdout)
 
 
-def check_two_backups_at_once(host):
-    section("Backups: two at once")
+def check_what_is_refused(host):
+    section("Backups: what kit refuses")
     held = BACKUP_DIR / "kit.lock"
     with held.open("w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = kit("backup")
     check("A second backup is refused rather than interleaved", result.returncode == 1 and "Another backup is already running" in result.stdout + result.stderr, result.stdout[-200:])
+
+    # Someone could type this on the wrong server. It must stop before touching anything.
+    live = Path("/srv/core/db.sqlite3")
+    before = (live.stat().st_mtime, live.stat().st_size)
+    attempt = kit("restore")
+    check("A restore over a working installation is refused", attempt.returncode == 1 and "already has an installation" in attempt.stdout + attempt.stderr, attempt.stdout[-200:])
+    check("...and it changed nothing", (live.stat().st_mtime, live.stat().st_size) == before)
+    check("...and everything is still running", container_state("sallskap-core-1")["State"].get("Health", {}).get("Status") == "healthy")
 
 
 def backups():
@@ -3146,7 +3157,7 @@ def backups():
     check_the_copy_can_be_read_back(host)
     check_a_copy_can_leave_the_server(host)
     check_the_vaults_emergency_copy_is_stopped(host)
-    check_two_backups_at_once(host)
+    check_what_is_refused(host)
 
 
 def prepare():
