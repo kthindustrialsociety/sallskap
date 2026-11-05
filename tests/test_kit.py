@@ -1390,6 +1390,151 @@ class WorkerSettings(unittest.TestCase):
         self.assertNotIn("board", kit.module_manifest("git")["collaborator_groups"])
 
 
+class Emergency(unittest.TestCase):
+    """Runs the commands with Docker replaced, recording what it was asked to do."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nvault = true\ngit = true\n')
+        self.calls = []
+        self.running = False
+
+        def fake_run(command, *args, **kwargs):
+            self.calls.append(command)
+            line = " ".join(command)
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0 if self.running else 1, "172.18.0.9\n" if self.running else "", "")
+            if command[:2] == ["docker", "rm"]:  # succeeds whether or not there's anything to remove
+                self.running = False
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if " run " in line:
+                self.running = True
+            if "generate-access-token" in line:
+                return subprocess.CompletedProcess(command, 0, "0123456789abcdef0123456789abcdef01234567\n", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        for patcher in (mock.patch.object(kit.subprocess, "run", fake_run), mock.patch.object(kit, "Paths", return_value=self.paths)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_kit(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kit.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def started(self):
+        return next(call for call in self.calls if "run" in call)
+
+    def test_it_turns_on_password_login_only_in_the_copy(self):
+        self.run_kit("emergency", "vault")
+        command = " ".join(self.started())
+        self.assertIn("--env SSO_ENABLED=false", command)
+        self.assertIn("--env SSO_ONLY=false", command)
+        self.assertIn("--env DOMAIN=https://localhost:8222", command)
+        self.assertEqual(self.started()[-1], "vaultwarden")
+        self.assertIn('SSO_ONLY: "true"', compose_services()["vaultwarden"])
+
+    def test_nothing_about_it_can_be_reached_except_over_ssh(self):
+        self.run_kit("emergency", "vault")
+        command = self.started()
+        for flag in ("--publish", "-p", "--service-ports", "--use-aliases"):
+            self.assertNotIn(flag, command)
+
+    def test_it_serves_https_as_its_web_page_refuses_anything_else(self):
+        self.run_kit("emergency", "vault")
+        command = " ".join(self.started())
+        self.assertIn('ROCKET_TLS={certs="/data/emergency-tls/cert.pem",key="/data/emergency-tls/key.pem"}', command)
+
+    def test_its_certificate_is_only_for_localhost_and_goes_when_it_stops(self):
+        self.run_kit("emergency", "vault")
+        made = next(call for call in self.calls if call[0] == "openssl")
+        self.assertIn("subjectAltName=DNS:localhost", made)
+        self.assertIn("-nodes", made)
+        self.assertEqual(made[made.index("-days") + 1], "7")
+        folder = self.paths.vault_dir / "emergency-tls"
+        self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+        self.run_kit("emergency", "vault", "--off")
+        self.assertFalse(folder.exists())
+
+    def test_it_turns_off_its_admin_page(self):
+        self.run_kit("emergency", "vault")
+        self.assertIn("ADMIN_TOKEN=", self.started())
+
+    def test_it_doesnt_depend_on_core(self):
+        self.run_kit("emergency", "vault")
+        self.assertIn("--no-deps", self.started())
+        self.assertFalse([call for call in self.calls if "manage.py" in call])
+
+    def test_it_says_how_to_reach_it(self):
+        code, out = self.run_kit("emergency", "vault")
+        self.assertEqual(code, 0)
+        self.assertIn("ssh -L 8222:172.18.0.9:8080", out)
+        self.assertIn("https://localhost:8222", out)
+        self.assertIn("warn about the certificate", out)
+        self.assertIn("kit emergency vault --off", out)
+
+    def test_asking_twice_starts_one(self):
+        self.run_kit("emergency", "vault")
+        self.run_kit("emergency", "vault")
+        self.assertEqual(len([call for call in self.calls if "run" in call]), 1)
+
+    def test_it_can_be_stopped(self):
+        self.run_kit("emergency", "vault")
+        code, out = self.run_kit("emergency", "vault", "--off")
+        self.assertEqual(code, 0)
+        self.assertIn("Stopped", out)
+        self.assertFalse(self.running)
+        self.assertIn("wasn't running", self.run_kit("emergency", "vault", "--off")[1])
+
+    def test_a_git_token_goes_on_their_own_account(self):
+        code, out = self.run_kit("emergency", "git", "someone")
+        self.assertEqual(code, 0)
+        command = " ".join(next(call for call in self.calls if "generate-access-token" in call))
+        self.assertIn("--username someone ", command)
+        self.assertNotIn(kit.FORGEJO_SERVICE_USER, command)
+        self.assertIn("0123456789abcdef0123456789abcdef01234567", out)
+        self.assertIn("Settings, Applications", out)
+
+    def test_a_git_token_doesnt_depend_on_core(self):
+        self.run_kit("emergency", "git", "someone")
+        self.assertFalse([call for call in self.calls if "manage.py" in call])
+
+    def test_it_refuses_a_module_thats_off(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        for args in (("emergency", "vault"), ("emergency", "git", "someone")):
+            with self.subTest(args):
+                code, out = self.run_kit(*args)
+                self.assertEqual(code, 1)
+                self.assertIn("isn't enabled", out)
+        self.assertEqual(self.calls, [])
+
+    def test_status_says_if_the_copy_is_still_running(self):
+        address = lambda *args, **kwargs: io.BytesIO(b"203.0.113.1")
+        with mock.patch.object(kit, "_resolve_ipv4", return_value={"203.0.113.1"}), mock.patch.object(kit.urllib.request, "urlopen", address):
+            self.run_kit("emergency", "vault")
+            _, running = self.run_kit("status")
+            self.run_kit("emergency", "vault", "--off")
+            _, stopped = self.run_kit("status")
+        self.assertIn("emergency copy is running", running)
+        self.assertNotIn("emergency copy is running", stopped)
+
+    def test_a_name_that_could_be_read_as_an_option_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for name in ("-x", "--admin", "a b", "a/b"):
+                with self.subTest(name):
+                    try:
+                        code, _ = self.run_kit("emergency", "git", name)
+                    except SystemExit as stopped:  # argparse refuses some of these itself
+                        code = stopped.code
+                    self.assertNotEqual(code, 0)
+        self.assertEqual(self.calls, [])
+
+
 class CommandLine(unittest.TestCase):
     def test_a_problem_gives_a_message_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1436,6 +1581,10 @@ class Packaging(unittest.TestCase):
         self.assertIn("image: sallskap-core:local", worker)
         self.assertIn("./modules:/modules:ro", worker)
         self.assertIn("condition: service_healthy", worker)
+
+    def test_vaultwardens_admin_page_is_closed_at_caddy(self):
+        """Its admin token is on now, so this is what keeps the page off the internet."""
+        self.assertIn("path /admin /admin/*", (ROOT / "modules" / "vault" / "site.caddy").read_text())
 
     def test_core_is_the_only_way_into_vaultwarden(self):
         vault = compose_services()["vaultwarden"]
