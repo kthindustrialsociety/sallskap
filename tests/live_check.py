@@ -7,12 +7,16 @@ with a real certificate. Run on the server as root. It creates fake users at
     python3 tests/live_check.py verify    after a rebuild, reboot or second setup:
                                           did logins and data survive?
     python3 tests/live_check.py burst     many logins at once: does the memory limit hold?
+    python3 tests/live_check.py backups   take a real backup and read it back. This one
+                                          makes no fake users, so it's safe on a real
+                                          installation, though logins pause for it
     python3 tests/live_check.py cleanup   remove the fake users
 
 Standard library only, as the rest of the kit's tooling is.
 """
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import html
@@ -20,12 +24,14 @@ import http.client
 import json
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import ssl
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -2801,6 +2807,322 @@ def verify_access(host, state):
     check("Nothing is waiting to be sent", core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0)
 
 
+# ---- Backups --------------------------------------------------------------------
+
+
+BACKUP_DIR = Path("/srv/backup")
+BACKUP_ENV = Path("/etc/sallskap/backup.env")
+SCRATCH = Path("/root/.sallskap-restore-check")
+
+
+def site_domains():
+    return [site["domain"] for site in tomllib.loads(CONFIG.read_text()).get("website", {}).get("sites", [])]
+
+
+def backup_password():
+    return dict(
+        line.split("=", 1) for line in BACKUP_ENV.read_text().splitlines() if "=" in line
+    )["RESTIC_PASSWORD"]
+
+
+def restic(*args, password=None, repo=None):
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": "/root",
+        "RESTIC_PASSWORD": password or backup_password(),
+    }
+    return subprocess.run(
+        ["restic", "--repo", str(repo or BACKUP_DIR / "repo"), *args],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+
+def latest_snapshot():
+    result = restic("snapshots", "--latest", "1", "--tag", "sallskap", "--json")
+    return json.loads(result.stdout)[-1] if result.returncode == 0 and result.stdout.strip() else {}
+
+
+def watch_while(hosts, stop):
+    """Poll each host over HTTPS until told to stop, and report what answered. This is
+    what shows that the public sites stay up while logins are paused for a backup."""
+    answers = {host: [] for host in hosts}
+
+    def poll():
+        context = ssl.create_default_context()
+        while not stop.is_set():
+            for host in hosts:
+                try:
+                    connection = http.client.HTTPSConnection(host, context=context, timeout=4)
+                    connection.request("GET", "/")
+                    answers[host].append(connection.getresponse().status)
+                    connection.close()
+                except Exception:  # a refused or dropped connection is the answer here
+                    answers[host].append(0)
+            time.sleep(0.2)
+
+    watcher = threading.Thread(target=poll, daemon=True)
+    watcher.start()
+    return answers, watcher
+
+
+def check_backup_before_the_first_one(host):
+    section("Backups: before the first one")
+    check("restic is installed", bool(shutil.which("restic")))
+    timer = subprocess.run(
+        ["systemctl", "is-enabled", "sallskap-backup.timer"], capture_output=True, text=True
+    ).stdout.strip()
+    check("A backup is scheduled every night", timer == "enabled", timer)
+    next_run = subprocess.run(
+        ["systemctl", "show", "-p", "NextElapseUSecRealtime", "--value", "sallskap-backup.timer"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    check("...and its next run is in the future", bool(next_run) and next_run != "0", next_run)
+    if not (BACKUP_DIR / "repo").exists():
+        check("`kit status` says nothing has been backed up yet", "no backups have been taken yet" in kit("status").stdout)
+
+
+def check_backup_runs(host, sites):
+    section("Backups: taking one")
+    first_time = not (BACKUP_DIR / "repo").exists()
+    stop = threading.Event()
+    answers, watcher = watch_while([host, *sites], stop)
+    started = time.monotonic()
+    result = kit("backup")
+    took = time.monotonic() - started
+    stop.set()
+    watcher.join(timeout=10)
+
+    check("`kit backup` finishes without an error", result.returncode == 0, result.stdout[-700:] + result.stderr[-700:])
+    check("...and says how long logins were paused", "paused for" in result.stdout, result.stdout[-200:])
+    print(f"  ----  the whole command took {took:.0f} s; it reported: {_paused_line(result.stdout)}")
+    if first_time:
+        check("...and prints the backup password the first time only", "can't be recovered" in result.stdout)
+
+    for site in sites:
+        seen = answers.get(site, [])
+        check(f"The public site {site} stayed up throughout", bool(seen) and set(seen) == {200}, f"{len(seen)} requests: {sorted(set(seen))}")
+    logins = answers.get(host, [])
+    check(
+        "Logins were paused while the copy was taken",
+        bool(logins) and 0 in logins,
+        f"{len(logins)} requests: {sorted(set(logins))}",
+    )
+    check("...and answer again afterwards", Browser(host).get("/accounts/login/").status == 200)
+    services = ["core", "sync"] + (["forgejo"] if git_enabled() else []) + (["vaultwarden"] if vault_enabled() else [])
+    for service in services:
+        state = docker_inspect(service)["State"]
+        health = state.get("Health", {}).get("Status", state.get("Status"))
+        check(f"{service} is healthy again", health in ("healthy", "running"), str(health))
+    wait_for_sync()
+    check("Nothing is left waiting to be sent to a tool", core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0)
+    return took
+
+
+def _paused_line(output):
+    return next((line.strip() for line in output.splitlines() if "paused for" in line), "nothing")
+
+
+def check_what_is_in_a_backup(host):
+    section("Backups: what's in one")
+    snapshot = latest_snapshot()
+    check("There's a snapshot tagged for this installation", bool(snapshot), str(snapshot)[:200])
+    if not snapshot:
+        return
+    # What every module declares, switched on or not, as disabling one keeps its data.
+    wanted = {"/etc/sallskap", "/srv/core", "/srv/caddy", "/var/lib/sallskap-deploy"}
+    for manifest in (ROOT / "modules").glob("*/module.toml"):
+        for declared in tomllib.loads(manifest.read_text()).get("data", []):
+            if Path(declared).exists():
+                wanted.add(declared)
+    check("It covers the config, core, and every module's data", wanted <= set(snapshot["paths"]), str(sorted(wanted - set(snapshot["paths"]))))
+    check("...and nothing else", not set(snapshot["paths"]) - wanted, str(sorted(set(snapshot["paths"]) - wanted)))
+    check("It doesn't hold the backups themselves", "/srv/backup" not in snapshot["paths"])
+
+    tags = set(snapshot["tags"])
+    running = {}
+    for service in ("forgejo", "vaultwarden"):
+        image = docker_inspect(service)["Config"]["Image"]
+        running[image.rsplit("/", 1)[-1].split(":")[0]] = image.rsplit(":", 1)[-1]
+    for name, version in running.items():
+        check(f"It records the {name} version it was taken with", f"image:{name}={version}" in tags, str(sorted(tags)))
+    commit = subprocess.run(
+        ["git", "-C", "/opt/sallskap", "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    check("...and which version of the kit took it", f"version:{commit}" in tags, str(sorted(tags)))
+
+    listed = restic("ls", "latest").stdout
+    for path in (
+        "/srv/core/db.sqlite3",
+        "/etc/sallskap/core.env",
+        "/etc/sallskap/sync.env",
+        "/etc/sallskap/backup.env",
+        "/srv/caddy/data",
+        "/var/lib/sallskap-deploy/.ssh/authorized_keys",
+    ):
+        check(f"{path} is in it", path in listed)
+    if git_enabled():
+        check("Forgejo's database is in it", "/srv/git/data/gitea.db" in listed)
+        check("...and its repositories", "/srv/git/git/repositories" in listed)
+    if vault_enabled():
+        check("The vault's database is in it", "/srv/vault/db.sqlite3" in listed)
+
+
+def check_a_backup_is_sound(host):
+    section("Backups: is it readable, and only with the password?")
+    integrity = restic("check", "--read-data")
+    check("restic's own check passes, reading every byte", integrity.returncode == 0, integrity.stdout[-500:])
+    wrong = restic("snapshots", password="not-the-password")
+    check("The wrong password is refused", wrong.returncode != 0 and "wrong password" in (wrong.stdout + wrong.stderr))
+    check(f"Only root can read {BACKUP_DIR}", oct(BACKUP_DIR.stat().st_mode & 0o777) == "0o700", oct(BACKUP_DIR.stat().st_mode & 0o777))
+    check("Only root can read the password", oct(BACKUP_ENV.stat().st_mode & 0o777) == "0o600", oct(BACKUP_ENV.stat().st_mode & 0o777))
+    second = kit("backup")
+    check("Running it again works and doesn't print the password again", second.returncode == 0 and "can't be recovered" not in second.stdout)
+
+
+def check_the_copy_can_be_read_back(host):
+    """Restore into a folder of its own and read what comes out. A full restore onto a
+    fresh server is a separate test; this one shows the copy is usable and consistent."""
+    section("Backups: does what's in it still work?")
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    SCRATCH.mkdir(mode=0o700)
+    restored = restic("restore", "latest", "--target", str(SCRATCH))
+    check("The backup restores", restored.returncode == 0, restored.stderr[-500:])
+    if restored.returncode != 0:
+        return
+
+    databases = [("core", "/srv/core/db.sqlite3", "accounts_user")]
+    if git_enabled():
+        databases.append(("Forgejo", "/srv/git/data/gitea.db", "user"))
+    if vault_enabled():
+        databases.append(("the vault", "/srv/vault/db.sqlite3", "users"))
+    for name, path, table in databases:
+        copy = SCRATCH / path.lstrip("/")
+        check(f"{name}'s database came back", copy.exists(), str(copy))
+        if not copy.exists():
+            continue
+        # Copied with the container stopped, so it needs no -wal file to be whole.
+        for extra in ("-wal", "-shm"):
+            if (copy.parent / (copy.name + extra)).exists():
+                (copy.parent / (copy.name + extra)).unlink()
+        connection = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        try:
+            sound = connection.execute("pragma integrity_check").fetchone()[0]
+            rows = connection.execute(f'select count(*) from "{table}"').fetchone()[0]
+        finally:
+            connection.close()
+        live = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            live_rows = live.execute(f'select count(*) from "{table}"').fetchone()[0]
+        finally:
+            live.close()
+        check(f"...{name}'s copy is a whole database", sound == "ok", sound)
+        check(f"...with every row the server has ({live_rows})", rows == live_rows, f"{rows} of {live_rows}")
+
+    for path in ("/etc/sallskap/core.env", "/etc/sallskap/sync.env", "/etc/sallskap/vault.env", "/etc/sallskap/config.toml"):
+        if not Path(path).exists():
+            continue
+        copy = SCRATCH / path.lstrip("/")
+        same = copy.exists() and copy.read_bytes() == Path(path).read_bytes()
+        check(f"{path} came back exactly as it is", same)
+    if git_enabled():
+        head = SCRATCH / "srv/git/git/repositories"
+        check("Forgejo's repositories came back", head.exists() and any(head.rglob("HEAD")))
+    for domain in site_domains():
+        served = Path(f"/srv/website/{domain}/current")
+        if not served.exists():
+            continue
+        page = served.resolve() / "index.html"
+        copy = SCRATCH / str(page).lstrip("/")
+        check(f"The published page for {domain} came back", copy.exists() and copy.read_bytes() == page.read_bytes(), str(copy))
+        link = SCRATCH / f"srv/website/{domain}/current"
+        check(f"...and {domain} still points at that release", link.is_symlink() and link.resolve().name == served.resolve().name)
+    certificates = list((SCRATCH / "srv/caddy/data").rglob("*.crt"))
+    check("Caddy's certificates came back, so a restore needs no new ones", bool(certificates), f"{len(certificates)} found")
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
+def check_a_copy_can_leave_the_server(host):
+    section("Backups: taking a copy off the server")
+    exported = Path("/root/.sallskap-export-check.tar")
+    exported.unlink(missing_ok=True)
+    result = kit("backup", "export", str(exported))
+    check("`kit backup export` writes one file", result.returncode == 0 and exported.exists(), result.stderr[-300:])
+    if not exported.exists():
+        return
+    check("...only root can read it", oct(exported.stat().st_mode & 0o777) == "0o600")
+    with tarfile.open(exported) as tar:
+        names = tar.getnames()
+    check("...holding the whole repository", "repo/config" in names)
+    check("...and not kit's lock or its own notes", not [n for n in names if "kit.lock" in n or "last-export" in n])
+
+    elsewhere = Path("/root/.sallskap-elsewhere")
+    shutil.rmtree(elsewhere, ignore_errors=True)
+    elsewhere.mkdir(mode=0o700)
+    subprocess.run(["tar", "-xf", str(exported), "-C", str(elsewhere)], check=True)
+    read_back = restic("snapshots", "--json", repo=elsewhere / "repo")
+    check("Unpacked somewhere else, it still reads with the password", read_back.returncode == 0, read_back.stderr[-300:])
+    if read_back.returncode == 0:
+        check("...and holds the same snapshots", len(json.loads(read_back.stdout)) == len(json.loads(restic("snapshots", "--json").stdout)))
+    refused = restic("snapshots", password="not-the-password", repo=elsewhere / "repo")
+    check("...and not without it", refused.returncode != 0)
+
+    # One line over SSH is the way a copy is meant to leave, so check the stream too.
+    streamed = Path("/root/.sallskap-stream-check.tar")
+    with streamed.open("wb") as target:
+        piped = subprocess.run(["/usr/local/bin/kit", "backup", "export", "-"], stdout=target, stderr=subprocess.PIPE)
+    check("Exporting to standard output works, for a copy over SSH", piped.returncode == 0, piped.stderr.decode()[-300:])
+    with tarfile.open(streamed) as tar:
+        check("...and gives the same thing", "repo/config" in tar.getnames())
+
+    status = kit("status").stdout
+    check("`kit status` reports the backup as fresh", "ok   last backup" in status, status[-400:])
+    check("...and that a copy has left the server", "ok   last copy off this server" in status, status[-400:])
+    shutil.rmtree(elsewhere, ignore_errors=True)
+    exported.unlink(missing_ok=True)
+    streamed.unlink(missing_ok=True)
+
+
+def check_the_vaults_emergency_copy_is_stopped(host):
+    if not vault_enabled():
+        return
+    section("Backups: the vault's emergency copy")
+    started = kit("emergency", "vault")
+    check("The emergency copy starts", started.returncode == 0, started.stderr[-300:])
+    running = subprocess.run(["docker", "ps", "--filter", f"name={VAULT_EMERGENCY}", "-q"], capture_output=True, text=True)
+    check("...and is running", bool(running.stdout.strip()))
+    result = kit("backup")
+    check("A backup finishes with it running", result.returncode == 0, result.stderr[-300:])
+    after = subprocess.run(["docker", "ps", "--filter", f"name={VAULT_EMERGENCY}", "-q"], capture_output=True, text=True)
+    check("...and stops it, as it writes to the data being copied", not after.stdout.strip())
+    check("`kit status` no longer mentions it", "emergency copy is running" not in kit("status").stdout)
+
+
+def check_two_backups_at_once(host):
+    section("Backups: two at once")
+    held = BACKUP_DIR / "kit.lock"
+    with held.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = kit("backup")
+    check("A second backup is refused rather than interleaved", result.returncode == 1 and "Another backup is already running" in result.stdout + result.stderr, result.stdout[-200:])
+
+
+def backups():
+    host = app_host()
+    sites = site_domains()
+    print(f"Checking backups on https://{host}, with public sites: {', '.join(sites) or 'none'}")
+    check_backup_before_the_first_one(host)
+    check_backup_runs(host, sites)
+    check_what_is_in_a_backup(host)
+    check_a_backup_is_sound(host)
+    check_the_copy_can_be_read_back(host)
+    check_a_copy_can_leave_the_server(host)
+    check_the_vaults_emergency_copy_is_stopped(host)
+    check_two_backups_at_once(host)
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -2957,7 +3279,7 @@ cache.clear()
 
 
 def main():
-    stages = {"prepare": prepare, "verify": verify, "burst": burst, "cleanup": cleanup}
+    stages = {"prepare": prepare, "verify": verify, "burst": burst, "backups": backups, "cleanup": cleanup}
     if len(sys.argv) != 2 or sys.argv[1] not in stages:
         raise SystemExit(__doc__)
     try:
