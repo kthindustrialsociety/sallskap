@@ -3024,12 +3024,13 @@ def check_the_copy_can_be_read_back(host):
         check(f"{name}'s database came back", copy.exists(), str(copy))
         if not copy.exists():
             continue
-        # These run in WAL mode, and a stopped container doesn't always leave the log
-        # checkpointed: Forgejo's held 4 MB of recent writes. So the log has to be in the
-        # backup beside the database, or hours of work would go missing without a word.
-        if Path(path + "-wal").exists():
-            in_backup = (copy.parent / (copy.name + "-wal")).exists()
-            check(f"...so did {name}'s write-ahead log, where its recent writes are", in_backup)
+        # These run in WAL mode, and stopping a container doesn't always leave the log
+        # checkpointed: Forgejo's held 4 MB of writes its database file knew nothing
+        # about, while core had folded its back in and removed it. Whole folders are
+        # copied, so whichever it is, the pair travels together. The row count below is
+        # what proves it: a backup of the database alone gives an old number here.
+        log = copy.parent / (copy.name + "-wal")
+        print(f"  ----  {name}: {'the log came with it' if log.exists() else 'no log; it had been folded in'}")
         # Opened read-write, on this copy only, so SQLite replays the log as it would
         # on a restored server.
         connection = sqlite3.connect(str(copy))
