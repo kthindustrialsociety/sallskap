@@ -6,3 +6,13 @@ requires    = []
 data        = ["/srv/git"]
 access      = ["developer", "board", "operator"]  # see the team map in kit/kit.py
 oidc        = true
+
+# Who gets what. Forgejo reads this at someone's sign-in, through kit/kit.py, and
+# connector.py acts on it straight away when core changes someone's groups.
+admin_group = "operator"
+collaborator_groups = ["developer", "operator"]  # who may stay a collaborator on a repo
+
+[teams]
+operator  = "Owners"
+developer = "developers"
+board     = "board"

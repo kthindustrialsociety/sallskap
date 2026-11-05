@@ -538,6 +538,16 @@ def _core_output(*args: str) -> str:
     return result.stdout
 
 
+def _core_python(code: str, stdin: str) -> str:
+    """Python inside core, for what kit's standard library can't do. What it's given goes
+    on stdin, as a command line can be read by anyone on the server."""
+    command = _compose("exec", "-T", "core", "python", "-c", code)
+    result = subprocess.run(command, capture_output=True, text=True, input=stdin)
+    if result.returncode:
+        raise KitError(f"Core couldn't do that: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
 def _forgejo_output(*args: str) -> str:
     command = _module_compose("git", "exec", "-T", "forgejo", "forgejo", *args)
     result = subprocess.run(command, capture_output=True, text=True)
@@ -573,21 +583,29 @@ def _expect(answer: tuple[int, object], *statuses: int) -> object:
     return answer[1]
 
 
-def _create_org_and_teams(config: Config, org: str) -> None:
-    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
-    command for making one, so this uses its API. Forgejo 15 has no way of deleting the
-    token afterwards with password login off, so it stays in its database, where only
-    a hash is stored, and its value is thrown away when this returns. So this only
-    runs until the login is connected."""
+def _forgejo_token(paths: Paths, config: Config) -> str:
+    """The admin token the worker uses, which this setup uses too. It's made once and then
+    kept, as Forgejo 15 has no way of deleting one with password login off. So a new one
+    would leave the old one working."""
+    kept = _read_env(paths.sync_env).get("FORGEJO_ADMIN_TOKEN")
+    if kept:
+        return kept
     if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
         _forgejo_output(
             "admin", "user", "create", "--username", FORGEJO_SERVICE_USER, "--email", f"{FORGEJO_SERVICE_USER}@git.{config.domain}",
             "--admin", "--random-password", "--must-change-password=false",
         )  # fmt: skip
     token = _forgejo_output(
-        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER,
-        "--token-name", f"kit-{secrets.token_hex(4)}", "--scopes", "write:admin,write:organization", "--raw",
+        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER, "--token-name", f"kit-{secrets.token_hex(4)}",
+        "--scopes", "write:admin,write:organization,write:repository,write:user", "--raw",
     ).strip()  # fmt: skip
+    _write_sync_env(paths, config, FORGEJO_ADMIN_TOKEN=token)
+    return token
+
+
+def _create_org_and_teams(token: str, org: str) -> None:
+    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
+    command for making one, so this uses its API."""
     if _forgejo_api(token, "GET", f"/orgs/{org}")[0] == 404:
         _expect(_forgejo_api(token, "POST", "/orgs", {"username": org, "visibility": "public"}), 201)
     # The limit on new repos is for people, but organisations are held to it too.
@@ -611,11 +629,8 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
     fields = dict(re.findall(r"^\s+(Client ID|Secret):\s+(\S+)$", output, re.M))
     if len(fields) != 2:
         raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
-    team_map = {
-        "operator": {org: ["Owners"]},
-        "developer": {org: ["developers"]},
-        "board": {org: ["board"]},
-    }
+    manifest = module_manifest("git")
+    team_map = {group: {org: [team]} for group, team in manifest["teams"].items()}
     settings = [
         "--name", org,
         "--provider", "openidConnect",
@@ -624,7 +639,7 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
         "--auto-discover-url", f"https://app.{config.domain}/.well-known/openid-configuration",
         "--scopes", "email", "--scopes", "profile", "--scopes", "groups",
         "--group-claim-name", "groups",
-        "--admin-group", "operator",
+        "--admin-group", manifest["admin_group"],
         "--group-team-map", json.dumps(team_map),
         "--group-team-map-removal",
         "--skip-local-2fa",  # core has already asked for it
@@ -645,16 +660,16 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
 
 
 def setup_git(paths: Paths, config: Config) -> None:
-    """The login is connected last, so finding it means everything before it finished,
-    and running this again doesn't make another token."""
+    """The login is connected last, so finding it means everything before it finished."""
     org = config.short_name
     source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
     registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
-    if source and registered:
-        return
+    token = _forgejo_token(paths, config)
     if not source:
-        _create_org_and_teams(config, org)
-    _connect_login(config, org, source, registered)
+        _create_org_and_teams(token, org)
+    if not (source and registered):
+        _connect_login(config, org, source, registered)
+    subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)  # now it has the token
 
 
 PREPARE["git"] = prepare_git
@@ -667,14 +682,26 @@ SETUP["git"] = setup_git
 VAULT_TOOL = "vaultwarden"  # its name in core's login service
 
 
-def _write_vault_env(paths: Paths, config: Config, client_id: str = "", secret: str = "") -> None:
+def _write_vault_env(paths: Paths, config: Config, admin_hash: str, client_id: str = "", secret: str = "") -> None:
     settings = {
         "DOMAIN": f"https://vault.{config.domain}",
         "SSO_AUTHORITY": f"https://app.{config.domain}",
         "SSO_CLIENT_ID": client_id,
         "SSO_CLIENT_SECRET": secret,
+        "ADMIN_TOKEN": admin_hash,
     }
     _write_atomic(paths.vault_env, "".join(f"{name}={value}\n" for name, value in settings.items()), 0o600)
+
+
+def _vault_admin_hash(paths: Paths, config: Config, current: dict[str, str]) -> str:
+    """Vaultwarden only gets a hash of its admin token, and only the worker gets the token.
+    The quotes are part of the setting, or Compose would read the $ in it as variables."""
+    if current.get("ADMIN_TOKEN") and _read_env(paths.sync_env).get("VAULT_ADMIN_TOKEN"):
+        return current["ADMIN_TOKEN"]
+    token = secrets.token_urlsafe(48)
+    hashed = _core_python("import sys; from argon2 import PasswordHasher; print(PasswordHasher().hash(sys.stdin.read()))", token)
+    _write_sync_env(paths, config, VAULT_ADMIN_TOKEN=token)
+    return f"'{hashed}'"
 
 
 def prepare_vault(paths: Paths, config: Config) -> None:
@@ -683,9 +710,10 @@ def prepare_vault(paths: Paths, config: Config) -> None:
     when it's made, so if one side is missing, both get a new one. The old secret goes
     first, so stopping partway can only leave a side missing."""
     current = _read_env(paths.vault_env)
+    admin_hash = _vault_admin_hash(paths, config, current)
     registered = re.search(rf"^{VAULT_TOOL}\s", _core_output("tool", "list"), re.M)
     if not (registered and current.get("SSO_CLIENT_SECRET")):
-        _write_vault_env(paths, config)
+        _write_vault_env(paths, config, admin_hash)
         if registered:
             _core_output("tool", "remove", VAULT_TOOL)
         manifest = module_manifest("vault")
@@ -695,7 +723,7 @@ def prepare_vault(paths: Paths, config: Config) -> None:
         if len(fields) != 2:
             raise KitError("Core registered Vaultwarden, but kit couldn't read its settings. Run this again.")
         current = {"SSO_CLIENT_ID": fields["Client ID"], "SSO_CLIENT_SECRET": fields["Secret"]}
-    _write_vault_env(paths, config, current["SSO_CLIENT_ID"], current["SSO_CLIENT_SECRET"])
+    _write_vault_env(paths, config, admin_hash, current["SSO_CLIENT_ID"], current["SSO_CLIENT_SECRET"])
     paths.vault_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.vault_dir, VAULT_UID, VAULT_UID)
