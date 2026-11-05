@@ -662,6 +662,21 @@ class Modules(unittest.TestCase):
         self.assertEqual(starts[:2], ["up -d caddy", "up -d --wait core"])
         self.assertEqual(self.setup_calls, ["prepare"])
 
+    def test_a_broken_module_doesnt_stop_the_worker_starting(self):
+        """The other tools still have to hear about changes, and it may have a new token."""
+        self.broken = ("demo",)
+        code, _ = self.run_kit("enable", "demo")
+        self.assertEqual(code, 1)
+        starts = [" ".join(call[call.index("up") :]) for call in self.calls if "up" in call]
+        self.assertEqual(starts[-1], "up -d --wait sync")
+
+    def test_apply_does_what_a_module_needs_once_its_up(self):
+        done = []
+        with mock.patch.dict(kit.AFTER_START, {"demo": lambda paths, config: done.append(len(self.calls))}):
+            self.run_kit("enable", "demo")
+        started = next(i for i, call in enumerate(self.calls, 1) if any(part.endswith("demo/compose.yml") for part in call))
+        self.assertEqual(done, [started])
+
     def test_enabling_again_finishes_after_a_failure(self):
         self.broken = ("demo",)
         self.run_kit("enable", "demo")
@@ -822,6 +837,7 @@ class GitSetup(unittest.TestCase):
         self.org_exists = False
         self.teams = ["Owners"]
         self.refuse = None  # part of a command to answer with a failure
+        self.dead_token = None  # one Forgejo no longer knows
 
         def fake_run(command, *args, **kwargs):
             self.calls.append((command, kwargs.get("input")))
@@ -838,6 +854,8 @@ class GitSetup(unittest.TestCase):
         if self.refuse and self.refuse in line:
             return subprocess.CompletedProcess(command, 1, "", "refused by the fake")
         if "curl" in command:
+            if self.dead_token and self.dead_token in (body or ""):
+                return done("{}\n401")
             url = command[-1].removeprefix("http://127.0.0.1:3000/api/v1")
             method = command[command.index("--request") + 1]
             if method == "GET" and url == "/orgs/kthis":
@@ -930,6 +948,25 @@ class GitSetup(unittest.TestCase):
         self.setup()
         self.assertEqual(self.find("generate-access-token"), [])
         self.assertTrue(any("Authorization: token kept-token" in (settings or "") for _, settings in self.calls))
+
+    def test_a_token_forgejo_no_longer_knows_is_replaced(self):
+        """After a restore from before it was made. Otherwise running this again can't finish."""
+        self.keep_token()
+        self.dead_token = "kept-token"
+        self.setup()
+        self.assertEqual(len(self.find("generate-access-token")), 1)
+        self.assertEqual(kit._read_env(self.paths.sync_env)["FORGEJO_ADMIN_TOKEN"], "the-token")
+
+    def test_forgejo_being_down_doesnt_cost_a_token(self):
+        self.keep_token()
+        real = self.answer
+        self.answer = lambda command, body: subprocess.CompletedProcess(command, 0, "{}\n502", "") if "curl" in command else real(command, body)
+        self.assertEqual(kit._forgejo_token(self.paths, self.config), "kept-token")
+        self.assertEqual(self.find("generate-access-token"), [])
+
+    def test_kit_apply_gives_an_upgrade_its_token(self):
+        """It doesn't run the setup, and the worker can't tell Forgejo anything without one."""
+        self.assertIs(kit.AFTER_START["git"], kit._forgejo_token)
 
     def test_an_upgrade_gets_a_token_and_leaves_its_login_alone(self):
         self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
@@ -1385,6 +1422,8 @@ class WorkerSettings(unittest.TestCase):
         self.assertEqual(manifest["admin_group"], "operator")
         for team in kit.FORGEJO_TEAMS:
             self.assertIn(team["name"], manifest["teams"].values())
+        # Forgejo silently skips a team in its map that doesn't exist. It makes Owners itself.
+        self.assertEqual(set(manifest["teams"].values()) - {"Owners"}, {team["name"] for team in kit.FORGEJO_TEAMS})
 
     def test_someone_who_can_only_read_never_stays_a_collaborator(self):
         self.assertNotIn("board", kit.module_manifest("git")["collaborator_groups"])
@@ -1504,6 +1543,32 @@ class Emergency(unittest.TestCase):
         self.run_kit("emergency", "git", "someone")
         self.assertFalse([call for call in self.calls if "manage.py" in call])
 
+    def test_disabling_the_vault_stops_the_copy_too(self):
+        self.run_kit("emergency", "vault")
+        with mock.patch.object(kit, "apply_web"):
+            code, _ = self.run_kit("disable", "vault")
+        self.assertEqual(code, 0)
+        self.assertFalse(self.running)
+        self.assertFalse((self.paths.vault_dir / "emergency-tls").exists())
+
+    def test_disabling_git_leaves_the_copy_alone(self):
+        self.run_kit("emergency", "vault")
+        with mock.patch.object(kit, "apply_web"):
+            self.run_kit("disable", "git")
+        self.assertTrue(self.running)
+
+    def test_status_says_so_even_with_the_module_off(self):
+        self.run_kit("emergency", "vault")
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        address = lambda *args, **kwargs: io.BytesIO(b"203.0.113.1")
+        with mock.patch.object(kit, "_resolve_ipv4", return_value={"203.0.113.1"}), mock.patch.object(kit.urllib.request, "urlopen", address):
+            _, out = self.run_kit("status")
+        self.assertIn("emergency copy is running", out)
+
+    def test_no_docker_means_nothing_is_running(self):
+        with mock.patch.object(kit.subprocess, "run", side_effect=FileNotFoundError("docker")):
+            self.assertIsNone(kit._vault_emergency_address())
+
     def test_it_refuses_a_module_thats_off(self):
         self.paths.config.write_text('[association]\ndomain = "example.org"\n')
         for args in (("emergency", "vault"), ("emergency", "git", "someone")):
@@ -1581,6 +1646,11 @@ class Packaging(unittest.TestCase):
         self.assertIn("image: sallskap-core:local", worker)
         self.assertIn("./modules:/modules:ro", worker)
         self.assertIn("condition: service_healthy", worker)
+
+    def test_restarting_the_worker_cant_lock_it_out_of_vaultwarden(self):
+        vault = compose_services()["vaultwarden"]
+        self.assertIn('ADMIN_RATELIMIT_MAX_BURST: "30"', vault)
+        self.assertIn('ADMIN_RATELIMIT_SECONDS: "10"', vault)
 
     def test_vaultwardens_admin_page_is_closed_at_caddy(self):
         """Its admin token is on now, so this is what keeps the page off the internet."""

@@ -338,7 +338,9 @@ def _module_compose(name: str, *args: str) -> list[str]:
 # What a module needs beyond starting its containers. Everything here has to be safe
 # to repeat, as running `kit enable` again is how someone finishes after a failure.
 PREPARE: dict = {}  # folders and secrets, before its containers start
+AFTER_START: dict = {}  # what an upgrade needs too, as `kit apply` doesn't run SETUP
 SETUP: dict = {}  # connecting it to core, once its containers are up
+STOP: dict = {}  # anything else of its that's running, which stopping it wouldn't reach
 
 
 def _new_signing_key() -> str:
@@ -424,16 +426,21 @@ def apply(paths: Paths, build: bool = False) -> None:
     """Start everything. Caddy goes first and modules last, so a problem with one can't
     hold up the public sites or logins. With --wait, core has finished migrating and
     each module is healthy when this returns. The worker goes after the modules, as
-    preparing one can give it a new token."""
+    preparing one can give it a new token, and it starts even if one fails, as the others
+    still have to hear about changes."""
     apply_web(paths)
     subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
     config = load_config(paths)
-    for name in config.modules:
-        if _has_containers(name):
-            if name in PREPARE:
-                PREPARE[name](paths, config)
-            subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
-    subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)
+    try:
+        for name in config.modules:
+            if _has_containers(name):
+                if name in PREPARE:
+                    PREPARE[name](paths, config)
+                subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+                if name in AFTER_START:
+                    AFTER_START[name](paths, config)
+    finally:
+        subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)
 
 
 def enable_module(paths: Paths, name: str) -> None:
@@ -459,6 +466,8 @@ def disable_module(paths: Paths, name: str) -> None:
     if not _has_containers(name):
         raise KitError(f"{name} has nothing to start, so it can't be switched on or off.")
     if name in load_config(paths).modules:
+        if name in STOP:
+            STOP[name](paths)
         subprocess.run(_module_compose(name, "rm", "--stop", "--force"), check=True)
         text = set_module(paths.config.read_text("utf-8"), name, False)
         parse_config(text)
@@ -586,9 +595,10 @@ def _expect(answer: tuple[int, object], *statuses: int) -> object:
 def _forgejo_token(paths: Paths, config: Config) -> str:
     """The admin token the worker uses, which this setup uses too. It's made once and then
     kept, as Forgejo 15 has no way of deleting one with password login off. So a new one
-    would leave the old one working."""
+    would leave the old one working, unless Forgejo no longer knows it, as after a restore
+    from before it was made."""
     kept = _read_env(paths.sync_env).get("FORGEJO_ADMIN_TOKEN")
-    if kept:
+    if kept and _forgejo_api(kept, "GET", "/user")[0] != 401:
         return kept
     if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
         _forgejo_output(
@@ -673,6 +683,7 @@ def setup_git(paths: Paths, config: Config) -> None:
 
 
 PREPARE["git"] = prepare_git
+AFTER_START["git"] = _forgejo_token
 SETUP["git"] = setup_git
 
 
@@ -746,11 +757,14 @@ def _require_module(paths: Paths, name: str) -> None:
 
 
 def _vault_emergency_address() -> str | None:
-    result = subprocess.run(
-        ["docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", VAULT_EMERGENCY],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", VAULT_EMERGENCY],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:  # no Docker yet, so nothing's running
+        return None
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -807,6 +821,9 @@ def vault_emergency_off(paths: Paths) -> bool:
         subprocess.run(["docker", "rm", "--force", VAULT_EMERGENCY], check=True, capture_output=True)
     shutil.rmtree(paths.vault_dir / VAULT_EMERGENCY_TLS, ignore_errors=True)
     return running
+
+
+STOP["vault"] = vault_emergency_off
 
 
 def git_emergency_token(paths: Paths, username: str) -> str:
@@ -1009,7 +1026,7 @@ def status(paths: Paths) -> int:
         raise KitError(f"Couldn't look up this server's public address: {error}") from error
 
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
-    if "vault" in config.modules and _vault_emergency_address():
+    if _vault_emergency_address():  # even if the module is off
         print("The vault's emergency copy is running, which takes master passwords. Stop it when you're done: kit emergency vault --off\n")
     print("Login and admin page:")
     problems = _check_dns(f"app.{config.domain}", server_ip)
