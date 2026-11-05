@@ -25,6 +25,31 @@ Opening Forgejo signs someone in through core, with nothing to click if they're 
 
 Repos belong to the organisation, which is named after the first part of the domain, so they survive a handover. Ordinary accounts can't create personal repos, forks or other organisations. Addresses come from core, so Forgejo's form for adding one answers with an error.
 
+## When someone leaves
+
+Core tells Forgejo straight away, usually within a few seconds, with no new sign-in needed. If Forgejo is down at the time, it's told as soon as it's back, and the person's page on the admin site says so until then.
+
+| In core | In Forgejo |
+|---|---|
+| Removed from a group | Off that group's team. Unless they're still a Developer or Operator, they also stop being a collaborator on any repo, including ones they created. Their account and tokens keep working, for public repos |
+| Removed from Operator | No longer a Forgejo admin or an owner of the organisation |
+| Account turned off, or deleted | Blocked, and off every team. Tokens stop working on the API and Git, and an open web page shows "Account is suspended" whatever it asks for |
+| Added to a group, or turned back on | On that group's team straight away. They don't get back as a collaborator, as the team is what gives them access |
+
+Forgejo makes someone a collaborator on a repo they create, as their team only has write access, and they keep admin rights on it until they leave. Git shows someone who's blocked a confusing error, such as `could not determine hash algorithm`, rather than saying they're blocked.
+
+Forgejo's own teams that aren't listed in `module.toml` are left alone, unless someone has left altogether.
+
+## If core is down
+
+Open web pages and tokens keep working, so most people can carry on. Only signing in stops. If an Operator needs in and has no token, run this on the server:
+
+```sh
+kit emergency git <their-forgejo-username>
+```
+
+It prints a token on their own account, for the API and Git, with no expiry. Delete it under Settings, Applications once core is back, as nothing else can delete it. Forgejo's repos are also plain Git repos under `/srv/git/git/repositories`, which root can copy.
+
 ## Using Git
 
 Git goes over HTTPS with a token, as Forgejo has no SSH server and no password login. Create a token in Forgejo under Settings, Applications, then use it as the password:
@@ -36,16 +61,18 @@ git clone https://git.example.org/example/some-repo.git
 ## Known limits
 
 - **Signing out of Forgejo doesn't log you out of core.** Opening Forgejo a few minutes later signs you back in. To stay out, log out of core too.
-- **Changes arrive at the next sign-in.** Forgejo only hears about someone's groups when they sign in, so a person removed from a group keeps their team, and their tokens keep working, until then. Turning off someone's account in core doesn't reach Forgejo yet either.
-- **Someone who created a repo keeps admin rights on it,** even after leaving the team. Forgejo makes them a collaborator, and leaving a team doesn't change that. An Operator can remove them from the repo's collaborators.
+- **A collaborator added by hand only lasts while they're a Developer or Operator.** Everyone else's collaborations get removed the next time core looks at them, at least once a day, as they can't be told apart from ones Forgejo made when someone created a repo. Give other people access with a team.
+- **Webhooks and mirrors outlive whoever set them up.** Someone with admin rights on a repo could have set one up to send its contents elsewhere, and removing them doesn't remove that. Check a sensitive repo's settings when someone leaves on bad terms.
 - **Some addresses can't sign in.** An address whose part before the @ is a name Forgejo reserves, such as `admin@example.org`, gets an error page. So does one matching `sallskap-admin`, the account that owns the organisation, or the organisation's own name, or a name Forgejo ends up treating as the same as someone else's. They can't get into anyone else's account, and they can use another address.
 - **Email and name changes aren't passed on.** Forgejo takes them from core when someone first signs in, and keeps them.
-- **One token stays behind,** or one more for each setup that failed before finishing. Creating the organisation needs an admin token, and Forgejo 15 can't delete one with password login off. Only a hash of it is stored, and nothing keeps its value.
+- **One admin token is kept,** on `sallskap-admin`, in `/etc/sallskap/sync.env`. Only the worker that tells Forgejo about changes has it, and only root can read that file. Forgejo 15 can't delete a token with password login off, so replacing it would leave the old one working.
 - **No build runner yet,** so Actions is off.
 
 ## Restoring
 
-Everything is in `/srv/git` and `/etc/sallskap/git.env`. Keep them together: the secret key in that file is what makes Forgejo's stored login secret readable. The `kit` backup comes later.
+Everything is in `/srv/git`, `/etc/sallskap/git.env` and `/etc/sallskap/sync.env`. Keep them together: the secret key in `git.env` is what makes Forgejo's stored login secret readable. The `kit` backup comes later.
+
+When the worker starts, it goes over everyone, so someone who left after the backup was taken is cut off again by itself.
 
 ## Upgrading
 

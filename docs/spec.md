@@ -129,6 +129,7 @@ Each module is a folder under `modules/<name>/` containing:
 | `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access group, session length if it needs its own, setup questions |
 | `compose.yml` | yes | The module's containers, with memory limits |
 | `site.caddy` | if web-facing | Caddy routing lines, imported automatically, with `__HOST__` for its hostname |
+| `connector.py` | if it can | How core tells the tool about changes to someone's access straight away, without waiting for their next login: see §8 |
 | `backup.sh` | optional | Pre-backup step, e.g. a database dump |
 | `README.md` | yes | What it does, who should own it, how to restore it |
 
@@ -243,7 +244,10 @@ An installation has one **primary domain** and any number of **site domains**.
 
 - **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect).
 - **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. A tool that can't do this, such as Vaultwarden, can be limited to certain groups in core instead. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
-- **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access at their next login everywhere.
+- **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access within seconds, in every tool whose module has a connector, and at their next login in the rest. Whether a tool's API can do this counts when choosing one.
+- **How core reaches tools:** a change to someone's access is saved along with a note that the tools need telling. A worker in its own container, with no ports, picks that up within seconds, retries if a tool is down, and the admin page says if it's stuck. It's the only process with the tools' admin tokens, so core's web process, which faces the internet, never has them. Each module's `connector.py` does the talking, using only the standard library. It also goes over everyone once a day and when it starts, which covers a tool restored from a backup.
+- **When someone leaves:** what can be done for them is done at once, and anything only a person can do becomes a follow-up on the admin page that stays open until someone marks it done, such as changing shared passwords.
+- **If core is down:** each module's README says how to get in. Nothing opens a way around 2FA at a public address: an emergency way in needs SSH on the server.
 - **Sessions:** short lifetimes for sensitive modules (vault: 8–24 h).
 - **Two-factor authentication:** required for the board, treasurer and operator groups; optional for members.
 - **Passwords:** hashed with Argon2 (Django supports it). Login attempts are rate-limited.
@@ -321,6 +325,7 @@ An association should never have to ask its provider how the server works. The k
 | `kit admin <email>` | Create the first admin, or restore someone's Operator access and clear any login lockouts. `--reset-2fa` also removes their 2FA |
 | `kit link <email>` | Create a one-time link that lets someone choose a password. It doesn't log them in, so it can't get around 2FA |
 | `kit tool add <name> <callback> [--group <group>] [--session-hours <1-24>]` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once, optionally limited to certain groups; list tools; remove a tool and end its access |
+| `kit emergency vault [--off]` / `kit emergency git <username>` | Get into a tool while core is down: a private copy of the vault reached over SSH; a token on someone's own Forgejo account |
 | `kit enable <module>` | Ask the setup questions, show any DNS record needed, start the module |
 | `kit disable <module>` | Stop the module and keep its data |
 | `kit remove <module>` | Delete its data after confirmation |
@@ -357,7 +362,7 @@ The same status is shown on a page in the admin.
   - a data processing agreement (for the hosting provider)
   - retention rules (e.g. delete lapsed members after N years)
 - Members can export and delete their data from the member portal.
-- Access: 1–2 operators have root on the server. Developers and incubator teams deploy only through Git, never with a shell on the server.
+- Access: 1–2 operators have root on the server, which is also how they get into tools if core is down. Developers and incubator teams deploy only through Git, never with a shell on the server.
 - Databases are never exposed to the internet; everything goes through Caddy.
 - Backups are encrypted. Keys are kept in the password vault and one offline copy.
 - An audit log records admin actions on members and finances.
