@@ -112,6 +112,26 @@ class RealRestic(unittest.TestCase):
         self.run_kit("backup")
         self.assertIn("no errors were found", self.restic("check", "--read-data"))
 
+    def test_damage_to_a_backup_is_noticed(self):
+        """What `restic check` is for. Done after the backup, as a backup prunes packs
+        no kept snapshot needs and can carry the damage away with them."""
+        self.run_kit("backup")
+        packs = [p for p in (self.paths.repo / "data").rglob("*") if p.is_file()]
+        self.assertTrue(packs)
+        damaged = bytearray(packs[-1].read_bytes())
+        damaged[len(damaged) // 2] ^= 0xFF
+        packs[-1].chmod(0o644)  # restic stores them read-only
+        packs[-1].write_bytes(bytes(damaged))
+        environment = {**kit.os.environ, **kit._read_env(self.paths.backup_env)}
+        result = subprocess.run(
+            ["restic", "--repo", str(self.paths.repo), "check", "--read-data"],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repository contains errors", result.stdout + result.stderr)
+
     def test_the_backup_is_unreadable_without_the_password(self):
         self.run_kit("backup")
         result = subprocess.run(

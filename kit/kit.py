@@ -1069,11 +1069,15 @@ def run_backup(paths: Paths) -> None:
             _print_backup_password(paths, password)
         if not _repo_exists(paths):
             _restic_run(paths, "init")
+        # Worked out before anything stops, so a mistake in a module's manifest costs
+        # an error rather than an outage.
+        what = [str(path) for path in backup_paths(paths, config)]
+        tags = _backup_tags(config)
         _run_backup_scripts(config)
         paused = time.monotonic()
         _stop_for_backup(paths, config)
         try:
-            _restic_run(paths, "backup", *_backup_tags(config), "--", *(str(p) for p in backup_paths(paths, config)))
+            _restic_run(paths, "backup", *tags, "--", *what)
         finally:
             _start_after_backup(paths, config)
             print(f"\nLogins and the tools were paused for {time.monotonic() - paused:.0f} seconds. The public sites weren't.")

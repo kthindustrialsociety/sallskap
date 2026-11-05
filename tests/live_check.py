@@ -3077,6 +3077,7 @@ def check_a_copy_can_leave_the_server(host):
     section("Backups: taking a copy off the server")
     exported = Path("/root/.sallskap-export-check.tar")
     exported.unlink(missing_ok=True)
+    before = time.time()
     result = kit("backup", "export", str(exported))
     check("`kit backup export` writes one file", result.returncode == 0 and exported.exists(), result.stderr[-300:])
     if not exported.exists():
@@ -3098,6 +3099,23 @@ def check_a_copy_can_leave_the_server(host):
     refused = restic("snapshots", password="not-the-password", repo=elsewhere / "repo")
     check("...and not without it", refused.returncode != 0)
 
+    # Damage would be noticed: proved on this unpacked copy, so the real repository is
+    # never touched. Flipping a byte in the live one wouldn't prove it, as the backup
+    # that runs first prunes unreferenced packs and can drop the damage with them.
+    packs = [p for p in (elsewhere / "repo" / "data").rglob("*") if p.is_file()]
+    check("The unpacked copy has pack files to damage", bool(packs))
+    if packs:
+        damaged = bytearray(packs[-1].read_bytes())
+        damaged[len(damaged) // 2] ^= 0xFF
+        packs[-1].chmod(0o644)  # restic stores them read-only
+        packs[-1].write_bytes(bytes(damaged))
+        noticed = restic("check", "--read-data", repo=elsewhere / "repo")
+        check(
+            "A single flipped byte is noticed by restic's own check",
+            "repository contains errors" in noticed.stdout + noticed.stderr,
+            (noticed.stdout + noticed.stderr)[-300:],
+        )
+
     # One line over SSH is the way a copy is meant to leave, so check the stream too.
     streamed = Path("/root/.sallskap-stream-check.tar")
     with streamed.open("wb") as target:
@@ -3106,6 +3124,11 @@ def check_a_copy_can_leave_the_server(host):
     with tarfile.open(streamed) as tar:
         check("...and gives the same thing", "repo/config" in tar.getnames())
 
+    # Not just that a copy has left at some point: that this one was recorded. An older
+    # note from an earlier run would otherwise hide an export that records nothing.
+    note = BACKUP_DIR / "last-export"
+    recorded = float(note.read_text().strip() or 0) if note.exists() else 0
+    check("The export was recorded as having just happened", recorded >= before, f"{recorded} vs {before}")
     status = kit("status").stdout
     check("`kit status` reports the backup as fresh", "ok   last backup" in status, status[-400:])
     check("...and that a copy has left the server", "ok   last copy off this server" in status, status[-400:])
@@ -3124,8 +3147,11 @@ def check_the_vaults_emergency_copy_is_stopped(host):
     check("...and is running", bool(running.stdout.strip()))
     result = kit("backup")
     check("A backup finishes with it running", result.returncode == 0, result.stderr[-300:])
-    after = subprocess.run(["docker", "ps", "--filter", f"name={VAULT_EMERGENCY}", "-q"], capture_output=True, text=True)
+    after = subprocess.run(["docker", "ps", "-a", "--filter", f"name={VAULT_EMERGENCY}", "-q"], capture_output=True, text=True)
     check("...and stops it, as it writes to the data being copied", not after.stdout.strip())
+    # Neither `compose stop` nor `compose up` reaches a `compose run` container, so this
+    # is what shows the module's own stop step ran rather than something else.
+    check("...and takes its certificate with it", not (VAULT_DIR / "emergency-tls").exists())
     check("`kit status` no longer mentions it", "emergency copy is running" not in kit("status").stdout)
 
 

@@ -1510,6 +1510,14 @@ class Backups(unittest.TestCase):
         with self.assertRaisesRegex(kit.KitError, "holds the backups"):
             kit.backup_paths(self.paths, self.config())
 
+    def test_a_mistake_in_a_manifest_costs_an_error_and_not_an_outage(self):
+        (self.demo / "module.toml").write_text(f'name = "demo"\ndata = ["{self.paths.backup_dir}"]\n')
+        self.paths.backup_dir.mkdir(parents=True)
+        code, out = self.run_kit("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("holds the backups", out)
+        self.assertFalse([c for c in self.docker_calls() if "stop" in c])
+
     # ---- The password --------------------------------------------------------
 
     def test_the_password_is_made_once_and_then_kept(self):
