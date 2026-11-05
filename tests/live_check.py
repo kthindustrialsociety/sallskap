@@ -15,6 +15,7 @@ Standard library only, as the rest of the kit's tooling is.
 import base64
 import hashlib
 import hmac
+import html
 import http.client
 import json
 import re
@@ -43,6 +44,9 @@ FORGEJO_SERVICE_USER = "sallskap-admin"
 VAULT = "sallskap-vaultwarden-1"
 VAULT_DIR = Path("/srv/vault")
 VAULT_ENV = Path("/etc/sallskap/vault.env")
+VAULT_EMERGENCY = "sallskap-vault-emergency"
+SYNC_ENV = Path("/etc/sallskap/sync.env")
+GIT_SECRET = "the-contents-of-a-private-file-7f3a"
 VAULT_UID = "10002"
 VAULT_HASH = "bm90LWEtcmVhbC1tYXN0ZXItcGFzc3dvcmQtaGFzaA=="
 VAULT_KEY = "2.bm90LXJlYWw=|bm90LXJlYWw=|bm90LXJlYWw="
@@ -84,6 +88,31 @@ FAKE = {
     "fake-vault-renamed": (["board"], True),
     "fake-vault-rules": (["board"], True),
     "fake-vault-offon": (["board"], True),
+    "fake-sync-2fa": (["developer"], False),
+    "fake-sync-joiner": (["member"], True),
+    "fake-sync-creator": (["developer"], False),
+    "fake-sync-colleague": (["developer"], False),
+    "fake-sync-moved": (["developer"], True),
+    "fake-sync-admin": (["operator"], True),
+    "fake-sync-leaver": (["developer"], False),
+    "fake-sync-deleted": (["developer"], False),
+    "fake-sync-bypass": (["developer"], False),
+    "fake-sync-outage": (["developer"], False),
+    "fake-sync-nowork": (["developer"], False),
+    "fake-sync-down": (["developer"], False),
+    "fake-sync-blocked": (["developer"], False),
+    "fake-sync-rescuer": (["operator"], True),
+    "fake-vsync-owner": (["board"], True),
+    "fake-vsync-removed": (["board"], True),
+    "fake-vsync-off": (["board"], True),
+    "fake-vsync-solo": (["board"], True),
+    "fake-vsync-co": (["board"], True),
+    "fake-vsync-deleted": (["board"], True),
+    "fake-vsync-renamed": (["board"], True),
+    "fake-vsync-outage": (["board"], True),
+    "fake-vsync-down": (["board"], True),
+    "fake-vsync-off-down": (["board"], True),
+    "fake-vsync-member": (["member"], False),
 }
 # These can't be named fake-something, as what's being tested is the name itself.
 FAKE_OTHER = ["fake-git-clash@example.net", f"{FORGEJO_SERVICE_USER}@example.org", "admin@example.org"]
@@ -843,7 +872,7 @@ def repo_url(host, username, secret, repo):
     return f"https://{username}:{secret}@{git_host(host)}/{org_of(host)}/{repo}.git"
 
 
-def set_groups(email, roles):
+def set_groups(email, roles, wait=True):
     in_core(
         f"""
 from django.contrib.auth import get_user_model
@@ -851,6 +880,8 @@ from django.contrib.auth.models import Group
 get_user_model().objects.get(email={email!r}).groups.set(Group.objects.filter(role__key__in={roles!r}))
 """
     )
+    if wait:
+        wait_for_sync()
 
 
 def forgejo_tokens():
@@ -1286,11 +1317,14 @@ def burst_forgejo(host, state):
 
 
 def cleanup_forgejo():
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
     host = app_host()
-    token = state.get("git", {}).get("operator_token")
+    token = sync_env().get("FORGEJO_ADMIN_TOKEN")
+    org = org_of(host)
     if token:
-        print("Fake repo:", forgejo_api(host, token, "DELETE", f"/repos/{org_of(host)}/fake-repo")[0])
+        repos = forgejo_api(host, token, "GET", f"/orgs/{org}/repos?limit=50")[1] or []
+        for repo in repos:
+            if repo["name"].startswith("fake-"):
+                print(f"Fake repo {repo['name']}:", forgejo_api(host, token, "DELETE", f"/repos/{org}/{repo['name']}")[0])
     listed = in_forgejo("forgejo", "admin", "user", "list").stdout
     for name in re.findall(r"^\d+\s+(fake-\S+)", listed, re.M):
         in_forgejo("forgejo", "admin", "user", "delete", "--username", name, "--purge")
@@ -1779,17 +1813,23 @@ def check_vault_sessions(host, secrets_by_name):
     check("It can be refreshed", status == 200, str(status))
     check("...which doesn't extend it", expires() == ending, f"{expires()} {ending}")
 
-    set_groups(email, ["member"])
-    status, _ = person.refresh()
-    check("Leaving the groups ends it at the next refresh, which is every page load", status != 200, str(status))
-    print(f"  info  Used by hand, the token still answers with {person.api('GET', '/api/sync')[0]} until it expires. Step 5's call to Vaultwarden's admin API closes this.")
-    set_groups(email, ["board"])
-    check("...and only core was stopping it", person.refresh()[0] == 200)
+    # Core refuses them too, which is what a browser meets if the worker is ever down. The
+    # worker would otherwise hide this, and end the session for good before it's reached.
+    worker("stop")
+    try:
+        set_groups(email, ["member"], wait=False)
+        status, _ = person.refresh()
+        check("With the worker stopped, leaving the groups ends it at the next refresh, which is every page load", status != 200, str(status))
+        check("...but a token used by hand keeps working, which is what the worker is for", person.api("GET", "/api/sync")[0] == 200)
+        set_groups(email, ["board"], wait=False)
+        check("...and only core was stopping it", person.refresh()[0] == 200)
 
-    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=False)")
-    status, _ = person.refresh()
-    check("Turning off the account ends it at the next refresh", status != 200, str(status))
-    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=True)")
+        in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=False)")
+        status, _ = person.refresh()
+        check("Turning off the account ends it at the next refresh", status != 200, str(status))
+        in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=True)")
+    finally:
+        worker("start")
 
 
 def check_vault_limits(host):
@@ -1976,6 +2016,746 @@ def cleanup_vault():
     print(f"Fake accounts left in Vaultwarden: {left}, removed {len(people)} and {len(orgs)} organisations")
 
 
+# ---- Access: the table in step 5 of the plan ------------------------------------
+#
+# Every check here has a control just before it, so nothing passes because a thing
+# never worked. Fake accounts only: the real ones are compared separately.
+
+
+def wait_for(condition, seconds=20):
+    """How long it took, or None if it never happened."""
+    started = time.time()
+    while time.time() - started < seconds:
+        if condition():
+            return round(time.time() - started, 1)
+        time.sleep(0.25)
+    return None
+
+
+def core_db(query, *values):
+    """What only its database can say: it's read here, never changed."""
+    connection = sqlite3.connect("file:/srv/core/db.sqlite3?mode=ro", uri=True)
+    try:
+        return connection.execute(query, values).fetchall()
+    finally:
+        connection.close()
+
+
+def wait_for_sync(seconds=30):
+    """Until the worker has told every tool about every change."""
+    wait_for(lambda: core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0, seconds)
+
+
+def sync_env():
+    return dict(line.split("=", 1) for line in SYNC_ENV.read_text().splitlines() if "=" in line)
+
+
+def worker(action):
+    """Stop or start the worker, for what it would otherwise hide."""
+    compose(action, "sync")
+    if action == "start":
+        wait_for(lambda: docker_inspect("sync")["State"].get("Health", {}).get("Status") == "healthy", 60)
+
+
+def set_active(email, active):
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+user = get_user_model().objects.get(email={email!r})
+user.is_active = {active!r}
+user.save()
+"""
+    )
+
+
+def admin_page_set_active(operator, email, active):
+    """The way an Operator does it: the real form on the admin page."""
+    pk = core_db("select id from accounts_user where email = ?", email)[0][0]
+    path = f"/admin/accounts/user/{pk}/change/"
+    page = operator.get(path)
+    token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text)
+    groups = [("groups", str(row[0])) for row in core_db("select group_id from accounts_user_groups where user_id = ?", pk)]
+    form = [("csrfmiddlewaretoken", token.group(1) if token else ""), ("email", email), ("name", ""), ("_save", "Save"), *groups]
+    if active:
+        form.append(("is_active", "on"))
+    return operator.send("POST", path, form).status
+
+
+def git_person(host, name, secrets_by_name):
+    person = Person(host)
+    person.log_in_to_core(email_of(name), secrets_by_name.get(name))
+    person.sign_in_to_git()
+    return person, person.make_token()
+
+
+def git_account(host, email):
+    """What Forgejo holds for someone, asked the way the worker asks."""
+    sub = core_db("select id from accounts_user where email = ?", email)[0][0]
+    found = forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/admin/users?login_name={sub}")[1]
+    return found[0] if found else None
+
+
+def collaborators(host, repo):
+    token = sync_env()["FORGEJO_ADMIN_TOKEN"]
+    return [user["login"] for user in forgejo_api(host, token, "GET", f"/repos/{org_of(host)}/{repo}/collaborators")[1]]
+
+
+def make_repo(host, token, repo):
+    """A private repo, with something in it to look for."""
+    org = org_of(host)
+    status, _ = forgejo_api(host, token, "POST", f"/orgs/{org}/repos", {"name": repo, "private": True, "auto_init": True, "default_branch": "main"})
+    content = base64.b64encode(GIT_SECRET.encode()).decode()
+    added, _ = forgejo_api(host, token, "POST", f"/repos/{org}/{repo}/contents/secret.txt", {"content": content, "branch": "main", "message": "x"})
+    return status == 201 and added == 201
+
+
+def can_push(host, username, token, repo, branch):
+    with tempfile.TemporaryDirectory() as tmp:
+        cloned = run_git("clone", "-q", repo_url(host, username, token, repo), tmp)
+        if cloned.returncode:
+            return False
+        for args in (("checkout", "-q", "-b", branch), ("-c", "user.name=Fake", "-c", "user.email=fake@example.org", "commit", "-q", "--allow-empty", "-m", "x")):
+            run_git(*args, cwd=tmp)
+        return run_git("push", "-q", "origin", branch, cwd=tmp).returncode == 0
+
+
+def git_refs(host, username, token, repo):
+    """What Git asks for first. Forgejo answers someone it has blocked with a 200 page."""
+    connection = http.client.HTTPSConnection(git_host(host), context=ssl.create_default_context(), timeout=30)
+    authorization = base64.b64encode(f"{username}:{token}".encode()).decode()
+    connection.request("GET", f"/{org_of(host)}/{repo}.git/info/refs?service=git-upload-pack", headers={"Authorization": f"Basic {authorization}"})
+    text = connection.getresponse().read().decode(errors="replace")
+    connection.close()
+    return text
+
+
+def can_clone(host, username, token, repo):
+    with tempfile.TemporaryDirectory() as tmp:
+        cloned = run_git("clone", "-q", repo_url(host, username, token, repo), str(Path(tmp, "x")))
+        return cloned.returncode == 0 and Path(tmp, "x", "secret.txt").exists()
+
+
+def check_sync_exposure(host):
+    section("The worker: what it can reach, and what holds its tokens")
+    info = docker_inspect("sync")
+    config = info["HostConfig"]
+    check("It publishes no ports", not config["PortBindings"], str(config["PortBindings"]))
+    check("It has a memory limit", config["Memory"] > 0)
+    check("Its filesystem is read-only", config["ReadonlyRootfs"])
+    check("It drops all capabilities", config["CapDrop"] == ["ALL"], str(config["CapDrop"]))
+    check("It can't gain privileges", "no-new-privileges:true" in config["SecurityOpt"])
+    check("It restarts by itself", config["RestartPolicy"]["Name"] == "unless-stopped")
+    check("It's healthy", info["State"].get("Health", {}).get("Status") == "healthy", str(info["State"].get("Health")))
+    uid = compose("exec", "-T", "sync", "id", "-u").stdout.strip()
+    check("It runs as non-root", uid == "10001", uid)
+    modules = next((mount for mount in info["Mounts"] if mount["Destination"] == "/modules"), {})
+    check("The modules' code is read-only to it", modules.get("RW") is False, str(modules))
+
+    env = sync_env()
+    mode = subprocess.run(["stat", "-c", "%u %a", str(SYNC_ENV)], capture_output=True, text=True).stdout.strip()
+    check("Its settings file is readable by root only", mode == "0 600", mode)
+    has = lambda service, value: value in " ".join(docker_inspect(service)["Config"]["Env"])
+    for name in ("FORGEJO_ADMIN_TOKEN", "VAULT_ADMIN_TOKEN"):
+        check(f"It has {name}", has("sync", env[name]))
+        check("...and core's web process doesn't", not has("core", env[name]) and env[name] not in CORE_ENV.read_text())
+    core_settings = dict(line.split("=", 1) for line in CORE_ENV.read_text().splitlines() if "=" in line)
+    check("It doesn't have core's signing key", not has("sync", core_settings["OIDC_SIGNING_KEY"]))
+    check("...or its secret key", not has("sync", core_settings["DJANGO_SECRET_KEY"]))
+    in_vault_env = dict(line.split("=", 1) for line in in_vault("env").stdout.splitlines() if "=" in line)
+    check("Vaultwarden only gets a hash of its admin token", in_vault_env.get("ADMIN_TOKEN", "").startswith("$argon2id$"), in_vault_env.get("ADMIN_TOKEN", "")[:12])
+    check("...and not the token", env["VAULT_ADMIN_TOKEN"] not in in_vault("env").stdout and env["VAULT_ADMIN_TOKEN"] not in VAULT_ENV.read_text())
+    wrong = compose("exec", "-T", "core", "python", "-c", "import urllib.request, urllib.error\ntry:\n    urllib.request.urlopen(urllib.request.Request('http://vaultwarden:8080/admin', data=b'token=wrong', headers={'Content-Type': 'application/x-www-form-urlencoded'}))\nexcept urllib.error.HTTPError as e:\n    print(e.code)")
+    check("A wrong admin token is refused, even from inside", wrong.stdout.strip() == "401", wrong.stdout + wrong.stderr[-200:])
+    check("With its token on, the admin page still isn't on the internet", Browser(vault_host(host)).get("/admin").status == 404)
+    check("...nor anything under it", Browser(vault_host(host)).get("/admin/users/overview").status == 404)
+    check("Vaultwarden hasn't warned about a plain token", "plain text" not in subprocess.run(["docker", "logs", VAULT], capture_output=True, text=True).stdout)
+
+
+def check_git_own_2fa(host, secrets_by_name):
+    """Someone with Forgejo's own 2FA turned on isn't asked again, as core has already asked."""
+    section("Forgejo: its own 2FA doesn't add a second login")
+    person, _ = git_person(host, "fake-sync-2fa", secrets_by_name)
+    page = person.git.get("/user/settings/security/two_factor/enroll")
+    found = re.search(r"\b[A-Z2-7]{32,}\b", page.text)
+    check("Someone can turn on Forgejo's own 2FA", bool(found), str(page.status))
+    if found:
+        answer = person.git.send("POST", "/user/settings/security/two_factor/enroll", [("passcode", totp(found.group(0)))])
+        check("...which it takes", answer.status in (200, 303), str(answer.status))
+        enrolled = core_db_git("select count(*) from two_factor where uid = (select id from user where lower_name = 'fake-sync-2fa')")
+        check("...and it's really on", enrolled == 1, str(enrolled))
+    person.new_git_session()
+    reached, _ = person.sign_in_to_git()
+    check("Signing in again asks for nothing more", person.in_git() and "two_factor" not in reached, reached)
+
+
+def core_db_git(query):
+    connection = sqlite3.connect("file:/srv/git/data/gitea.db?mode=ro", uri=True)
+    try:
+        return connection.execute(query).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def check_git_groups_now(host, operator, secrets_by_name):
+    section("Forgejo: joining a group")
+    joiner, token = git_person(host, "fake-sync-joiner", secrets_by_name)
+    check("Control: a Member is on no team", team_names(host, token) == [], str(team_names(host, token)))
+    email = email_of("fake-sync-joiner")
+    set_groups(email, ["board"], wait=False)
+    took = wait_for(lambda: team_names(host, token) == ["board"])
+    check("Joining Board puts them on the team, with no new sign-in", took is not None)
+    print(f"  info  It took {took} seconds.")
+
+    section("Forgejo: leaving a group, including repos they created")
+    org = org_of(host)
+    colleague, colleague_token = git_person(host, "fake-sync-colleague", secrets_by_name)
+    creator, token = git_person(host, "fake-sync-creator", secrets_by_name)
+    repo = "fake-sync-repo"
+    check("A Developer creates a repo", make_repo(host, token, repo))
+    check("Control: Forgejo made them a collaborator", "fake-sync-creator" in collaborators(host, repo), str(collaborators(host, repo)))
+    check("Control: they can push to it", can_push(host, "fake-sync-creator", token, repo, "before"))
+    check("Control: so can a colleague", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-before"))
+
+    set_groups(email_of("fake-sync-creator"), ["member"], wait=False)
+    took = wait_for(lambda: forgejo_api(host, token, "GET", f"/repos/{org}/{repo}")[0] == 404)
+    check("Leaving the group takes the repo they created away, with no new sign-in", took is not None)
+    print(f"  info  It took {took} seconds.")
+    wait_for_sync()
+    check("They're on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("They aren't a collaborator on it", "fake-sync-creator" not in collaborators(host, repo), str(collaborators(host, repo)))
+    check("They can't push", not can_push(host, "fake-sync-creator", token, repo, "after"))
+    check("They can't clone", not can_clone(host, "fake-sync-creator", token, repo))
+    check("Their account still works, for public repos", forgejo_api(host, token, "GET", "/user")[0] == 200)
+    check("A colleague on the team isn't affected", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-after"))
+
+    mover, token = git_person(host, "fake-sync-moved", secrets_by_name)
+    moved_repo = "fake-sync-moved-repo"
+    check("A Developer who's about to join Board creates a repo", make_repo(host, token, moved_repo))
+    set_groups(email_of("fake-sync-moved"), ["board"])
+    check("On joining Board instead, they can read it", can_clone(host, "fake-sync-moved", token, moved_repo))
+    check("...but no longer write to it", not can_push(host, "fake-sync-moved", token, moved_repo, "after"))
+    check("...as they aren't a collaborator", "fake-sync-moved" not in collaborators(host, moved_repo), str(collaborators(host, moved_repo)))
+
+    admin, token = git_person(host, "fake-sync-admin", secrets_by_name)
+    check("Control: an Operator is a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
+    set_groups(email_of("fake-sync-admin"), ["member"])
+    check("Leaving Operator ends that, with no new sign-in", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    check("...and takes them off the owners", team_names(host, token) == [], str(team_names(host, token)))
+
+
+def check_git_offboarding(host, operator, secrets_by_name):
+    section("Forgejo: offboarding")
+    org = org_of(host)
+    email = email_of("fake-sync-leaver")
+    leaver, token = git_person(host, "fake-sync-leaver", secrets_by_name)
+    repo = "fake-sync-leaver-repo"
+    raw = f"/{org}/{repo}/raw/branch/main/secret.txt"
+    check("They create a repo", make_repo(host, token, repo))
+    check("Control: their token reaches the API", forgejo_api(host, token, "GET", "/user")[0] == 200)
+    check("Control: their token works with Git", can_clone(host, "fake-sync-leaver", token, repo))
+    check("Control: their open session shows the settings page", leaver.in_git())
+    check("Control: their open session shows the file", GIT_SECRET in leaver.git.get(raw).text)
+    check("Control: their open session shows the repo's file list", "secret.txt" in leaver.git.get(f"/{org}/{repo}").text)
+    check("Control: Git hands out the repo's refs", "refs/heads" in git_refs(host, "fake-sync-leaver", token, repo))
+    check("Control: their core session works", leaver.app.logged_in())
+
+    status = admin_page_set_active(operator, email, False)
+    check("An Operator turns off their account on the admin page", status == 302, str(status))
+    took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] != 200)
+    check("Their token stops working on the API, with nothing more to do", took is not None)
+    print(f"  info  It took {took} seconds.")
+    wait_for_sync()
+    check("...and with Git", not can_clone(host, "fake-sync-leaver", token, repo))
+    check("...which hands out nothing about the repo, whatever the status", "refs/heads" not in git_refs(host, "fake-sync-leaver", token, repo))
+    # Forgejo answers a blocked session with a 200 page, so status alone proves nothing.
+    check("Their open session no longer shows the settings page", not leaver.in_git())
+    check("...or the file", GIT_SECRET not in leaver.git.get(raw).text)
+    check("...or the repo's file list", "secret.txt" not in leaver.git.get(f"/{org}/{repo}").text)
+    before = forgejo_tokens()
+    leaver.git.send("POST", "/user/settings/applications/tokens/new", [("name", "while-blocked"), ("resource", "all"), ("scope", "write:repository")])
+    check("...and can't make a new token", forgejo_tokens() == before, f"{before} {forgejo_tokens()}")
+    check("Core has ended their session too", not leaver.app.logged_in())
+    fresh = Person(host)
+    fresh.app.log_in(email)
+    check("They can't log in to core", not fresh.app.logged_in())
+    account = git_account(host, email)
+    check("Forgejo has them blocked", account["prohibit_login"] is True, str(account["prohibit_login"]))
+    developers = next(t for t in forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{org}/teams")[1] if t["name"] == "developers")
+    check("They're off the team", forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/teams/{developers['id']}/members/fake-sync-leaver")[0] == 404)
+    check("They aren't a collaborator on what they created", "fake-sync-leaver" not in collaborators(host, repo), str(collaborators(host, repo)))
+
+    status = admin_page_set_active(operator, email, True)
+    check("Turning the account back on works", status == 302, str(status))
+    took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] == 200)
+    check("...and so does their token", took is not None)
+    wait_for_sync()
+    check("...and they're back on the team", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    check("...but not back as a collaborator, as the team is what gives them access", "fake-sync-leaver" not in collaborators(host, repo), str(collaborators(host, repo)))
+    fresh = Person(host)
+    fresh.log_in_to_core(email)
+    fresh.sign_in_to_git()
+    check("...and they can sign in again", fresh.in_git())
+
+    section("Forgejo: other ways of leaving")
+    _, token = git_person(host, "fake-sync-deleted", secrets_by_name)
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.get(email={email_of('fake-sync-deleted')!r}).delete()")
+    check("Deleting the account in core stops their token", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] != 200) is not None)
+
+    _, token = git_person(host, "fake-sync-bypass", secrets_by_name)
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email_of('fake-sync-bypass')!r}).update(is_active=False)")
+    time.sleep(5)
+    check("Control: a change that gets past the signals isn't noticed yet", forgejo_api(host, token, "GET", "/user")[0] == 200)
+    compose("restart", "sync")
+    check("...until the worker's regular look at everyone", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] != 200, 60) is not None)
+
+    section("Forgejo: when it's down at the time")
+    _, token = git_person(host, "fake-sync-outage", secrets_by_name)
+    email = email_of("fake-sync-outage")
+    subprocess.run(["docker", "stop", FORGEJO], capture_output=True)
+    try:
+        status = admin_page_set_active(operator, email, False)
+        check("Turning off an account still works, and the page doesn't wait for it", status == 302, str(status))
+        pk = core_db("select id from accounts_user where email = ?", email)[0][0]
+        wait_for(lambda: "error" in core_db("select tools from accounts_accesssync where sub = ?", str(pk))[0][0])
+        page = operator.get(f"/admin/accounts/user/{pk}/change/").text
+        check("Their page on the admin site says it hasn't reached Forgejo", "forgejo:" in page)
+    finally:
+        subprocess.run(["docker", "start", FORGEJO], capture_output=True)
+    wait_for(lambda: json.loads(subprocess.run(["docker", "inspect", FORGEJO], capture_output=True, text=True).stdout)[0]["State"].get("Health", {}).get("Status") == "healthy", 90)
+    took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] == 403, 330)
+    check("When it's back, the worker tries again and their token stops", took is not None)
+    print(f"  info  It took {took} seconds after Forgejo was healthy.")
+    wait_for_sync()  # blocking comes first, so their token stops before it has finished
+    page = operator.get(f"/admin/accounts/user/{pk}/change/").text
+    check("Their page then says it's done", "forgejo:" not in page and "Sent to" in page)
+
+
+def check_worker_down(host, operator, secrets_by_name):
+    section("The worker: when it's down")
+    _, token = git_person(host, "fake-sync-nowork", secrets_by_name)
+    email = email_of("fake-sync-nowork")
+    worker("stop")
+    try:
+        status = admin_page_set_active(operator, email, False)
+        check("Turning off an account still works", status == 302, str(status))
+        time.sleep(3)
+        check("Control: their token isn't stopped yet", forgejo_api(host, token, "GET", "/user")[0] == 200)
+        time.sleep(61)
+        index = operator.get("/admin/").text
+        check("After a minute, the admin page says so", f"{email} hasn't reached every tool" in html.unescape(index))
+    finally:
+        worker("start")
+    check("When it's back, it catches up", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] == 403, 60) is not None)
+    wait_for_sync()
+    check("...and the admin page stops saying so", f"{email} hasn" not in html.unescape(operator.get("/admin/").text))
+
+
+def vault_member(owner, org, person_email, kind=2, collection=None):
+    """Add someone to an organisation, as the steps with no mail go."""
+    collections = [{"id": collection, "readOnly": False, "hidePasswords": False, "manage": False}] if collection else []
+    owner.api("POST", f"/api/organizations/{org}/users/invite", {"emails": [person_email], "groups": [], "type": kind, "collections": collections, "permissions": {}})
+    members = owner.api("GET", f"/api/organizations/{org}/users")[1].get("data", [])
+    member = next((m for m in members if m["email"] == person_email), {})
+    owner.api("POST", f"/api/organizations/{org}/users/{member.get('id')}/confirm", {"key": VAULT_KEY})
+    return member.get("id")
+
+
+def vault_org(person, email, name):
+    answer = person.api(
+        "POST",
+        "/api/organizations",
+        {"name": name, "billingEmail": email, "collectionName": VAULT_KEY, "key": VAULT_KEY, "planType": 0, "keys": {"encryptedPrivateKey": VAULT_KEY, "publicKey": "not-a-real-public-key"}},
+    )[1]
+    return answer["id"]
+
+
+def vault_enabled_flag(email):
+    found = vault_db("select enabled from users where email = ?", email)
+    return bool(found[0][0]) if found else None
+
+
+def follow_ups(email):
+    return core_db("select text, done_at, done_by_id from accounts_followup where about = ? order by id", email)
+
+
+def check_vault_offboarding(host, operator, secrets_by_name):
+    section("Vaultwarden: leaving a group")
+    clear_vault_limits()
+    owner = vault_person(host, "fake-vsync-owner", secrets_by_name)
+    owner_email = email_of("fake-vsync-owner")
+    org_name = "Fake shared passwords"
+    org = vault_org(owner, owner_email, org_name)
+    check("An owner has an organisation", bool(org))
+
+    email = email_of("fake-vsync-removed")
+    removed = vault_person(host, "fake-vsync-removed", secrets_by_name)
+    vault_member(owner, org, email)
+    account = vault_account(email)
+    joined = [entry["id"] for entry in removed.sync().get("profile", {}).get("organizations", [])]
+    check("Control: they're in the organisation", org in joined, str(joined))
+    check("Control: their token reaches the API", removed.in_vault())
+    check("Control: it can be refreshed", removed.refresh()[0] == 200)
+    set_groups(email, ["member"], wait=False)
+    took = wait_for(lambda: not removed.in_vault())
+    check("Leaving the groups ends their token, even used by hand", took is not None)
+    print(f"  info  It took {took} seconds.")
+    wait_for_sync()
+    check("...and refreshing it", removed.refresh()[0] != 200)
+    check("Vaultwarden has them turned off", vault_enabled_flag(email) is False)
+    reached, answer = removed.click_sign_in()
+    check("Signing in again shows them they have no access", answer.status == 403 and removed.code is None, f"{reached} {answer.status}")
+    check("A follow-up asks for the shared passwords to change", len(follow_ups(email)) == 1 and org_name in follow_ups(email)[0][0], str(follow_ups(email)))
+    set_groups(email, ["board"])
+    check("Coming back turns them on again", vault_enabled_flag(email) is True)
+    status, _ = removed.sign_in()
+    check("...and they can sign in", status == 200, str(status))
+    check("...to the same account", vault_account(email) == account)
+    check("...and asking again doesn't repeat the follow-up", len(follow_ups(email)) == 1, str(follow_ups(email)))
+    # With that one still open. A second note mustn't get in the way of turning them off.
+    set_groups(email, ["member"], wait=False)
+    took = wait_for(lambda: not removed.in_vault())
+    check("Leaving again ends their token again", took is not None)
+    wait_for_sync()
+    check("...with Vaultwarden turning them off", vault_enabled_flag(email) is False)
+    check("...and still the one follow-up", len(follow_ups(email)) == 1, str(follow_ups(email)))
+    set_groups(email, ["board"])
+
+    section("Vaultwarden: offboarding")
+    clear_vault_limits()
+    email = email_of("fake-vsync-off")
+    leaver = vault_person(host, "fake-vsync-off", secrets_by_name)
+    owner_id = owner.sync()["profile"]["id"]
+    collection = owner.api("GET", f"/api/organizations/{org}/collections")[1]["data"][0]["id"]
+    member_id = vault_member(owner, org, email, collection=collection)
+    created = owner.api("POST", "/api/ciphers/create", {"cipher": {"type": 2, "name": VAULT_KEY, "organizationId": org, "encryptedFor": owner_id, "secureNote": {"type": 0}, "notes": VAULT_KEY}, "collectionIds": [collection]})
+    entry = created[1]["id"] if created[0] == 200 else None
+    check("A shared entry exists", bool(entry), str(created)[:200])
+    check("Control: their token reaches the API", leaver.in_vault())
+    check("Control: they can fetch the shared entry", leaver.api("GET", f"/api/ciphers/{entry}")[0] == 200)
+    check("Control: they have their own entries to keep", leaver.api("POST", "/api/ciphers", {"type": 2, "name": VAULT_KEY, "encryptedFor": leaver.sync()["profile"]["id"], "secureNote": {"type": 0}, "notes": VAULT_KEY})[0] == 200)
+    status = admin_page_set_active(operator, email, False)
+    check("An Operator turns off their account on the admin page", status == 302, str(status))
+    took = wait_for(lambda: not leaver.in_vault())
+    check("Their token stops working, even used by hand", took is not None)
+    print(f"  info  It took {took} seconds.")
+    wait_for_sync()
+    check("...and refreshing it", leaver.refresh()[0] != 200)
+    check("...and fetching the shared entry", leaver.api("GET", f"/api/ciphers/{entry}")[0] != 200)
+    check("Vaultwarden has them turned off", vault_enabled_flag(email) is False)
+    fresh = VaultPerson(host)
+    fresh.app.log_in(email)
+    check("They can't log in to core", not fresh.app.logged_in())
+
+    open_items = follow_ups(email)
+    check("A follow-up names the organisation and the person", len(open_items) == 1 and org_name in open_items[0][0] and email in open_items[0][0], str(open_items))
+    check("...and it's open", open_items and open_items[0][1] is None)
+    compose("restart", "sync")
+    time.sleep(5)
+    wait_for_sync()
+    check("Going over everyone again doesn't add another", len(follow_ups(email)) == 1, str(follow_ups(email)))
+
+    board = Browser(host)
+    board.log_in(owner_email)
+    board.enter_code(totp(secrets_by_name["fake-vsync-owner"], 1))  # each code works once, and they've just used this one
+    index = board.get("/admin/").text
+    check("Board sees it on the admin page", f"{email} could see them" in html.unescape(index))
+    check("...and in its list", org_name in board.get("/admin/accounts/followup/").text)
+    member = Browser(host)
+    member.log_in(email_of("fake-vsync-member"))
+    check("A Member doesn't", member.get("/admin/accounts/followup/").status != 200)
+    check("Nobody can add one by hand", board.get("/admin/accounts/followup/add/").status == 403)
+
+    # What a person does: the owner changes the entry and removes them from the organisation.
+    status, _ = owner.api("PUT", f"/api/ciphers/{entry}", {"type": 2, "name": VAULT_KEY, "organizationId": org, "encryptedFor": owner_id, "secureNote": {"type": 0}, "notes": VAULT_KEY.replace("bm90LXJlYWw=", "Y2hhbmdlZA==", 1)})
+    check("An owner can change the shared entry", status == 200, str(status))
+    status, _ = owner.api("DELETE", f"/api/organizations/{org}/users/{member_id}")
+    check("...and remove them from the organisation, though their account is off", status == 200, str(status))
+    pk = core_db("select id from accounts_followup where about = ?", email)[0][0]
+    page = board.get("/admin/accounts/followup/")
+    token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text)
+    done = board.send("POST", "/admin/accounts/followup/", [("csrfmiddlewaretoken", token.group(1) if token else ""), ("action", "mark_done"), ("_selected_action", str(pk))])
+    check("...and mark the follow-up done", done.status == 302, str(done.status))
+    closed = follow_ups(email)[0]
+    board_pk = core_db("select id from accounts_user where email = ?", owner_email)[0][0]
+    check("It records when and who", closed[1] is not None and closed[2] == board_pk, str(closed))
+    check("...and it's no longer shown as to do", f"{email} could see them" not in html.unescape(board.get("/admin/").text))
+    check("...while another that's still open is", f"{email_of('fake-vsync-removed')} could see them" in html.unescape(board.get("/admin/").text))
+
+    status = admin_page_set_active(operator, email, True)
+    wait_for_sync()
+    check("If they come back, their account is on again", vault_enabled_flag(email) is True, str(status))
+    fresh = VaultPerson(host)
+    fresh.log_in_to_core(email, None)
+    fresh.app.enter_code(totp(secrets_by_name["fake-vsync-off"], 1))
+    check("...and they can sign in", fresh.sign_in()[0] == 200)
+    data = fresh.sync()
+    check("...with their own entries", len(data.get("ciphers", [])) == 1, str(len(data.get("ciphers", []))))
+    check("...and not the organisation's", org not in [entry["id"] for entry in data.get("profile", {}).get("organizations", [])])
+
+    section("Vaultwarden: an organisation left with no owner")
+    clear_vault_limits()
+    email = email_of("fake-vsync-solo")
+    solo = vault_person(host, "fake-vsync-solo", secrets_by_name)
+    vault_org(solo, email, "Fake solo organisation")
+    set_groups(email, ["member"])
+    text = " ".join(item[0] for item in follow_ups(email))
+    check("Losing an organisation's only owner says so", "only owner" in text and "Fake solo organisation" in text, text)
+    email = email_of("fake-vsync-co")
+    co = vault_person(host, "fake-vsync-co", secrets_by_name)
+    vault_member(owner, org, email, kind=0)
+    set_groups(email, ["member"])
+    text = " ".join(item[0] for item in follow_ups(email))
+    check("One owner of two leaving doesn't", text and "only owner" not in text, text)
+
+    section("Vaultwarden: people are found by core's id, not their address")
+    clear_vault_limits()
+    old_address, new_address = email_of("fake-vsync-renamed"), email_of("fake-vsync-renamed-new")
+    renamed = vault_person(host, "fake-vsync-renamed", secrets_by_name)
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+user = get_user_model().objects.get(email={old_address!r})
+user.email = {new_address!r}
+user.save()
+"""
+    )
+    wait_for_sync()
+    check("Control: Vaultwarden keeps their old address, and they're still in", vault_account(old_address) is not None and renamed.in_vault())
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+user = get_user_model().objects.create_user({old_address!r}, {PASSWORD!r})
+user.groups.set(Group.objects.filter(role__key="board"))
+user.is_active = False
+user.save()
+"""
+    )
+    wait_for_sync()
+    check("Turning off someone else who now has that address leaves them alone", renamed.in_vault() and vault_enabled_flag(old_address) is True, str(vault_enabled_flag(old_address)))
+    set_active(new_address, False)
+    check("Turning off the person themselves, at their new address, ends their token", wait_for(lambda: not renamed.in_vault()) is not None)
+
+    section("Vaultwarden: other ways of leaving")
+    deleted = vault_person(host, "fake-vsync-deleted", secrets_by_name)
+    in_core(f"from django.contrib.auth import get_user_model as g; g().objects.get(email={email_of('fake-vsync-deleted')!r}).delete()")
+    check("Deleting the account in core ends their token", wait_for(lambda: not deleted.in_vault()) is not None)
+
+    section("Vaultwarden: when it's down at the time")
+    clear_vault_limits()
+    email = email_of("fake-vsync-outage")
+    person = vault_person(host, "fake-vsync-outage", secrets_by_name)
+    subprocess.run(["docker", "stop", VAULT], capture_output=True)
+    try:
+        status = admin_page_set_active(operator, email, False)
+        check("Turning off an account still works", status == 302, str(status))
+        pk = core_db("select id from accounts_user where email = ?", email)[0][0]
+        wait_for(lambda: "error" in core_db("select tools from accounts_accesssync where sub = ?", str(pk))[0][0])
+        check("Their page on the admin site says it hasn't reached Vaultwarden", "vaultwarden:" in operator.get(f"/admin/accounts/user/{pk}/change/").text)
+    finally:
+        subprocess.run(["docker", "start", VAULT], capture_output=True)
+    wait_for_vault()
+    took = wait_for(lambda: not person.in_vault(), 330)
+    check("When it's back, the worker tries again and their token stops", took is not None)
+    print(f"  info  It took {took} seconds after Vaultwarden was healthy.")
+    return {"blocked_vault_tokens": leaver.tokens}
+
+
+def emergency_token(host, email, password=VAULT_HASH):
+    """A password login at the emergency copy, which only someone on the server can reach."""
+    connection = emergency_connection()
+    form = urllib.parse.urlencode(
+        {"grant_type": "password", "username": email, "password": password, "scope": "api offline_access", "client_id": "web", "deviceType": "9", "deviceIdentifier": str(uuid.uuid4()), "deviceName": "chrome"}
+    )
+    connection.request("POST", "/identity/connect/token", form, {"Content-Type": "application/x-www-form-urlencoded"})
+    answer = connection.getresponse()
+    text = answer.read().decode(errors="replace")
+    connection.close()
+    try:
+        return answer.status, json.loads(text)
+    except ValueError:
+        return answer.status, {}
+
+
+def kit_emergency_address():
+    return subprocess.run(["docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", VAULT_EMERGENCY], capture_output=True, text=True).stdout.strip()
+
+
+def emergency_connection():
+    """It only speaks HTTPS, with a certificate made on the spot for localhost."""
+    return http.client.HTTPSConnection(kit_emergency_address(), 8080, context=ssl._create_unverified_context(), timeout=30)
+
+
+def emergency_get(path, token=None):
+    connection = emergency_connection()
+    connection.request("GET", path, headers={"Authorization": f"Bearer {token}"} if token else {})
+    answer = connection.getresponse()
+    text = answer.read().decode(errors="replace")
+    connection.close()
+    return answer.status, text
+
+
+def check_core_down(host, secrets_by_name):
+    org = org_of(host)
+    clear_limits()
+    clear_vault_limits()
+    developer, token = git_person(host, "fake-sync-down", secrets_by_name)
+    repo = "fake-sync-down-repo"
+    make_repo(host, token, repo)
+    vault = vault_person(host, "fake-vsync-down", secrets_by_name)
+    off_email = email_of("fake-vsync-off-down")
+    off = vault_person(host, "fake-vsync-off-down", secrets_by_name)
+    set_active(off_email, False)
+    wait_for_sync()
+    check("Control: someone is turned off in Vaultwarden, for a check below", vault_enabled_flag(off_email) is False)
+    sites = tomllib.loads(CONFIG.read_text()).get("website", {}).get("sites", [])
+    git_person(host, "fake-sync-rescuer", secrets_by_name)
+    check("Control: an Operator has a Forgejo account", "fake-sync-rescuer" in in_forgejo("forgejo", "admin", "user", "list").stdout)
+    check("Control: signing in to core works", developer.app.logged_in())
+
+    compose("stop", "core")
+    try:
+        section("Core is down: Forgejo")
+        check("Control: core really is down", Browser(host).get("/").status >= 500)
+        check("An open session keeps working", developer.in_git())
+        check("...and shows repos", GIT_SECRET in developer.git.get(f"/{org}/{repo}/raw/branch/main/secret.txt").text)
+        check("A token keeps working on the API", forgejo_api(host, token, "GET", "/user")[0] == 200)
+        check("...and with Git", can_push(host, "fake-sync-down", token, repo, "while-core-is-down"))
+        visitor = Person(host)
+        visitor.app.cookies = dict(developer.app.cookies)  # logged in to core, so it's only core being down that stops this
+        started = time.time()
+        reached, answer = visitor.open_git(f"/user/oauth2/{org}")
+        check("Someone new to Forgejo can't sign in", not visitor.in_git(), reached)
+        check("...and is told straight away, rather than left waiting", time.time() - started < 20, str(time.time() - started))
+        for site in sites[:1]:
+            check("The public sites don't depend on core", Browser(site["domain"]).get("/").status == 200)
+
+        section("Core is down: getting into Forgejo")
+        answer = kit("emergency", "git", "fake-sync-rescuer")
+        found = re.search(r"\b[0-9a-f]{40}\b", answer.stdout)
+        check("`kit emergency git` makes a token on someone's own account", answer.returncode == 0 and bool(found), answer.stderr[-200:])
+        emergency = found.group(0) if found else ""
+        status, account = forgejo_api(host, emergency, "GET", "/user")
+        check("It works on the API, in their name", status == 200 and account.get("login") == "fake-sync-rescuer", str(status))
+        check("...and with Git, on a private repo", can_clone(host, "fake-sync-rescuer", emergency, repo))
+        # After --, so it gets past kit's own command line and only the check itself can stop it.
+        refused = kit("emergency", "git", "--", "--admin")
+        check("It refuses a name that could be read as an option", refused.returncode != 0 and "isn't a valid" in refused.stderr, refused.stderr[-200:])
+        check("It refuses someone with no account", kit("emergency", "git", "fake-nobody-at-all").returncode != 0)
+
+        section("Core is down: Vaultwarden")
+        check("Control: a token used by hand still reaches the API", vault.in_vault())
+        check("...but can't refresh, so a browser's next page load signs it out", vault.refresh()[0] != 200)
+        reached, answer = vault.click_sign_in()
+        check("Someone logged in to core can't sign in", vault.code is None, reached)
+        status, data = vault.identity(grant_type="password", username=email_of("fake-vsync-down"), password=VAULT_HASH, scope="api offline_access", deviceType="9", deviceIdentifier=vault.device, deviceName="chrome")
+        check("The public address still refuses a master password", status != 200 and "access_token" not in data, str(status))
+
+        section("Core is down: getting into Vaultwarden")
+        answer = kit("emergency", "vault")
+        check("`kit emergency vault` starts", answer.returncode == 0, answer.stderr[-300:])
+        check("...and says how to reach it", "ssh -L 8222:" in answer.stdout and "https://localhost:8222" in answer.stdout, answer.stdout[:300])
+        check("It's up", wait_for(lambda: emergency_is_up(), 60) is not None)
+        lines = subprocess.run(["docker", "ps", "--format", "{{.Names}}|{{.Ports}}"], capture_output=True, text=True).stdout.splitlines()
+        publishing = sorted(line.split("|")[0] for line in lines if "->" in line)
+        check("Only Caddy publishes ports, still", publishing == ["sallskap-caddy-1"], str(publishing))
+        listening = [line for line in subprocess.run(["ss", "-ltnH"], capture_output=True, text=True).stdout.splitlines() if ":8222 " in line or ":8080 " in line]
+        check("Nothing on the server listens for it", not listening, str(listening))
+        info = json.loads(subprocess.run(["docker", "inspect", VAULT_EMERGENCY], capture_output=True, text=True).stdout)[0]
+        check("It won't restart by itself", info["HostConfig"]["RestartPolicy"]["Name"] in ("", "no"), str(info["HostConfig"]["RestartPolicy"]))
+        check("It keeps Vaultwarden's limits", info["HostConfig"]["Memory"] > 0 and info["HostConfig"]["ReadonlyRootfs"] and info["HostConfig"]["CapDrop"] == ["ALL"])
+        aliases = [alias for network in info["NetworkSettings"]["Networks"].values() for alias in network.get("Aliases") or []]
+        check("Caddy can't find it under Vaultwarden's name", "vaultwarden" not in aliases, str(aliases))
+        resolved = subprocess.run(["docker", "exec", "sallskap-caddy-1", "getent", "hosts", "vaultwarden"], capture_output=True, text=True).stdout.split()
+        check("...as that name still means one address, and not this one", resolved and kit_emergency_address() not in resolved, str(resolved))
+
+        status, data = emergency_token(host, email_of("fake-vsync-down"))
+        check("The right master password gets in", status == 200 and "access_token" in data, f"{status} {str(data)[:200]}")
+        status_sync, text = emergency_get("/api/sync", data.get("access_token"))
+        check("...and reaches their vault", status_sync == 200 and email_of("fake-vsync-down") in text, str(status_sync))
+        check("That token means nothing at the public address", public_vault_status(host, data.get("access_token")) == 401, str(public_vault_status(host, data.get("access_token"))))
+        status, data = emergency_token(host, email_of("fake-vsync-down"), "bm90LXRoZS1yaWdodC1oYXNo")
+        check("A wrong master password doesn't", status != 200 and "access_token" not in data, str(status))
+        status, data = emergency_token(host, off_email)
+        check("An account that's turned off doesn't, even with the right one", status != 200 and "access_token" not in data, f"{status} {str(data)[:200]}")
+        check("Its admin page is off", "disabled" in emergency_get("/admin")[1].lower())
+        refusals = [vault.identity(grant_type="password", username=email_of("fake-vsync-down"), password=VAULT_HASH, scope="api offline_access", deviceType="9", deviceIdentifier=vault.device, deviceName="chrome")[0] for _ in range(6)]
+        check("The public address still refuses a master password, every time", all(status != 200 for status in refusals), str(refusals))
+        check("`kit emergency vault` again changes nothing", kit("emergency", "vault").returncode == 0 and kit_emergency_address() != "")
+
+        answer = kit("emergency", "vault", "--off")
+        check("`--off` stops it", answer.returncode == 0 and "Stopped" in answer.stdout, answer.stdout + answer.stderr)
+        check("...and it's gone", subprocess.run(["docker", "inspect", VAULT_EMERGENCY], capture_output=True).returncode != 0)
+        check("...along with its certificate", not (VAULT_DIR / "emergency-tls").exists())
+        check("Asking again says so", "wasn't" in kit("emergency", "vault", "--off").stdout)
+    finally:
+        subprocess.run(["docker", "rm", "--force", VAULT_EMERGENCY], capture_output=True)
+        compose("up", "-d", "--wait", "core")
+
+    section("Core is back")
+    clear_limits()
+    clear_vault_limits()
+    check("An open Forgejo session is still fine", developer.in_git())
+    returning = Person(host)
+    returning.app.cookies = dict(developer.app.cookies)
+    returning.sign_in_to_git()
+    check("Signing in to Forgejo works again", returning.in_git())
+    status, _ = vault.sign_in()
+    check("Signing in to Vaultwarden works again", status == 200, str(status))
+    check("...into the same account", vault.in_vault())
+
+
+def emergency_is_up():
+    try:
+        return emergency_get("/alive")[0] == 200
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+def public_vault_status(host, token):
+    person = VaultPerson(host)
+    person.tokens = {"access_token": token or ""}
+    return person.api("GET", "/api/sync")[0]
+
+
+def check_access_table(host, operator, secrets_by_name):
+    """Both tools together, as some of this takes core itself down."""
+    check_sync_exposure(host)
+    clear_limits()
+    check_git_own_2fa(host, secrets_by_name)
+    time.sleep(31)
+    check_git_groups_now(host, operator, secrets_by_name)
+    clear_limits()
+    check_git_offboarding(host, operator, secrets_by_name)
+    clear_limits()
+    check_worker_down(host, operator, secrets_by_name)
+    clear_limits()
+    state = check_vault_offboarding(host, operator, secrets_by_name)
+    clear_limits()
+    check_core_down(host, secrets_by_name)
+    clear_limits()
+    clear_vault_limits()
+    # Someone who has left, to check after a restart that they stay out.
+    keeper_name = "fake-sync-blocked"
+    _, token = git_person(host, keeper_name, secrets_by_name)
+    admin_page_set_active(operator, email_of(keeper_name), False)
+    wait_for_sync()
+    return {**state, "blocked_git_token": token, "worker_token_hashes": hashlib.sha256(SYNC_ENV.read_bytes()).hexdigest()}
+
+
+def verify_access(host, state):
+    section("Access: do those who've left stay out?")
+    check_sync_exposure(host)
+    check("A blocked Forgejo token stays blocked", forgejo_api(host, state["blocked_git_token"], "GET", "/user")[0] == 403)
+    blocked = VaultPerson(host)
+    blocked.tokens = state["blocked_vault_tokens"]
+    # That person came back during the checks, so this token ended when they left.
+    check("A Vaultwarden token ended by leaving stays ended", not blocked.in_vault())
+    check("The worker's settings didn't change", hashlib.sha256(SYNC_ENV.read_bytes()).hexdigest() == state["worker_token_hashes"])
+    wait_for_sync()
+    check("Nothing is waiting to be sent", core_db("select count(*) from accounts_accesssync where pending = 1")[0][0] == 0)
+
+
 def prepare():
     if STATE.exists():
         raise SystemExit(f"{STATE} exists. Run cleanup first.")
@@ -1994,6 +2774,9 @@ def prepare():
     tool = check_login_service(host, secrets_by_name)
     forgejo = check_forgejo(host, secrets_by_name) if git_enabled() else None
     vault = check_vault(host, secrets_by_name) if vault_enabled() else None
+    access = check_access_table(host, operator, secrets_by_name) if git_enabled() and vault_enabled() else None
+    if forgejo:
+        forgejo["fingerprint"] = forgejo_fingerprint()  # after those, which make tokens too
 
     keeper = Browser(host)
     keeper.log_in(email_of("fake-member"))
@@ -2007,6 +2790,7 @@ def prepare():
                 "tool": tool,
                 "git": forgejo,
                 "vault": vault,
+                "access": access,
                 "signing_key": json.loads(Browser(host).get("/.well-known/jwks.json").text)["keys"][0]["kid"],
             }
         )
@@ -2046,6 +2830,8 @@ def verify():
         verify_forgejo(host, state["git"])
     if state.get("vault"):
         verify_vault(host, state["vault"])
+    if state.get("access"):
+        verify_access(host, state["access"])
 
 
 def burst():
@@ -2077,6 +2863,10 @@ def burst():
     check("Nothing was killed for using too much memory", _oom_kills(cgroup) == oom_before)
     clear_limits()
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    info = docker_inspect("sync")
+    peak_file = Path(f"/sys/fs/cgroup/system.slice/docker-{info['Id']}.scope/memory.peak")
+    if peak_file.exists():
+        print(f"  info  The worker's peak memory since it started: {int(peak_file.read_text()) // 1024**2} MB of a {info['HostConfig']['Memory'] // 1024**2} MB limit.")
     if state.get("git"):
         burst_forgejo(host, state["git"])
     if state.get("vault"):
@@ -2095,10 +2885,13 @@ def cleanup():
         cleanup_forgejo()
     if vault_enabled():
         cleanup_vault()
+    subprocess.run(["docker", "rm", "--force", VAULT_EMERGENCY], capture_output=True)
     in_core(
         f"""
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from accounts.models import FollowUp
+print(FollowUp.objects.filter(about__startswith="fake-", about__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__startswith="fake-", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__startswith="nobody", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__in={FAKE_OTHER!r}).delete())

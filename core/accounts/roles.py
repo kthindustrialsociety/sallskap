@@ -15,8 +15,11 @@ class Role:
     permissions: tuple[str, ...] = ()  # what they see and can change once inside
 
 
+# Passwords to change when someone leaves: Board usually holds them, and Operators see it happen.
+FOLLOW_UPS = ("accounts.view_followup", "accounts.change_followup")
+
 ROLES = (
-    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user",)),
+    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user", *FOLLOW_UPS)),
     Role("treasurer", "Treasurer", admin=True, requires_2fa=True),
     Role("events", "Events", admin=True),
     Role("developer", "Developer"),
@@ -34,6 +37,7 @@ ROLES = (
             "auth.change_group",
             "mfa.view_authenticator",
             "mfa.delete_authenticator",  # how someone who lost their phone starts over
+            *FOLLOW_UPS,
         ),
     ),
     Role("member", "Member"),

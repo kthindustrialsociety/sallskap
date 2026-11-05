@@ -469,11 +469,11 @@ class Docker(unittest.TestCase):
 
     def test_apply_starts_caddy_then_waits_for_core(self):
         self.run_kit("apply")
-        self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"]])
+        self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
 
     def test_apply_only_rebuilds_when_asked(self):
         self.run_kit("apply", "--build")
-        self.assertEqual(self.starts()[-1], ["up", "-d", "--wait", "--build", "core"])
+        self.assertIn(["up", "-d", "--wait", "--build", "core"], self.starts())
 
     def test_a_broken_core_cannot_hold_up_the_web_server(self):
         self.run_kit("apply")
@@ -638,7 +638,7 @@ class Modules(unittest.TestCase):
         self.assertEqual(self.paths.config.stat().st_mode & 0o777, 0o600)
         self.assertIn("# keep this", self.paths.config.read_text())
         starts = [" ".join(call[call.index("up") :]) for call in self.calls if "up" in call]
-        self.assertEqual(starts, ["up -d caddy", "up -d --wait core", "up -d --wait"])
+        self.assertEqual(starts, ["up -d caddy", "up -d --wait core", "up -d --wait", "up -d --wait sync"])
         self.assertEqual(self.setup_calls, ["prepare", "setup"])
         self.assertEqual(len(self.demo_commands()), 1)
 
@@ -675,7 +675,8 @@ class Modules(unittest.TestCase):
         self.calls.clear()
         self.setup_calls.clear()
         self.run_kit("apply")
-        self.assertEqual(self.demo_commands()[-1], self.calls[-1])
+        self.assertEqual(self.demo_commands()[-1], self.calls[-2])
+        self.assertEqual(self.calls[-1][-4:], ["up", "-d", "--wait", "sync"])  # after them, as preparing one can give it a token
         self.assertEqual(self.setup_calls, ["prepare"])
 
     def test_apply_ignores_modules_that_are_off(self):
@@ -712,6 +713,12 @@ class Modules(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("isn't enabled", out)
         self.assertEqual(self.demo_commands(), [])
+
+    def test_disable_tells_the_worker_to_stop_asking_it(self):
+        self.run_kit("enable", "demo")
+        self.calls.clear()
+        self.run_kit("disable", "demo")
+        self.assertEqual(self.calls[-1][-3:], ["up", "-d", "sync"])
 
     def test_a_failed_disable_can_be_finished_by_running_it_again(self):
         """It's still marked as on, so the next run reaches the container."""
@@ -804,6 +811,10 @@ class GitSetup(unittest.TestCase):
     """Runs the setup with a made-up Forgejo and core, recording what they were asked."""
 
     def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
         self.calls = []
         self.sources = ""
         self.tools = ""
@@ -867,7 +878,10 @@ class GitSetup(unittest.TestCase):
         return found
 
     def setup(self):
-        kit.setup_git(None, self.config)
+        kit.setup_git(self.paths, self.config)
+
+    def keep_token(self):
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="kept-token")
 
     def test_the_token_never_goes_on_a_command_line(self):
         """Anyone on the server can read those, and this token can't be deleted."""
@@ -895,10 +909,39 @@ class GitSetup(unittest.TestCase):
         self.setup()
         self.assertEqual(self.find("admin user create"), [])
 
-    def test_the_token_can_only_do_what_the_setup_needs(self):
+    def test_the_token_can_only_do_what_this_and_the_worker_need(self):
         self.setup()
         token = self.find("generate-access-token")[0]
-        self.assertIn("--scopes write:admin,write:organization ", token)
+        self.assertIn("--scopes write:admin,write:organization,write:repository,write:user ", token)
+
+    def test_the_token_is_kept_for_the_worker_and_nowhere_else(self):
+        self.setup()
+        self.assertEqual(kit._read_env(self.paths.sync_env)["FORGEJO_ADMIN_TOKEN"], "the-token")
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_the_worker_is_restarted_last_so_it_has_the_token(self):
+        self.setup()
+        self.assertTrue(self.lines()[-1].endswith("up -d --wait sync"), self.lines()[-1])
+        self.assertLess(self.index("add-oauth"), len(self.lines()) - 1)
+
+    def test_a_kept_token_is_used_rather_than_making_another(self):
+        """Forgejo 15 can't delete one with password login off, so another would leave the old one working."""
+        self.keep_token()
+        self.setup()
+        self.assertEqual(self.find("generate-access-token"), [])
+        self.assertTrue(any("Authorization: token kept-token" in (settings or "") for _, settings in self.calls))
+
+    def test_an_upgrade_gets_a_token_and_leaves_its_login_alone(self):
+        self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
+        self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
+        self.users = "ID Username\n1 sallskap-admin a@b true true false\n"
+        self.setup()
+        self.assertEqual(len(self.find("generate-access-token")), 1)
+        self.assertEqual(self.find("admin user create"), [])
+        self.assertEqual(self.find("tool add"), [])
+        self.assertEqual(self.find("add-oauth"), [])
+        self.assertEqual(self.find("update-oauth"), [])
+        self.assertEqual(self.find(" restart "), [])
 
     def test_it_creates_the_teams_a_group_can_lead_to(self):
         self.setup()
@@ -977,6 +1020,7 @@ class GitSetup(unittest.TestCase):
         self.assertLess(self.index(" restart forgejo"), self.index(" up -d --wait"))
 
     def test_a_finished_setup_does_nothing_and_makes_no_token(self):
+        self.keep_token()
         self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
         self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
         self.setup()
@@ -1000,6 +1044,7 @@ class GitSetup(unittest.TestCase):
 
     def test_a_login_source_with_no_tool_makes_no_new_token(self):
         """The login is connected last, so the organisation and teams are already there."""
+        self.keep_token()
         self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
         self.setup()
         self.assertEqual(self.find("generate-access-token"), [])
@@ -1098,14 +1143,21 @@ class VaultSetup(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"Registered.\n  Client ID: the-id\n  Secret:    {next(self.new_secrets)}\n", "")
             if "tool remove" in line:
                 self.tools = ""
+            if "argon2" in line:
+                self.hashed.append(kwargs.get("input"))
+                return subprocess.CompletedProcess(command, 0, f"$argon2id$v=19$fake{len(self.hashed)}\n", "")
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        self.hashed = []
         patcher = mock.patch.object(kit.subprocess, "run", fake_run)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def settings(self):
         return kit._read_env(self.paths.vault_env)
+
+    def worker_settings(self):
+        return kit._read_env(self.paths.sync_env)
 
     def find(self, text):
         return [line for line in self.calls if text in line]
@@ -1126,8 +1178,50 @@ class VaultSetup(unittest.TestCase):
                 "SSO_AUTHORITY": "https://app.example.org",
                 "SSO_CLIENT_ID": "the-id",
                 "SSO_CLIENT_SECRET": "first-secret",
+                "ADMIN_TOKEN": "'$argon2id$v=19$fake1'",
             },
         )
+
+    def test_only_the_worker_has_the_admin_token(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.assertGreater(len(token), 40)
+        self.assertEqual(self.hashed, [token])
+        self.assertNotIn(token, self.paths.vault_env.read_text())
+        self.assertFalse(self.paths.core_env.exists() and token in self.paths.core_env.read_text())
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_the_admin_token_never_goes_on_a_command_line(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.assertFalse([line for line in self.calls if token in line])
+
+    def test_the_hash_is_quoted_or_compose_would_read_the_dollars_as_variables(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.assertIn("ADMIN_TOKEN='$argon2id$", self.paths.vault_env.read_text())
+
+    def test_running_it_again_keeps_the_admin_token(self):
+        kit.prepare_vault(self.paths, self.config)
+        token, hashed = self.worker_settings()["VAULT_ADMIN_TOKEN"], self.settings()["ADMIN_TOKEN"]
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.worker_settings()["VAULT_ADMIN_TOKEN"], token)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], hashed)
+        self.assertEqual(len(self.hashed), 1)
+
+    def test_a_lost_hash_gets_a_new_token_on_both_sides(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.paths.vault_env.unlink()
+        kit.prepare_vault(self.paths, self.config)
+        self.assertNotEqual(self.worker_settings()["VAULT_ADMIN_TOKEN"], token)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], "'$argon2id$v=19$fake2'")
+
+    def test_a_lost_token_gets_a_new_hash_too(self):
+        kit.prepare_vault(self.paths, self.config)
+        text = self.paths.sync_env.read_text()
+        self.paths.sync_env.write_text("".join(line for line in text.splitlines(keepends=True) if "VAULT_ADMIN_TOKEN" not in line))
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], "'$argon2id$v=19$fake2'")
 
     def test_the_authority_has_no_trailing_slash_as_it_must_match_the_issuer_exactly(self):
         kit.prepare_vault(self.paths, self.config)
@@ -1235,6 +1329,212 @@ class Status(unittest.TestCase):
         self.assertNotIn("demo.example.org", out)
 
 
+class WorkerSettings(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
+        self.config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\nvault = true\nwebsite = true\n')
+
+    def settings(self):
+        return kit._read_env(self.paths.sync_env)
+
+    def test_it_only_asks_modules_that_are_on_and_have_a_connector(self):
+        kit._write_sync_env(self.paths, self.config)
+        self.assertEqual(self.settings()["SYNC_MODULES"], "git,vault")
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n[modules]\nvault = true\n'))
+        self.assertEqual(self.settings()["SYNC_MODULES"], "vault")
+
+    def test_it_is_private(self):
+        kit._write_sync_env(self.paths, self.config)
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_it_doesnt_get_core_secrets(self):
+        kit.prepare_core(self.paths, self.config)
+        core = kit._read_env(self.paths.core_env)
+        worker = kit._read_env(self.paths.sync_env)
+        self.assertNotEqual(worker["DJANGO_SECRET_KEY"], core["DJANGO_SECRET_KEY"])
+        self.assertNotIn("OIDC_SIGNING_KEY", worker)
+
+    def test_core_is_never_given_the_tools_tokens(self):
+        kit.prepare_core(self.paths, self.config)
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        kit.prepare_core(self.paths, self.config)
+        self.assertNotIn("the-token", self.paths.core_env.read_text())
+        self.assertNotIn("sync.env", compose_services()["core"])
+
+    def test_preparing_core_keeps_the_tokens_and_changes_nothing_else(self):
+        kit.prepare_core(self.paths, self.config)
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        before = self.paths.sync_env.read_text()
+        modified = self.paths.sync_env.stat().st_mtime_ns
+        kit.prepare_core(self.paths, self.config)
+        self.assertEqual(self.paths.sync_env.read_text(), before)
+        self.assertEqual(self.paths.sync_env.stat().st_mtime_ns, modified)
+
+    def test_turning_a_module_off_stops_asking_it_and_keeps_its_token(self):
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n'))
+        self.assertEqual(self.settings()["SYNC_MODULES"], "")
+        self.assertEqual(self.settings()["FORGEJO_ADMIN_TOKEN"], "the-token")
+
+    def test_the_team_map_has_one_home(self):
+        manifest = kit.module_manifest("git")
+        self.assertEqual(manifest["teams"], {"operator": "Owners", "developer": "developers", "board": "board"})
+        self.assertEqual(manifest["admin_group"], "operator")
+        for team in kit.FORGEJO_TEAMS:
+            self.assertIn(team["name"], manifest["teams"].values())
+
+    def test_someone_who_can_only_read_never_stays_a_collaborator(self):
+        self.assertNotIn("board", kit.module_manifest("git")["collaborator_groups"])
+
+
+class Emergency(unittest.TestCase):
+    """Runs the commands with Docker replaced, recording what it was asked to do."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nvault = true\ngit = true\n')
+        self.calls = []
+        self.running = False
+
+        def fake_run(command, *args, **kwargs):
+            self.calls.append(command)
+            line = " ".join(command)
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0 if self.running else 1, "172.18.0.9\n" if self.running else "", "")
+            if command[:2] == ["docker", "rm"]:  # succeeds whether or not there's anything to remove
+                self.running = False
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if " run " in line:
+                self.running = True
+            if "generate-access-token" in line:
+                return subprocess.CompletedProcess(command, 0, "0123456789abcdef0123456789abcdef01234567\n", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        for patcher in (mock.patch.object(kit.subprocess, "run", fake_run), mock.patch.object(kit, "Paths", return_value=self.paths)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_kit(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kit.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def started(self):
+        return next(call for call in self.calls if "run" in call)
+
+    def test_it_turns_on_password_login_only_in_the_copy(self):
+        self.run_kit("emergency", "vault")
+        command = " ".join(self.started())
+        self.assertIn("--env SSO_ENABLED=false", command)
+        self.assertIn("--env SSO_ONLY=false", command)
+        self.assertIn("--env DOMAIN=https://localhost:8222", command)
+        self.assertEqual(self.started()[-1], "vaultwarden")
+        self.assertIn('SSO_ONLY: "true"', compose_services()["vaultwarden"])
+
+    def test_nothing_about_it_can_be_reached_except_over_ssh(self):
+        self.run_kit("emergency", "vault")
+        command = self.started()
+        for flag in ("--publish", "-p", "--service-ports", "--use-aliases"):
+            self.assertNotIn(flag, command)
+
+    def test_it_serves_https_as_its_web_page_refuses_anything_else(self):
+        self.run_kit("emergency", "vault")
+        command = " ".join(self.started())
+        self.assertIn('ROCKET_TLS={certs="/data/emergency-tls/cert.pem",key="/data/emergency-tls/key.pem"}', command)
+
+    def test_its_certificate_is_only_for_localhost_and_goes_when_it_stops(self):
+        self.run_kit("emergency", "vault")
+        made = next(call for call in self.calls if call[0] == "openssl")
+        self.assertIn("subjectAltName=DNS:localhost", made)
+        self.assertIn("-nodes", made)
+        self.assertEqual(made[made.index("-days") + 1], "7")
+        folder = self.paths.vault_dir / "emergency-tls"
+        self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+        self.run_kit("emergency", "vault", "--off")
+        self.assertFalse(folder.exists())
+
+    def test_it_turns_off_its_admin_page(self):
+        self.run_kit("emergency", "vault")
+        self.assertIn("ADMIN_TOKEN=", self.started())
+
+    def test_it_doesnt_depend_on_core(self):
+        self.run_kit("emergency", "vault")
+        self.assertIn("--no-deps", self.started())
+        self.assertFalse([call for call in self.calls if "manage.py" in call])
+
+    def test_it_says_how_to_reach_it(self):
+        code, out = self.run_kit("emergency", "vault")
+        self.assertEqual(code, 0)
+        self.assertIn("ssh -L 8222:172.18.0.9:8080", out)
+        self.assertIn("https://localhost:8222", out)
+        self.assertIn("warn about the certificate", out)
+        self.assertIn("kit emergency vault --off", out)
+
+    def test_asking_twice_starts_one(self):
+        self.run_kit("emergency", "vault")
+        self.run_kit("emergency", "vault")
+        self.assertEqual(len([call for call in self.calls if "run" in call]), 1)
+
+    def test_it_can_be_stopped(self):
+        self.run_kit("emergency", "vault")
+        code, out = self.run_kit("emergency", "vault", "--off")
+        self.assertEqual(code, 0)
+        self.assertIn("Stopped", out)
+        self.assertFalse(self.running)
+        self.assertIn("wasn't running", self.run_kit("emergency", "vault", "--off")[1])
+
+    def test_a_git_token_goes_on_their_own_account(self):
+        code, out = self.run_kit("emergency", "git", "someone")
+        self.assertEqual(code, 0)
+        command = " ".join(next(call for call in self.calls if "generate-access-token" in call))
+        self.assertIn("--username someone ", command)
+        self.assertNotIn(kit.FORGEJO_SERVICE_USER, command)
+        self.assertIn("0123456789abcdef0123456789abcdef01234567", out)
+        self.assertIn("Settings, Applications", out)
+
+    def test_a_git_token_doesnt_depend_on_core(self):
+        self.run_kit("emergency", "git", "someone")
+        self.assertFalse([call for call in self.calls if "manage.py" in call])
+
+    def test_it_refuses_a_module_thats_off(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        for args in (("emergency", "vault"), ("emergency", "git", "someone")):
+            with self.subTest(args):
+                code, out = self.run_kit(*args)
+                self.assertEqual(code, 1)
+                self.assertIn("isn't enabled", out)
+        self.assertEqual(self.calls, [])
+
+    def test_status_says_if_the_copy_is_still_running(self):
+        address = lambda *args, **kwargs: io.BytesIO(b"203.0.113.1")
+        with mock.patch.object(kit, "_resolve_ipv4", return_value={"203.0.113.1"}), mock.patch.object(kit.urllib.request, "urlopen", address):
+            self.run_kit("emergency", "vault")
+            _, running = self.run_kit("status")
+            self.run_kit("emergency", "vault", "--off")
+            _, stopped = self.run_kit("status")
+        self.assertIn("emergency copy is running", running)
+        self.assertNotIn("emergency copy is running", stopped)
+
+    def test_a_name_that_could_be_read_as_an_option_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for name in ("-x", "--admin", "a b", "a/b"):
+                with self.subTest(name):
+                    try:
+                        code, _ = self.run_kit("emergency", "git", name)
+                    except SystemExit as stopped:  # argparse refuses some of these itself
+                        code = stopped.code
+                    self.assertNotEqual(code, 0)
+        self.assertEqual(self.calls, [])
+
+
 class CommandLine(unittest.TestCase):
     def test_a_problem_gives_a_message_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1269,6 +1569,22 @@ def compose_services() -> dict[str, str]:
 class Packaging(unittest.TestCase):
     def test_compose_files_are_read_correctly(self):
         self.assertLessEqual({"caddy", "core"}, set(compose_services()))
+
+    def test_the_worker_has_the_same_limits_as_core_and_no_ports(self):
+        worker = compose_services()["sync"]
+        for setting in ("mem_limit:", "pids_limit:", "read_only: true", "cap_drop: [ALL]", '"no-new-privileges:true"', "restart: unless-stopped"):
+            self.assertIn(setting, worker)
+        self.assertNotIn("ports:", worker)
+
+    def test_the_worker_runs_cores_image_and_cant_change_module_code(self):
+        worker = compose_services()["sync"]
+        self.assertIn("image: sallskap-core:local", worker)
+        self.assertIn("./modules:/modules:ro", worker)
+        self.assertIn("condition: service_healthy", worker)
+
+    def test_vaultwardens_admin_page_is_closed_at_caddy(self):
+        """Its admin token is on now, so this is what keeps the page off the internet."""
+        self.assertIn("path /admin /admin/*", (ROOT / "modules" / "vault" / "site.caddy").read_text())
 
     def test_core_is_the_only_way_into_vaultwarden(self):
         vault = compose_services()["vaultwarden"]

@@ -3,9 +3,12 @@ from django.contrib import admin
 from django.contrib.auth.admin import GroupAdmin as DjangoGroupAdmin
 from django.contrib.auth.models import Group
 from django.db.models import Exists, OuterRef
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
 
-from .models import User
+from . import sync
+from .models import AccessSync, FollowUp, User
 
 
 @admin.register(User)
@@ -15,7 +18,7 @@ class UserAdmin(admin.ModelAdmin):
     search_fields = ("email", "name")
     ordering = ("email",)
     filter_horizontal = ("groups", "user_permissions")
-    readonly_fields = ("last_login", "date_joined")
+    readonly_fields = ("last_login", "date_joined", "access_in_tools")
 
     def get_fields(self, request, obj=None):
         fields = ["email", "name", "is_active", "groups"]
@@ -23,7 +26,7 @@ class UserAdmin(admin.ModelAdmin):
             # Anyone who could edit these could give themselves everything.
             fields += ["is_superuser", "user_permissions"]
         if obj:
-            fields += ["last_login", "date_joined"]
+            fields += ["access_in_tools", "last_login", "date_joined"]
         return fields
 
     def get_queryset(self, request):
@@ -39,6 +42,11 @@ class UserAdmin(admin.ModelAdmin):
         if not change:
             obj.set_unusable_password()  # they choose their own, through `kit link`
         super().save_model(request, obj, form, change)
+
+    @admin.display(description=_("access in tools"))
+    def access_in_tools(self, obj):
+        row = AccessSync.objects.filter(user=obj).first()
+        return sync.describe(row) if row else _("Nothing to send")
 
     @admin.display(description=_("groups"))
     def group_list(self, obj):
@@ -94,3 +102,26 @@ class AuthenticatorAdmin(admin.ModelAdmin):
 
     def delete_queryset(self, request, queryset):
         Authenticator.objects.filter(user__in=queryset.values("user")).delete()
+
+
+@admin.register(FollowUp)
+class FollowUpAdmin(admin.ModelAdmin):
+    """Only `sync_tools` adds these, and they stay as a record. All anyone can do is say
+    one is done, which records who and when."""
+
+    list_display = ("text", "about", "tool", "created_at", "done_at", "done_by")
+    list_filter = (("done_at", admin.EmptyFieldListFilter),)
+    fields = ("text", "about", "tool", "created_at", "done_at", "done_by")
+    readonly_fields = fields
+    actions = ("mark_done",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.action(description=_("Mark as done"), permissions=["change"])
+    def mark_done(self, request, queryset):
+        done = queryset.filter(done_at__isnull=True).update(done_at=timezone.now(), done_by=request.user)
+        self.message_user(request, ngettext("%d follow-up marked as done.", "%d follow-ups marked as done.", done) % done)

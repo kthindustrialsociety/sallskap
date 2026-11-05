@@ -16,6 +16,19 @@ class SallskapAdminSite(admin.AdminSite):
         user = request.user
         return user.is_active and user.is_staff and not user.needs_2fa_setup
 
+    def index(self, request, extra_context=None):
+        """The two things that shouldn't wait for someone to go looking."""
+        from accounts import sync
+        from accounts.models import FollowUp
+
+        if request.user.has_perm("accounts.view_user"):
+            for row in sync.stuck()[:10]:
+                messages.error(request, _("A change to %(person)s hasn't reached every tool yet. %(what)s") % {"person": row.label, "what": sync.describe(row)})
+        if request.user.has_perm("accounts.view_followup"):
+            for follow_up in FollowUp.objects.filter(done_at__isnull=True)[:10]:
+                messages.warning(request, follow_up.text)
+        return super().index(request, extra_context)
+
     def login(self, request, extra_context=None):
         """Never shows Django's own login form, which knows nothing about 2FA
         or the login limits. Everyone logs in through allauth."""

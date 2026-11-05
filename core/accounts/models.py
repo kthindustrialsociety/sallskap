@@ -128,3 +128,46 @@ class GroupRole(models.Model):
 
     def __str__(self):
         return self.key
+
+
+class AccessSync(models.Model):
+    """A change to someone's access that the tools have yet to hear about. It's written
+    along with the change, so one can't happen without the other, and `sync_tools` does
+    the rest: see accounts/sync.py."""
+
+    user = models.OneToOneField(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="access_sync")
+    sub = models.CharField(max_length=64, unique=True)  # how tools know them, which outlasts a deleted account
+    label = models.CharField(max_length=254)  # their address, to show to people
+    requested_at = models.DateTimeField()
+    pending = models.BooleanField(default=True, db_index=True)
+    attempts = models.PositiveIntegerField(default=0)
+    retry_at = models.DateTimeField(null=True, blank=True)
+    tools = models.JSONField(default=dict)  # for each tool, what happened the last time
+
+    def __str__(self):
+        return self.label
+
+
+class FollowUp(models.Model):
+    """Something a person has to do, because no tool can do it for them. It stays open
+    until someone says it's done, and it records who said so."""
+
+    about = models.CharField(_("about"), max_length=254)  # the address of the person who lost access
+    sub = models.CharField(max_length=64)
+    tool = models.CharField(_("tool"), max_length=100)
+    key = models.CharField(max_length=100)  # which thing in that tool, so it's only asked for once
+    text = models.TextField(_("what to do"))
+    created_at = models.DateTimeField(_("created"), default=timezone.now)
+    done_at = models.DateTimeField(_("done"), null=True, blank=True)
+    done_by = models.ForeignKey(User, verbose_name=_("done by"), null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+
+    class Meta:
+        verbose_name = _("follow-up")
+        verbose_name_plural = _("follow-ups")
+        ordering = [models.F("done_at").asc(nulls_first=True), "-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["sub", "tool", "key"], condition=models.Q(done_at__isnull=True), name="one_open_follow_up"),
+        ]
+
+    def __str__(self):
+        return self.text

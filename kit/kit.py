@@ -68,6 +68,10 @@ class Paths:
         return self.config_dir / "core.env"
 
     @property
+    def sync_env(self) -> Path:
+        return self.config_dir / "sync.env"
+
+    @property
     def git_env(self) -> Path:
         return self.config_dir / "git.env"
 
@@ -364,6 +368,24 @@ def prepare_core(paths: Paths, config: Config) -> None:
     paths.core_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.core_dir, CORE_UID, CORE_UID)
+    _write_sync_env(paths, config)
+
+
+def _write_sync_env(paths: Paths, config: Config, **tokens: str) -> None:
+    """For the worker that tells tools about changes to people's access: see
+    core/accounts/sync.py. Its tokens are only here, so core's web process, which faces
+    the internet, never has them. Nor does it get core's secrets, as it signs nothing."""
+    current = _read_env(paths.sync_env)
+    settings = {
+        **current,
+        "SALLSKAP_DOMAIN": config.domain,
+        "DJANGO_SECRET_KEY": current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50),  # Django insists on one
+        "SYNC_MODULES": ",".join(name for name in config.modules if (ROOT / "modules" / name / "connector.py").exists()),
+        **tokens,
+    }
+    text = "".join(f"{name}={value}\n" for name, value in settings.items())
+    if not paths.sync_env.exists() or paths.sync_env.read_text("utf-8") != text:
+        _write_atomic(paths.sync_env, text, 0o600)
 
 
 def apply_web(paths: Paths) -> None:
@@ -401,7 +423,8 @@ def apply_web(paths: Paths) -> None:
 def apply(paths: Paths, build: bool = False) -> None:
     """Start everything. Caddy goes first and modules last, so a problem with one can't
     hold up the public sites or logins. With --wait, core has finished migrating and
-    each module is healthy when this returns."""
+    each module is healthy when this returns. The worker goes after the modules, as
+    preparing one can give it a new token."""
     apply_web(paths)
     subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
     config = load_config(paths)
@@ -410,6 +433,7 @@ def apply(paths: Paths, build: bool = False) -> None:
             if name in PREPARE:
                 PREPARE[name](paths, config)
             subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+    subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)
 
 
 def enable_module(paths: Paths, name: str) -> None:
@@ -442,6 +466,7 @@ def disable_module(paths: Paths, name: str) -> None:
     else:
         print(f"{name} isn't enabled.")
     apply_web(paths)
+    subprocess.run(_compose("up", "-d", "sync"), check=True)  # so it stops asking that module
 
 
 # ---- Core: accounts ----------------------------------------------------------
@@ -513,6 +538,16 @@ def _core_output(*args: str) -> str:
     return result.stdout
 
 
+def _core_python(code: str, stdin: str) -> str:
+    """Python inside core, for what kit's standard library can't do. What it's given goes
+    on stdin, as a command line can be read by anyone on the server."""
+    command = _compose("exec", "-T", "core", "python", "-c", code)
+    result = subprocess.run(command, capture_output=True, text=True, input=stdin)
+    if result.returncode:
+        raise KitError(f"Core couldn't do that: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
 def _forgejo_output(*args: str) -> str:
     command = _module_compose("git", "exec", "-T", "forgejo", "forgejo", *args)
     result = subprocess.run(command, capture_output=True, text=True)
@@ -548,21 +583,29 @@ def _expect(answer: tuple[int, object], *statuses: int) -> object:
     return answer[1]
 
 
-def _create_org_and_teams(config: Config, org: str) -> None:
-    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
-    command for making one, so this uses its API. Forgejo 15 has no way of deleting the
-    token afterwards with password login off, so it stays in its database, where only
-    a hash is stored, and its value is thrown away when this returns. So this only
-    runs until the login is connected."""
+def _forgejo_token(paths: Paths, config: Config) -> str:
+    """The admin token the worker uses, which this setup uses too. It's made once and then
+    kept, as Forgejo 15 has no way of deleting one with password login off. So a new one
+    would leave the old one working."""
+    kept = _read_env(paths.sync_env).get("FORGEJO_ADMIN_TOKEN")
+    if kept:
+        return kept
     if not re.search(rf"^\d+\s+{FORGEJO_SERVICE_USER}\s", _forgejo_output("admin", "user", "list", "--admin"), re.M):
         _forgejo_output(
             "admin", "user", "create", "--username", FORGEJO_SERVICE_USER, "--email", f"{FORGEJO_SERVICE_USER}@git.{config.domain}",
             "--admin", "--random-password", "--must-change-password=false",
         )  # fmt: skip
     token = _forgejo_output(
-        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER,
-        "--token-name", f"kit-{secrets.token_hex(4)}", "--scopes", "write:admin,write:organization", "--raw",
+        "admin", "user", "generate-access-token", "--username", FORGEJO_SERVICE_USER, "--token-name", f"kit-{secrets.token_hex(4)}",
+        "--scopes", "write:admin,write:organization,write:repository,write:user", "--raw",
     ).strip()  # fmt: skip
+    _write_sync_env(paths, config, FORGEJO_ADMIN_TOKEN=token)
+    return token
+
+
+def _create_org_and_teams(token: str, org: str) -> None:
+    """Forgejo silently skips a team in its map if it doesn't exist, and there's no
+    command for making one, so this uses its API."""
     if _forgejo_api(token, "GET", f"/orgs/{org}")[0] == 404:
         _expect(_forgejo_api(token, "POST", "/orgs", {"username": org, "visibility": "public"}), 201)
     # The limit on new repos is for people, but organisations are held to it too.
@@ -586,11 +629,8 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
     fields = dict(re.findall(r"^\s+(Client ID|Secret):\s+(\S+)$", output, re.M))
     if len(fields) != 2:
         raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
-    team_map = {
-        "operator": {org: ["Owners"]},
-        "developer": {org: ["developers"]},
-        "board": {org: ["board"]},
-    }
+    manifest = module_manifest("git")
+    team_map = {group: {org: [team]} for group, team in manifest["teams"].items()}
     settings = [
         "--name", org,
         "--provider", "openidConnect",
@@ -599,7 +639,7 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
         "--auto-discover-url", f"https://app.{config.domain}/.well-known/openid-configuration",
         "--scopes", "email", "--scopes", "profile", "--scopes", "groups",
         "--group-claim-name", "groups",
-        "--admin-group", "operator",
+        "--admin-group", manifest["admin_group"],
         "--group-team-map", json.dumps(team_map),
         "--group-team-map-removal",
         "--skip-local-2fa",  # core has already asked for it
@@ -620,16 +660,16 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
 
 
 def setup_git(paths: Paths, config: Config) -> None:
-    """The login is connected last, so finding it means everything before it finished,
-    and running this again doesn't make another token."""
+    """The login is connected last, so finding it means everything before it finished."""
     org = config.short_name
     source = re.search(rf"^(\d+)\s+{re.escape(org)}\s", _forgejo_output("admin", "auth", "list"), re.M)
     registered = re.search(rf"^{FORGEJO_TOOL}\s", _core_output("tool", "list"), re.M)
-    if source and registered:
-        return
+    token = _forgejo_token(paths, config)
     if not source:
-        _create_org_and_teams(config, org)
-    _connect_login(config, org, source, registered)
+        _create_org_and_teams(token, org)
+    if not (source and registered):
+        _connect_login(config, org, source, registered)
+    subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)  # now it has the token
 
 
 PREPARE["git"] = prepare_git
@@ -642,14 +682,26 @@ SETUP["git"] = setup_git
 VAULT_TOOL = "vaultwarden"  # its name in core's login service
 
 
-def _write_vault_env(paths: Paths, config: Config, client_id: str = "", secret: str = "") -> None:
+def _write_vault_env(paths: Paths, config: Config, admin_hash: str, client_id: str = "", secret: str = "") -> None:
     settings = {
         "DOMAIN": f"https://vault.{config.domain}",
         "SSO_AUTHORITY": f"https://app.{config.domain}",
         "SSO_CLIENT_ID": client_id,
         "SSO_CLIENT_SECRET": secret,
+        "ADMIN_TOKEN": admin_hash,
     }
     _write_atomic(paths.vault_env, "".join(f"{name}={value}\n" for name, value in settings.items()), 0o600)
+
+
+def _vault_admin_hash(paths: Paths, config: Config, current: dict[str, str]) -> str:
+    """Vaultwarden only gets a hash of its admin token, and only the worker gets the token.
+    The quotes are part of the setting, or Compose would read the $ in it as variables."""
+    if current.get("ADMIN_TOKEN") and _read_env(paths.sync_env).get("VAULT_ADMIN_TOKEN"):
+        return current["ADMIN_TOKEN"]
+    token = secrets.token_urlsafe(48)
+    hashed = _core_python("import sys; from argon2 import PasswordHasher; print(PasswordHasher().hash(sys.stdin.read()))", token)
+    _write_sync_env(paths, config, VAULT_ADMIN_TOKEN=token)
+    return f"'{hashed}'"
 
 
 def prepare_vault(paths: Paths, config: Config) -> None:
@@ -658,9 +710,10 @@ def prepare_vault(paths: Paths, config: Config) -> None:
     when it's made, so if one side is missing, both get a new one. The old secret goes
     first, so stopping partway can only leave a side missing."""
     current = _read_env(paths.vault_env)
+    admin_hash = _vault_admin_hash(paths, config, current)
     registered = re.search(rf"^{VAULT_TOOL}\s", _core_output("tool", "list"), re.M)
     if not (registered and current.get("SSO_CLIENT_SECRET")):
-        _write_vault_env(paths, config)
+        _write_vault_env(paths, config, admin_hash)
         if registered:
             _core_output("tool", "remove", VAULT_TOOL)
         manifest = module_manifest("vault")
@@ -670,13 +723,103 @@ def prepare_vault(paths: Paths, config: Config) -> None:
         if len(fields) != 2:
             raise KitError("Core registered Vaultwarden, but kit couldn't read its settings. Run this again.")
         current = {"SSO_CLIENT_ID": fields["Client ID"], "SSO_CLIENT_SECRET": fields["Secret"]}
-    _write_vault_env(paths, config, current["SSO_CLIENT_ID"], current["SSO_CLIENT_SECRET"])
+    _write_vault_env(paths, config, admin_hash, current["SSO_CLIENT_ID"], current["SSO_CLIENT_SECRET"])
     paths.vault_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.vault_dir, VAULT_UID, VAULT_UID)
 
 
 PREPARE["vault"] = prepare_vault
+
+
+# ---- Getting in while core is down -------------------------------------------
+
+
+VAULT_EMERGENCY = "sallskap-vault-emergency"
+VAULT_EMERGENCY_PORT = 8222  # on the operator's own computer, at the end of their tunnel
+VAULT_EMERGENCY_TLS = "emergency-tls"
+
+
+def _require_module(paths: Paths, name: str) -> None:
+    if name not in load_config(paths).modules:
+        raise KitError(f"The {name} module isn't enabled.")
+
+
+def _vault_emergency_address() -> str | None:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", VAULT_EMERGENCY],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _make_emergency_certificate(paths: Paths) -> None:
+    """In Vaultwarden's own folder, as that's what it can read. It's only good for localhost
+    and for a week, and it goes when the copy stops."""
+    folder = paths.vault_dir / VAULT_EMERGENCY_TLS
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(mode=0o700, parents=True)
+    command = [
+        "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "7",
+        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+        "-keyout", str(folder / "key.pem"), "-out", str(folder / "cert.pem"),
+    ]  # fmt: skip
+    subprocess.run(command, check=True, capture_output=True)
+    if os.geteuid() == 0:
+        for path in (folder, *folder.iterdir()):
+            os.chown(path, VAULT_UID, VAULT_UID)
+
+
+def vault_emergency_on(paths: Paths) -> str:
+    """A second Vaultwarden on the same data, with password login on and no route from
+    Caddy or any published port, so only someone with SSH on the server can reach it. The
+    public address stays core-only throughout, and an account turned off stays turned off.
+    `compose run` gives it no alias on the network, so Caddy can't end up sending anyone
+    here, and it isn't restarted. Nothing about it needs core.
+
+    Its web page refuses any address that isn't HTTPS, even on localhost, so this has a
+    certificate made on the spot. A browser warns about it, and the tunnel is what actually
+    protects the traffic. Its health check shows as failing, as that uses plain HTTP."""
+    _require_module(paths, "vault")
+    if not _vault_emergency_address():
+        _make_emergency_certificate(paths)
+        settings = {
+            "SSO_ENABLED": "false",
+            "SSO_ONLY": "false",
+            "DOMAIN": f"https://localhost:{VAULT_EMERGENCY_PORT}",
+            "ROCKET_TLS": f'{{certs="/data/{VAULT_EMERGENCY_TLS}/cert.pem",key="/data/{VAULT_EMERGENCY_TLS}/key.pem"}}',
+            "ADMIN_TOKEN": "",  # turns off its admin page, which nothing here needs
+        }
+        environment = [item for name, value in settings.items() for item in ("--env", f"{name}={value}")]
+        run = _module_compose("vault", "run", "--detach", "--rm", "--no-deps", "--name", VAULT_EMERGENCY, *environment, "vaultwarden")
+        subprocess.run(run, check=True, capture_output=True)
+    address = _vault_emergency_address()
+    if not address:
+        raise KitError("Its emergency copy didn't start. See: docker logs " + VAULT_EMERGENCY)
+    return address
+
+
+def vault_emergency_off(paths: Paths) -> bool:
+    """Whether there was one to stop: removing nothing still counts as success to Docker."""
+    running = bool(_vault_emergency_address())
+    if running:
+        subprocess.run(["docker", "rm", "--force", VAULT_EMERGENCY], check=True, capture_output=True)
+    shutil.rmtree(paths.vault_dir / VAULT_EMERGENCY_TLS, ignore_errors=True)
+    return running
+
+
+def git_emergency_token(paths: Paths, username: str) -> str:
+    """On that person's own account, so it's in their name. Only a person's own settings
+    page can delete one, once core is back, as Forgejo 15 has no other way with password
+    login off."""
+    _require_module(paths, "git")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", username):
+        raise KitError(f"{username!r} isn't a valid Forgejo username.")
+    return _forgejo_output(
+        "admin", "user", "generate-access-token", "--username", username,
+        "--token-name", f"emergency-{secrets.token_hex(4)}", "--scopes", "all", "--raw",
+    ).strip()  # fmt: skip
 
 
 # ---- Sites: config and credentials -------------------------------------------
@@ -866,6 +1009,8 @@ def status(paths: Paths) -> int:
         raise KitError(f"Couldn't look up this server's public address: {error}") from error
 
     print(f"Primary domain: {config.domain}\nServer address: {server_ip}\n")
+    if "vault" in config.modules and _vault_emergency_address():
+        print("The vault's emergency copy is running, which takes master passwords. Stop it when you're done: kit emergency vault --off\n")
     print("Login and admin page:")
     problems = _check_dns(f"app.{config.domain}", server_ip)
     for name in config.modules:
@@ -898,6 +1043,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="show sites, published releases and DNS problems")
     commands.add_parser("enable", help="switch on a module, or finish switching it on").add_argument("module")
     commands.add_parser("disable", help="stop a module and keep its data").add_argument("module")
+
+    emergency = commands.add_parser("emergency", help="get into a tool while core is down")
+    emergency = emergency.add_subparsers(dest="emergency_tool", required=True)
+    vault = emergency.add_parser("vault", help="start a private copy of the vault that takes master passwords, reached over SSH")
+    vault.add_argument("--off", action="store_true", help="stop it again")
+    emergency.add_parser("git", help="make a token on someone's own Forgejo account").add_argument("username")
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -964,6 +1115,20 @@ def main(argv: list[str] | None = None) -> int:
             status(paths)
         elif args.command == "disable":
             disable_module(paths, args.module)
+        elif args.command == "emergency" and args.emergency_tool == "git":
+            print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
+            print("Delete it under Settings, Applications once core is back. Nothing else can.")
+        elif args.command == "emergency":
+            if args.off:
+                print("Stopped the vault's emergency copy." if vault_emergency_off(paths) else "It wasn't running.")
+            else:
+                address = vault_emergency_on(paths)
+                print("The vault's emergency copy is running. Only someone with SSH on this server can reach it.\n")
+                print("On your own computer, add this to how you normally connect to this server:\n")
+                print(f"  ssh -L {VAULT_EMERGENCY_PORT}:{address}:8080 ...\n")
+                print(f"Then open https://localhost:{VAULT_EMERGENCY_PORT} and log in with your address and master password.")
+                print("Your browser will warn about the certificate, as it was made just now for this. Go ahead: the tunnel protects it.")
+                print("Stop it when you're done: kit emergency vault --off")
         elif args.action == "add":
             site = Site(args.domain, tuple(args.alias), not args.no_spa, args.www)
             add_site(paths, site)
