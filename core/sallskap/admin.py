@@ -8,6 +8,9 @@ from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
 
+SHOWN_AT_ONCE = 10
+
+
 class SallskapAdminSite(admin.AdminSite):
     site_title = site_header = _("Sällskap admin")
     index_title = _("Administration")
@@ -21,12 +24,22 @@ class SallskapAdminSite(admin.AdminSite):
         from accounts import sync
         from accounts.models import FollowUp
 
+        def more(queryset):
+            extra = queryset.count() - SHOWN_AT_ONCE
+            return _("...and %(count)d more.") % {"count": extra} if extra > 0 else None
+
         if request.user.has_perm("accounts.view_user"):
-            for row in sync.stuck()[:10]:
-                messages.error(request, _("A change to %(person)s hasn't reached every tool yet. %(what)s") % {"person": row.label, "what": sync.describe(row)})
+            stuck = sync.stuck()
+            for row in stuck[:SHOWN_AT_ONCE]:
+                messages.error(request, _("A change to %(person)s hasn't reached every tool yet. %(what)s") % {"person": sync.label(row), "what": sync.describe(row)})
+            if more(stuck):
+                messages.error(request, more(stuck))
         if request.user.has_perm("accounts.view_followup"):
-            for follow_up in FollowUp.objects.filter(done_at__isnull=True)[:10]:
+            open_ones = FollowUp.objects.filter(done_at__isnull=True)
+            for follow_up in open_ones[:SHOWN_AT_ONCE]:
                 messages.warning(request, follow_up.text)
+            if more(open_ones):
+                messages.warning(request, more(open_ones))
         return super().index(request, extra_context)
 
     def login(self, request, extra_context=None):

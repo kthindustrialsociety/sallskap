@@ -35,6 +35,12 @@ services:
       PASSWORD_HINTS_ALLOWED: "false"
       SENDS_ALLOWED: "false"            # public links to shared files and text
 
+      # The worker logs in to the admin page each time it starts, and by default a few
+      # restarts would hold up someone's removal for minutes. Caddy keeps that page off the
+      # internet, and its token is long and random, so guessing isn't what this is for here.
+      ADMIN_RATELIMIT_SECONDS: "10"
+      ADMIN_RATELIMIT_MAX_BURST: "30"
+
       # Its server would otherwise fetch an icon from each site someone has saved.
       DISABLE_ICON_DOWNLOAD: "true"
     volumes:

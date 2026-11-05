@@ -102,6 +102,7 @@ FAKE = {
     "fake-sync-down": (["developer"], False),
     "fake-sync-blocked": (["developer"], False),
     "fake-sync-rescuer": (["operator"], True),
+    "fake-sync-no2fa": (["developer"], False),
     "fake-vsync-owner": (["board"], True),
     "fake-vsync-removed": (["board"], True),
     "fake-vsync-off": (["board"], True),
@@ -2206,6 +2207,23 @@ def check_git_groups_now(host, operator, secrets_by_name):
     check("Joining Board puts them on the team, with no new sign-in", took is not None)
     print(f"  info  It took {took} seconds.")
 
+    section("Forgejo: a group that requires 2FA waits for it")
+    email = email_of("fake-sync-no2fa")
+    _, token = git_person(host, "fake-sync-no2fa", secrets_by_name)
+    check("Control: a Developer is on their team and isn't an admin", team_names(host, token) == ["developers"] and forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    set_groups(email, ["developer", "operator"])
+    check("Joining Operator with no 2FA doesn't make them a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    check("...or an owner", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    in_core(
+        f"""
+from django.contrib.auth import get_user_model
+from allauth.mfa.totp.internal.auth import TOTP, generate_totp_secret
+TOTP.activate(get_user_model().objects.get(email={email!r}), generate_totp_secret())
+"""
+    )
+    took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
+    check("Setting up 2FA does both, with no new sign-in", took is not None and "Owners" in team_names(host, token), str(team_names(host, token)))
+
     section("Forgejo: leaving a group, including repos they created")
     org = org_of(host)
     colleague, colleague_token = git_person(host, "fake-sync-colleague", secrets_by_name)
@@ -2298,8 +2316,14 @@ def check_git_offboarding(host, operator, secrets_by_name):
 
     section("Forgejo: other ways of leaving")
     _, token = git_person(host, "fake-sync-deleted", secrets_by_name)
+    deleted = git_account(host, email_of("fake-sync-deleted"))
     in_core(f"from django.contrib.auth import get_user_model as g; g().objects.get(email={email_of('fake-sync-deleted')!r}).delete()")
     check("Deleting the account in core stops their token", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] != 200) is not None)
+    wait_for_sync()
+    forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "PATCH", "/admin/users/fake-sync-deleted", {"login_name": deleted["login_name"], "source_id": deleted["source_id"], "prohibit_login": False})
+    check("Control: restoring Forgejo from an older backup would bring their account back", forgejo_api(host, token, "GET", "/user")[0] == 200)
+    compose("restart", "sync")
+    check("...until the worker's regular look at everyone, though they're gone from core", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] != 200, 60) is not None)
 
     _, token = git_person(host, "fake-sync-bypass", secrets_by_name)
     in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email_of('fake-sync-bypass')!r}).update(is_active=False)")
@@ -2348,6 +2372,15 @@ def check_worker_down(host, operator, secrets_by_name):
     check("When it's back, it catches up", wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] == 403, 60) is not None)
     wait_for_sync()
     check("...and the admin page stops saying so", f"{email} hasn" not in html.unescape(operator.get("/admin/").text))
+
+    section("The worker: restarting it a few times")
+    clear_vault_limits()
+    for _ in range(6):  # it logs in to Vaultwarden's admin page each time
+        compose("restart", "sync")
+        time.sleep(4)
+        wait_for_sync()
+    limited = core_db("select count(*) from accounts_accesssync where tools like '%answered 429%'")[0][0]
+    check("Doesn't get it locked out of Vaultwarden, which would hold up someone's removal", limited == 0, f"{limited} people waiting")
 
 
 def vault_member(owner, org, person_email, kind=2, collection=None):
@@ -2704,6 +2737,18 @@ def check_core_down(host, secrets_by_name):
     check("Signing in to Vaultwarden works again", status == 200, str(status))
     check("...into the same account", vault.in_vault())
 
+    section("Switching off the vault with its emergency copy running")
+    kit("emergency", "vault")
+    check("Control: the copy is running", wait_for(emergency_is_up, 60) is not None)
+    check("`kit status` says so", "emergency copy is running" in kit("status").stdout)
+    done = kit("disable", "vault")
+    check("`kit disable vault` works", done.returncode == 0, done.stderr[-300:])
+    check("...and stops it too", subprocess.run(["docker", "inspect", VAULT_EMERGENCY], capture_output=True).returncode != 0)
+    check("...along with its certificate", not (VAULT_DIR / "emergency-tls").exists())
+    done = kit("enable", "vault")
+    check("`kit enable vault` brings Vaultwarden back", done.returncode == 0, done.stderr[-300:])
+    wait_for_vault()
+
 
 def emergency_is_up():
     try:
@@ -2892,12 +2937,16 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from accounts.models import FollowUp
 print(FollowUp.objects.filter(about__startswith="fake-", about__endswith="@example.org").delete())
+print(FollowUp.objects.filter(about__startswith="A deleted account").delete())
 print(get_user_model().objects.filter(email__startswith="fake-", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__startswith="nobody", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__in={FAKE_OTHER!r}).delete())
 cache.clear()
 """
     )
+    # What's left of them, once every tool knows. This only runs on an installation with no real members.
+    wait_for_sync()
+    in_core("from accounts.models import AccessSync; AccessSync.objects.filter(user__isnull=True).delete()")
     STATE.unlink(missing_ok=True)
     kit("tool", "remove", FAKE_TOOL)
     print(f"Fake tool left: {FAKE_TOOL in kit('tool', 'list').stdout}")

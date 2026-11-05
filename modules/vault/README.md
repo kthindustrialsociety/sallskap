@@ -91,7 +91,7 @@ Only an Operator with SSH can do this, and it doesn't ask for 2FA, as SSH stands
 
 Everything is in `/srv/vault`, `/etc/sallskap/vault.env` and `/etc/sallskap/sync.env`. Keep them together, and stop Vaultwarden while copying its database. The vaults are encrypted with each person's master password, so a restore doesn't bring back anything someone has lost theirs for. The `kit` backup comes later.
 
-When the worker starts, it goes over everyone, so someone who left after the backup was taken is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows.
+When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows.
 
 ## Upgrading
 

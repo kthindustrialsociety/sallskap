@@ -1,6 +1,7 @@
 """Every way someone's access can change marks them as waiting: see accounts/sync.py."""
 
 from allauth.idp.oidc.models import Client
+from allauth.mfa.models import Authenticator
 from django.contrib.auth.models import Group
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 
@@ -50,6 +51,11 @@ def group_deleted(sender, instance, **kwargs):
         sync.request_for(user)
 
 
+def two_factor_changed(sender, instance, **kwargs):
+    # Whether tools may hear about a group that requires it depends on this.
+    sync.request_for(instance.user)
+
+
 def tool_rules_changed(sender, **kwargs):
     sync.request_for_everyone()
 
@@ -61,6 +67,8 @@ def connect():
     post_save.connect(group_saved, sender=Group)
     pre_delete.connect(group_deleting, sender=Group)
     post_delete.connect(group_deleted, sender=Group)
+    post_save.connect(two_factor_changed, sender=Authenticator)
+    post_delete.connect(two_factor_changed, sender=Authenticator)
     post_save.connect(tool_rules_changed, sender=Client)
     post_save.connect(tool_rules_changed, sender=ToolAccess)
     post_delete.connect(tool_rules_changed, sender=ToolAccess)

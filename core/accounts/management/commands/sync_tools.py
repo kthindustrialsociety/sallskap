@@ -31,10 +31,10 @@ class Command(BaseCommand):
         next_pass = timezone.now() + EVERYONE_EVERY
         while True:
             close_old_connections()
-            worked = sync.run_once(connectors)
+            ALIVE.touch()
+            worked = sync.run_once(connectors, tick=ALIVE.touch)
             if once and not worked:
                 return
-            ALIVE.touch()
             if timezone.now() >= next_pass:
                 sync.request_for_everyone()
                 next_pass = timezone.now() + EVERYONE_EVERY

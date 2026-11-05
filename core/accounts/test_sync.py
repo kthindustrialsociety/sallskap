@@ -10,6 +10,8 @@ from unittest import mock
 
 from allauth.idp.oidc.adapter import get_adapter
 from allauth.idp.oidc.models import Client
+from allauth.mfa.models import Authenticator
+from allauth.mfa.totp.internal.auth import TOTP, generate_totp_secret
 from django.contrib.auth.models import Group
 from django.core.management import call_command
 from django.db import transaction
@@ -206,11 +208,143 @@ class Working(Base):
         self.assertFalse(self.connector.seen[0].allowed)
         self.assertEqual(self.connector.seen[0].groups, ())
 
-    def test_once_everyone_knows_about_someone_deleted_the_row_goes(self):
+    def test_once_everyone_knows_about_someone_deleted_only_their_id_stays(self):
         sub = sync.sub_of(self.user)
         self.user.delete()
         sync.run_once([self.connector])
-        self.assertFalse(AccessSync.objects.filter(sub=sub).exists())
+        row = AccessSync.objects.get(sub=sub)
+        self.assertEqual(row.label, "")
+        self.assertFalse(row.pending)
+
+    def test_a_look_at_everyone_covers_someone_deleted(self):
+        """A tool restored from a backup could bring their account back."""
+        sub = sync.sub_of(self.user)
+        self.user.delete()
+        sync.run_once([self.connector])
+        self.connector.seen.clear()
+        sync.request_for_everyone()
+        sync.run_once([self.connector])
+        self.assertEqual([person.sub for person in self.connector.seen], [sub])
+        self.assertFalse(self.connector.seen[0].allowed)
+
+    def test_a_tool_skipped_when_someone_was_deleted_still_hears_later(self):
+        """Being re-registered at the time, or having no connector yet, mustn't lose it."""
+        sub = sync.sub_of(self.user)
+        self.user.delete()
+        late = FakeConnector("late")
+        sync.run_once([late])  # it isn't registered yet
+        self.assertEqual(late.seen, [])
+        make_tool("late", "https://late.example.org/callback")
+        sync.run_once([late])
+        self.assertEqual([person.sub for person in late.seen], [sub])
+        self.assertFalse(late.seen[0].allowed)
+
+    def test_a_note_about_someone_whose_address_is_gone_still_says_who(self):
+        self.user.delete()
+        self.connector.notes = []
+        sync.run_once([self.connector])
+        restored = FakeConnector()
+        restored.notes = [("org-1", "Change the passwords.")]
+        sync.request_for_everyone()
+        sync.run_once([restored])
+        self.assertIn("deleted account", restored.seen[0].email)
+        self.assertIn("deleted account", FollowUp.objects.get().about)
+
+    def test_a_group_that_requires_2fa_waits_for_it(self):
+        """Core wouldn't let them through to a tool, so telling it directly would get around that."""
+        self.user.groups.add(Group.objects.get(role__key="operator"))
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[-1].groups, ("developer",))
+
+    def test_setting_up_2fa_lets_it_through(self):
+        self.user.groups.add(Group.objects.get(role__key="operator"))
+        sync.run_once([self.connector])
+        TOTP.activate(self.user, generate_totp_secret())
+        self.assertTrue(waiting(self.user))
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[-1].groups, ("developer", "operator"))
+
+    def test_losing_2fa_takes_it_away_again(self):
+        self.user.groups.add(Group.objects.get(role__key="operator"))
+        TOTP.activate(self.user, generate_totp_secret())
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[-1].groups, ("developer", "operator"))
+        Authenticator.objects.filter(user=self.user).delete()
+        self.assertTrue(waiting(self.user))
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[-1].groups, ("developer",))
+
+    def test_groups_that_dont_require_2fa_dont_wait(self):
+        self.user.groups.add(Group.objects.get(role__key="member"))
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[-1].groups, ("developer", "member"))
+
+    def test_someone_just_removed_goes_ahead_of_a_look_at_everyone(self):
+        other, _ = make_user("other@example.org", ["developer"])
+        sync.request_for_everyone()
+        sync.request_for(other)
+        sync.run_once([self.connector])
+        self.assertEqual(self.connector.seen[0].sub, sync.sub_of(other))
+
+    def test_a_tool_not_answering_only_costs_one_try_each_time(self):
+        """A hung tool times out for every person otherwise, which holds up the worker."""
+        make_user("other@example.org", ["developer"])
+        sync.request_for_everyone()
+
+        class Hung(FakeConnector):
+            def apply(self, person, note):
+                self.seen.append(person)
+                raise TimeoutError("timed out")
+
+        hung, healthy = Hung("tool"), FakeConnector("other")
+        make_tool("other", "https://other.example.org/callback")
+        sync.request_for_everyone()
+        self.assertEqual(sync.run_once([hung, healthy]), 2)
+        self.assertEqual(len(hung.seen), 1)
+        self.assertEqual(len(healthy.seen), 2)
+        self.assertEqual(AccessSync.objects.filter(pending=True).count(), 2)
+        for row in AccessSync.objects.all():
+            self.assertIn("timed out", row.tools["tool"]["error"])
+
+    def test_a_tool_refusing_one_person_doesnt_stop_it_being_asked_about_others(self):
+        other, _ = make_user("other@example.org", ["developer"])
+        sync.request_for_everyone()
+
+        class Picky(FakeConnector):
+            def apply(self, person, note):
+                self.seen.append(person)
+                if person.sub == sync.sub_of(other):
+                    raise RuntimeError("answered 500")
+
+        picky = Picky()
+        sync.run_once([picky])
+        self.assertEqual(len(picky.seen), 2)
+
+    def test_it_says_its_alive_after_each_person(self):
+        make_user("other@example.org", ["developer"])
+        sync.request_for_everyone()
+        ticks = []
+        sync.run_once([self.connector], tick=lambda: ticks.append(1))
+        self.assertEqual(len(ticks), 2)
+
+    def test_a_tool_no_longer_asked_doesnt_show_its_old_error(self):
+        self.ask()
+        self.connector.broken = True
+        sync.run_once([self.connector])
+        self.assertIn("the tool is down", sync.describe(AccessSync.objects.get(user=self.user)))
+        AccessSync.objects.filter(user=self.user).update(retry_at=None)
+        sync.run_once([])  # the module was switched off
+        row = AccessSync.objects.get(user=self.user)
+        self.assertNotIn("the tool is down", sync.describe(row))
+        self.assertFalse(row.pending)
+
+    def test_a_connector_that_cant_run_keeps_people_waiting_and_says_why(self):
+        """Quietly skipping it would look like there was nothing to do."""
+        self.ask()
+        sync.run_once([sync.Unavailable("tool", "it has no TOKEN yet")])
+        row = AccessSync.objects.get(user=self.user)
+        self.assertTrue(row.pending)
+        self.assertIn("it has no TOKEN yet", sync.describe(row))
 
     def test_a_row_for_someone_deleted_stays_until_every_tool_knows(self):
         sub = sync.sub_of(self.user)
@@ -336,9 +470,22 @@ class Loading(Base):
                 "class Connector:\n    tool = 'demo'\n    def __init__(self, environ):\n        self.token = environ['DEMO_TOKEN']\n"
             )
             env = {"SYNC_MODULES_DIR": folder, "SYNC_MODULES": "demo"}
-            self.assertEqual(sync.load_connectors(env), [])
+            waiting_for_token = sync.load_connectors(env)
+            self.assertIsInstance(waiting_for_token[0], sync.Unavailable)
+            self.assertEqual(waiting_for_token[0].tool, "demo")
+            self.assertIn("DEMO_TOKEN", waiting_for_token[0].reason)
             found = sync.load_connectors({**env, "DEMO_TOKEN": "t"})
             self.assertEqual([connector.tool for connector in found], ["demo"])
+            self.assertNotIsInstance(found[0], sync.Unavailable)
+
+    def test_a_connector_that_doesnt_load_doesnt_stop_the_others(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for name, code in (("broken", "this isn't python"), ("fine", "class Connector:\n    tool = 'fine'\n    def __init__(self, environ):\n        pass\n")):
+                Path(folder, name).mkdir()
+                Path(folder, name, "connector.py").write_text(code)
+            found = sync.load_connectors({"SYNC_MODULES_DIR": folder, "SYNC_MODULES": "broken,fine"})
+        self.assertIsInstance(found[0], sync.Unavailable)
+        self.assertNotIsInstance(found[1], sync.Unavailable)
 
     def test_no_modules_means_no_connectors(self):
         self.assertEqual(sync.load_connectors({"SYNC_MODULES": ""}), [])
@@ -468,6 +615,12 @@ class FollowUps(Base):
         self.assertContains(self.client.get(reverse("admin:index")), "Change the passwords in Shared.")
         self.open_ones().update(done_at=timezone.now())
         self.assertNotContains(self.client.get(reverse("admin:index")), "Change the passwords in Shared.")
+
+    def test_more_than_can_be_shown_says_how_many(self):
+        for number in range(13):
+            FollowUp.objects.create(about="a@example.org", sub=str(number), tool="tool", key="k", text=f"Follow-up {number}.")
+        self.enter_admin(["board"])
+        self.assertContains(self.client.get(reverse("admin:index")), "and 3 more")
 
     def test_a_treasurer_isnt_told(self):
         self.run_with_note()

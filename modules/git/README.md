@@ -34,7 +34,7 @@ Core tells Forgejo straight away, usually within a few seconds, with no new sign
 | Removed from a group | Off that group's team. Unless they're still a Developer or Operator, they also stop being a collaborator on any repo, including ones they created. Their account and tokens keep working, for public repos |
 | Removed from Operator | No longer a Forgejo admin or an owner of the organisation |
 | Account turned off, or deleted | Blocked, and off every team. Tokens stop working on the API and Git, and an open web page shows "Account is suspended" whatever it asks for |
-| Added to a group, or turned back on | On that group's team straight away. They don't get back as a collaborator, as the team is what gives them access |
+| Added to a group, or turned back on | On that group's team straight away. They don't get back as a collaborator, as the team is what gives them access. If the group requires 2FA, this waits until they've set it up |
 
 Forgejo makes someone a collaborator on a repo they create, as their team only has write access, and they keep admin rights on it until they leave. Git shows someone who's blocked a confusing error, such as `could not determine hash algorithm`, rather than saying they're blocked.
 
@@ -72,7 +72,7 @@ git clone https://git.example.org/example/some-repo.git
 
 Everything is in `/srv/git`, `/etc/sallskap/git.env` and `/etc/sallskap/sync.env`. Keep them together: the secret key in `git.env` is what makes Forgejo's stored login secret readable. The `kit` backup comes later.
 
-When the worker starts, it goes over everyone, so someone who left after the backup was taken is cut off again by itself.
+When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is cut off again by itself.
 
 ## Upgrading
 
