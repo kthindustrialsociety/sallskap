@@ -6,11 +6,13 @@ import importlib.util
 import io
 import json
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
 import tomllib
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -1325,9 +1327,13 @@ class Status(unittest.TestCase):
         self.paths.config.write_text('[association]\ndomain = "example.org"\n')
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"203.0.113.1"
-        patcher = mock.patch.object(kit.urllib.request, "urlopen", return_value=response)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.object(kit.urllib.request, "urlopen", return_value=response),
+            # Whether the machine running the tests has restic isn't what's being tested.
+            mock.patch.object(kit.shutil, "which", return_value="/usr/bin/restic"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_status(self, addresses):
         out = io.StringIO()
@@ -1342,8 +1348,11 @@ class Status(unittest.TestCase):
 
     def test_the_app_hostname_pointing_here_is_fine(self):
         code, out = self.run_status({"203.0.113.1"})
-        self.assertEqual(code, 0)
         self.assertIn("ok   app.example.org", out)
+        self.assertNotIn("DNS", out)
+        # The only thing left to report is that nothing has been backed up yet.
+        self.assertEqual(code, 1)
+        self.assertIn("no backups have been taken yet", out)
 
     def fake_module(self):
         root = Path(self._tmp.name) / "root"
@@ -1364,6 +1373,512 @@ class Status(unittest.TestCase):
         self.fake_module()
         _, out = self.run_status(set())
         self.assertNotIn("demo.example.org", out)
+
+
+class Backups(unittest.TestCase):
+    """Runs the backup commands against a made-up module, with Docker and restic replaced."""
+
+    SNAPSHOT_TIME = "2026-11-05T03:00:11.123456789+01:00"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.base = base
+        self.root = base / "root"
+        (self.root / "modules" / "website").mkdir(parents=True)
+        (self.root / "modules" / "website" / "module.toml").write_text(
+            f'name = "website"\ndata = ["{base / "srv" / "website"}"]\n'
+        )
+        (self.root / "modules" / "website" / "site.caddy").write_text("(website_defaults) {\n}\n")
+        self.demo = self.root / "modules" / "demo"
+        self.demo.mkdir()
+        self.demo_data = base / "srv" / "demo"
+        (self.demo / "module.toml").write_text(
+            f'name = "demo"\ndescription = "A demo"\nsubdomain = "demo"\ndata = ["{self.demo_data}"]\n'
+        )
+        (self.demo / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo/demo:9.9.9\n")
+        (self.demo / "site.caddy").write_text("__HOST__ {\n\treverse_proxy demo:80\n}\n")
+
+        self.paths = kit.Paths(
+            config_dir=base / "etc",
+            website_dir=base / "srv" / "website",
+            deploy_home=base / "home",
+            core_dir=base / "srv" / "core",
+            caddy_dir=base / "srv" / "caddy",
+            backup_dir=base / "srv" / "backup",
+        )
+        self.paths.config_dir.mkdir()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
+        for folder in (self.paths.core_dir, self.paths.caddy_dir, self.paths.deploy_home, self.demo_data):
+            folder.mkdir(parents=True)
+
+        self.calls = []
+        self.restic_fails = ()  # restic commands that come back with an error
+        self.stopped_extras = []
+        real_run = subprocess.run
+
+        def fake_run(command, *args, **kwargs):
+            if command[0] == "restic":
+                self.calls.append(command)
+                return self.fake_restic(command, **kwargs)
+            if command[0] == "docker":
+                self.calls.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[0] == "sh":  # a module's own backup.sh
+                self.calls.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[0] == "git":
+                return subprocess.CompletedProcess(command, 0, "abc1234\n", "")
+            return real_run(command, *args, **kwargs)
+
+        for patcher in (
+            mock.patch.object(kit, "ROOT", self.root),
+            mock.patch.object(kit.subprocess, "run", fake_run),
+            mock.patch.object(kit, "Paths", return_value=self.paths),
+            mock.patch.object(kit, "status", return_value=0),
+            mock.patch.object(kit.shutil, "which", return_value="/usr/bin/restic"),
+            mock.patch.object(kit, "apply", lambda paths, build=False: self.calls.append(["kit", "apply"])),
+            mock.patch.dict(kit.STOP, {"demo": lambda paths: self.stopped_extras.append("demo")}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_restic(self, command, **kwargs):
+        action = command[3]
+        repo = Path(command[2])
+        if action in self.restic_fails:
+            return subprocess.CompletedProcess(command, 1, "", "restic said no")
+        if action == "init":
+            (repo / "config").parent.mkdir(parents=True, exist_ok=True)
+            (repo / "config").write_text("a repository")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if action == "cat":
+            return subprocess.CompletedProcess(command, 1 if not (repo / "config").exists() else 0, "", "")
+        if action == "snapshots":
+            snapshot = {
+                "id": "deadbeef",
+                "time": self.SNAPSHOT_TIME,
+                "hostname": "old-server",
+                "paths": [str(self.paths.core_dir)],
+                "tags": ["sallskap", "version:abc1234", "module:demo", "image:demo=9.9.9"],
+            }
+            return subprocess.CompletedProcess(command, 0, json.dumps([snapshot]), "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def run_kit(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kit.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def restic_calls(self, action=None):
+        return [c for c in self.calls if c[0] == "restic" and (action is None or c[3] == action)]
+
+    def docker_calls(self):
+        return [c for c in self.calls if c[0] == "docker"]
+
+    def config(self):
+        return kit.load_config(self.paths)
+
+    # ---- What goes in --------------------------------------------------------
+
+    def test_what_goes_in_comes_from_the_module_manifests(self):
+        wanted = kit.backup_paths(self.paths, self.config())
+        self.assertIn(self.demo_data, wanted)
+        self.assertIn(self.paths.config_dir, wanted)
+        self.assertIn(self.paths.core_dir, wanted)
+
+    def test_caddys_certificates_and_the_publishing_keys_go_in(self):
+        wanted = kit.backup_paths(self.paths, self.config())
+        self.assertIn(self.paths.caddy_dir, wanted)
+        self.assertIn(self.paths.deploy_home, wanted)
+
+    def test_a_module_that_is_switched_off_still_gets_backed_up(self):
+        """Disabling a module keeps its data, so a backup has to keep it too."""
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.assertEqual(self.config().modules, ())
+        self.assertIn(self.demo_data, kit.backup_paths(self.paths, self.config()))
+
+    def test_a_folder_that_isnt_there_is_left_out(self):
+        shutil.rmtree(self.demo_data)
+        self.assertNotIn(self.demo_data, kit.backup_paths(self.paths, self.config()))
+
+    def test_the_backups_own_folder_is_never_backed_up(self):
+        (self.demo / "module.toml").write_text(f'name = "demo"\ndata = ["{self.paths.backup_dir}"]\n')
+        self.paths.backup_dir.mkdir(parents=True)
+        with self.assertRaisesRegex(kit.KitError, "holds the backups"):
+            kit.backup_paths(self.paths, self.config())
+
+    # ---- The password --------------------------------------------------------
+
+    def test_the_password_is_made_once_and_then_kept(self):
+        first, made = kit.backup_password(self.paths)
+        self.assertTrue(made)
+        again, made_again = kit.backup_password(self.paths)
+        self.assertEqual(first, again)
+        self.assertFalse(made_again)
+        self.assertEqual(self.paths.backup_env.stat().st_mode & 0o777, 0o600)
+
+    def test_the_password_is_shown_once_and_only_when_it_is_made(self):
+        code, out = self.run_kit("backup")
+        self.assertEqual(code, 0)
+        password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+        self.assertIn(password, out)
+        self.assertIn("can't be recovered", out)
+        _, again = self.run_kit("backup")
+        self.assertNotIn(password, again)
+
+    def test_a_backup_without_a_password_refuses_rather_than_making_one_silently(self):
+        """Only `kit backup` may make the password, as only it prints it."""
+        with self.assertRaisesRegex(kit.KitError, "No backup password"):
+            kit._restic_environment(self.paths)
+
+    # ---- Taking one ----------------------------------------------------------
+
+    def test_a_first_backup_sets_up_the_repository_then_copies(self):
+        code, _ = self.run_kit("backup")
+        self.assertEqual(code, 0)
+        self.assertEqual([c[3] for c in self.restic_calls()], ["init", "backup", "forget"])
+
+    def test_a_later_backup_doesnt_set_the_repository_up_again(self):
+        self.run_kit("backup")
+        self.calls.clear()
+        self.run_kit("backup")
+        self.assertEqual([c[3] for c in self.restic_calls()], ["backup", "forget"])
+
+    def test_everything_but_caddy_stops_before_the_copy_and_starts_after(self):
+        self.run_kit("backup")
+        order = []
+        for call in self.calls:
+            if call[0] == "restic" and call[3] == "backup":
+                order.append("copy")
+                continue
+            if call[0] != "docker":
+                continue
+            # A module runs from its own Compose file; core and the worker are named.
+            module = next((Path(part).parent.name for part in call if part.endswith("compose.yml")), None)
+            for action in ("stop", "start"):
+                if action in call:
+                    order.append(f"{action} {module or ' '.join(call[call.index(action) + 1 :])}")
+        self.assertEqual(order, ["stop sync core", "stop demo", "copy", "start demo", "start core", "start sync"])
+        self.assertFalse([c for c in self.docker_calls() if "caddy" in c])
+
+    def test_the_vaults_emergency_copy_is_stopped_too(self):
+        """It writes to the same data, and it's meant to be short-lived anyway."""
+        self.run_kit("backup")
+        self.assertEqual(self.stopped_extras, ["demo"])
+
+    def test_the_containers_come_back_even_when_the_copy_fails(self):
+        self.restic_fails = ("backup",)
+        code, out = self.run_kit("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("restic backup failed", out)
+        starts = [c for c in self.docker_calls() if "start" in c]
+        self.assertEqual(len(starts), 3)
+
+    def test_a_modules_own_step_runs_while_it_is_still_up(self):
+        (self.demo / "backup.sh").write_text("#!/bin/sh\nexit 0\n")
+        self.run_kit("backup")
+        names = [c[0] if c[0] != "sh" else "backup.sh" for c in self.calls]
+        self.assertLess(names.index("backup.sh"), names.index("docker"))
+
+    def test_a_modules_own_step_failing_stops_the_backup(self):
+        (self.demo / "backup.sh").write_text("#!/bin/sh\nexit 1\n")
+        fails = lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", "")  # noqa: E731
+        with mock.patch.object(kit.subprocess, "run", fails), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(kit.KitError, "backup.sh failed"):
+                kit._run_backup_scripts(self.config())
+
+    def test_the_snapshot_records_the_version_and_each_pinned_image(self):
+        self.run_kit("backup")
+        tags = self.restic_calls("backup")[0]
+        self.assertIn("version:abc1234", tags)
+        self.assertIn("image:demo=9.9.9", tags)
+        self.assertIn("module:demo", tags)
+
+    def test_old_snapshots_are_pruned_so_the_disk_cant_fill(self):
+        self.run_kit("backup")
+        forget = self.restic_calls("forget")[0]
+        self.assertIn("--prune", forget)
+        self.assertIn("--keep-daily", forget)
+        self.assertIn("--tag", forget)
+
+    def test_the_pause_is_reported_so_an_operator_knows_what_it_costs(self):
+        _, out = self.run_kit("backup")
+        self.assertRegex(out, r"paused for \d+ seconds")
+        self.assertIn("public sites weren't", out)
+
+    def test_restic_missing_says_how_to_install_it(self):
+        with mock.patch.object(kit.shutil, "which", return_value=None):
+            code, out = self.run_kit("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("apt-get install restic", out)
+        self.assertEqual(self.calls, [])
+
+    def test_two_backups_at_once_are_refused_rather_than_interleaved(self):
+        with kit._backup_lock(self.paths):
+            code, out = self.run_kit("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("Another backup is already running", out)
+
+    # ---- The off-server target ----------------------------------------------
+
+    def test_nothing_leaves_the_server_unless_a_target_is_set(self):
+        _, out = self.run_kit("backup")
+        self.assertEqual(self.restic_calls("copy"), [])
+        self.assertIn("Nothing has left this server", out)
+
+    def test_a_target_is_set_up_once_and_then_copied_to(self):
+        self.paths.config.write_text(
+            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{self.base / "away"}"\n[modules]\ndemo = true\n'
+        )
+        self.run_kit("backup")
+        init_targets = [c for c in self.restic_calls("init") if str(self.base / "away") in c]
+        self.assertEqual(len(init_targets), 1)
+        self.assertIn("--copy-chunker-params", init_targets[0])
+        self.assertEqual(len(self.restic_calls("copy")), 1)
+        self.calls.clear()
+        self.run_kit("backup")
+        self.assertEqual([c for c in self.restic_calls("init") if str(self.base / "away") in c], [])
+        self.assertEqual(len(self.restic_calls("copy")), 1)
+
+    def test_a_target_is_read_as_a_restic_repository_and_nothing_else(self):
+        for target in ("", 42, True):
+            with self.subTest(target=target):
+                text = f'[association]\ndomain = "a.org"\n[backup]\ntarget = {json.dumps(target)}\n'
+                with self.assertRaisesRegex(kit.KitError, "must be a restic repository"):
+                    kit.parse_config(text)
+
+    # ---- Taking a copy off the server ---------------------------------------
+
+    def test_an_export_holds_the_whole_repository_as_one_file(self):
+        self.run_kit("backup")
+        out_file = self.base / "away.tar"
+        code, out = self.run_kit("backup", "export", str(out_file))
+        self.assertEqual(code, 0)
+        self.assertIn("It's encrypted", out)
+        with tarfile.open(out_file) as tar:
+            self.assertIn("repo/config", tar.getnames())
+        self.assertEqual(out_file.stat().st_mode & 0o777, 0o600)
+
+    def test_an_export_leaves_out_the_lock_and_its_own_note(self):
+        """Or unpacking it would bring another server's lock and dates along."""
+        self.run_kit("backup")
+        out_file = self.base / "away.tar"
+        self.run_kit("backup", "export", str(out_file))
+        with tarfile.open(out_file) as tar:
+            self.assertEqual([n for n in tar.getnames() if "kit.lock" in n or "last-export" in n], [])
+
+    def test_an_export_to_a_folder_is_named_by_its_date(self):
+        self.run_kit("backup")
+        self.run_kit("backup", "export", str(self.base))
+        self.assertTrue(list(self.base.glob("sallskap-backup-*.tar")))
+
+    def test_an_export_records_when_a_copy_last_left_the_server(self):
+        self.run_kit("backup")
+        self.assertFalse((self.paths.backup_dir / "last-export").exists())
+        self.run_kit("backup", "export", str(self.base / "away.tar"))
+        self.assertTrue((self.paths.backup_dir / "last-export").exists())
+
+    def test_an_export_with_nothing_to_export_says_so(self):
+        code, out = self.run_kit("backup", "export", str(self.base / "away.tar"))
+        self.assertEqual(code, 1)
+        self.assertIn("no backup to export yet", out)
+
+    def fake_stdout(self, a_screen):
+        stream = io.BytesIO()
+        pretend = mock.MagicMock()
+        pretend.buffer = stream
+        pretend.isatty.return_value = a_screen
+        return stream, mock.patch.object(kit.sys, "stdout", pretend)
+
+    def test_an_export_to_a_screen_is_refused_rather_than_printed(self):
+        self.run_kit("backup")
+        _, as_stdout = self.fake_stdout(a_screen=True)
+        with as_stdout, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(kit.KitError, "print the backup to your screen"):
+                kit.export_backup(self.paths, "-")
+
+    def test_an_export_streams_to_standard_output_by_default(self):
+        """So a copy off the server is one line over SSH, with nothing left behind."""
+        self.run_kit("backup")
+        stream, as_stdout = self.fake_stdout(a_screen=False)
+        with as_stdout, contextlib.redirect_stderr(io.StringIO()):
+            kit.export_backup(self.paths, "-")
+        stream.seek(0)
+        with tarfile.open(fileobj=stream) as tar:
+            self.assertIn("repo/config", tar.getnames())
+
+    # ---- Status --------------------------------------------------------------
+
+    def status_lines(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            problems = kit._backup_status(self.paths)
+        return problems, out.getvalue()
+
+    def test_status_says_when_nothing_has_been_backed_up(self):
+        problems, out = self.status_lines()
+        self.assertEqual(problems, 1)
+        self.assertIn("no backups have been taken yet", out)
+
+    def test_status_counts_a_missing_restic_as_a_problem(self):
+        with mock.patch.object(kit.shutil, "which", return_value=None):
+            problems, out = self.status_lines()
+        self.assertEqual(problems, 1)
+        self.assertIn("no backups are being taken", out)
+
+    def test_status_reports_a_fresh_backup_and_nags_about_the_copy(self):
+        self.run_kit("backup")
+        with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
+            problems, out = self.status_lines()
+        self.assertIn("ok   last backup 1 hours ago", out)
+        self.assertEqual(problems, 1)
+        self.assertIn("no copy has ever left this server", out)
+
+    def test_status_reports_a_backup_that_has_stopped_running(self):
+        self.run_kit("backup")
+        self.note_export(days_ago=1)
+        with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 5 * 86400):
+            problems, out = self.status_lines()
+        self.assertIn("the last backup was 5 days ago", out)
+        self.assertIn("sallskap-backup.timer", out)
+        self.assertEqual(problems, 1)
+
+    def test_status_reports_a_copy_off_the_server_that_has_got_old(self):
+        self.run_kit("backup")
+        self.note_export(days_ago=40)
+        with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
+            problems, out = self.status_lines()
+        self.assertIn("ok   last backup", out)
+        self.assertIn("the last copy off this server was 40 days ago", out)
+        self.assertEqual(problems, 1)
+
+    def note_export(self, days_ago):
+        when = self.snapshot_timestamp() - days_ago * 86400 + 3600
+        (self.paths.backup_dir / "last-export").write_text(f"{int(when)}\n")
+
+    def snapshot_timestamp(self):
+        return datetime.fromisoformat(self.SNAPSHOT_TIME[:26] + self.SNAPSHOT_TIME[-6:]).timestamp()
+
+    # ---- Restoring -----------------------------------------------------------
+
+    def test_a_restore_refuses_to_replace_a_working_installation(self):
+        (self.paths.core_dir / "db.sqlite3").write_text("a database")
+        code, out = self.run_kit("restore")
+        self.assertEqual(code, 1)
+        self.assertIn("already has an installation", out)
+        self.assertEqual(self.restic_calls(), [])
+
+    def test_a_restore_over_a_working_installation_needs_force(self):
+        self.run_kit("backup")
+        (self.paths.core_dir / "db.sqlite3").write_text("a database")
+        code, out = self.run_kit("restore", "--force")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.restic_calls("restore")), 1)
+
+    def test_a_restore_puts_everything_back_then_starts_it(self):
+        self.run_kit("backup")
+        code, out = self.run_kit("restore")
+        self.assertEqual(code, 0, out)
+        restore = self.restic_calls("restore")[0]
+        self.assertIn("deadbeef", restore)
+        self.assertEqual(restore[-2:], ["--target", "/"])
+        self.assertIn(["kit", "apply"], self.calls)
+
+    def test_a_restore_says_what_to_check_afterwards(self):
+        self.run_kit("backup")
+        _, out = self.run_kit("restore")
+        self.assertIn("who has left since the backup", out)
+        self.assertIn("master password", out)
+
+    def test_a_restore_stops_what_is_running_before_putting_files_back(self):
+        self.run_kit("backup")
+        self.calls.clear()
+        self.run_kit("restore")
+        stops = [i for i, c in enumerate(self.calls) if "stop" in c]
+        restores = [i for i, c in enumerate(self.calls) if c[0] == "restic" and c[3] == "restore"]
+        self.assertTrue(stops and restores and max(stops) < min(restores))
+
+    def test_a_restore_refuses_a_backup_from_a_different_tool_version(self):
+        """An older tool refuses a database written by a newer one."""
+        self.run_kit("backup")
+        (self.demo / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo/demo:8.0.0\n")
+        code, out = self.run_kit("restore")
+        self.assertEqual(code, 1)
+        self.assertIn("the backup was taken with 9.9.9, this code pins 8.0.0", out)
+        self.assertEqual(self.restic_calls("restore"), [])
+
+    def test_a_version_difference_can_be_overridden_once_it_has_been_seen(self):
+        self.run_kit("backup")
+        (self.demo / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo/demo:8.0.0\n")
+        code, out = self.run_kit("restore", "--force")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Going ahead with a version difference", out)
+
+    def test_a_restore_from_an_exported_file_unpacks_it_first(self):
+        self.run_kit("backup")
+        out_file = self.base / "away.tar"
+        self.run_kit("backup", "export", str(out_file))
+        shutil.rmtree(self.paths.backup_dir)
+        code, out = self.run_kit("restore", str(out_file))
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.paths.repo / "config").exists())
+
+    def test_a_restore_wont_unpack_over_backups_that_are_already_there(self):
+        self.run_kit("backup")
+        out_file = self.base / "away.tar"
+        self.run_kit("backup", "export", str(out_file))
+        code, out = self.run_kit("restore", str(out_file))
+        self.assertEqual(code, 1)
+        self.assertIn("already holds backups", out)
+
+    def test_a_restore_refuses_a_file_that_isnt_an_export(self):
+        not_a_backup = self.base / "notes.txt"
+        not_a_backup.write_text("hello")
+        code, out = self.run_kit("restore", str(not_a_backup))
+        self.assertEqual(code, 1)
+        self.assertIn("isn't a backup exported by kit", out)
+
+    def test_a_restore_with_nothing_to_restore_from_says_what_to_give_it(self):
+        code, out = self.run_kit("restore")
+        self.assertEqual(code, 1)
+        self.assertIn("kit restore <file>", out)
+
+    def test_an_exported_file_cannot_write_outside_the_backup_folder(self):
+        """It's unpacked as root, so a crafted file mustn't be able to place one anywhere."""
+        shutil.rmtree(self.paths.backup_dir, ignore_errors=True)
+        crafted = self.base / "crafted.tar"
+        with tarfile.open(crafted, "w") as tar:
+            info = tarfile.TarInfo("../../escaped")
+            info.size = 0
+            tar.addfile(info, io.BytesIO(b""))
+        code, _ = self.run_kit("restore", str(crafted))
+        self.assertEqual(code, 1)
+        self.assertFalse((self.base.parent / "escaped").exists())
+
+    def test_the_password_for_a_restore_is_taken_from_the_offline_copy(self):
+        with mock.patch.dict(kit.os.environ, {}, clear=False):
+            kit.os.environ.pop("RESTIC_PASSWORD", None)
+            with mock.patch.object(kit.getpass, "getpass", return_value="typed-in") as asked:
+                self.assertEqual(kit._restore_password(self.paths), "typed-in")
+        asked.assert_called_once()
+
+    def test_a_restore_puts_the_publishing_keys_back_in_the_deploy_accounts_name(self):
+        """restic puts back the numbers it saved, and this server's may differ."""
+        self.run_kit("backup")
+        self.paths.config.write_text(
+            '[association]\ndomain = "example.org"\n\n[[website.sites]]\ndomain = "example.org"\n'
+        )
+        site = self.paths.site_dir("example.org")
+        site.mkdir(parents=True)
+        (site / "current").write_text("x")
+        with mock.patch.object(kit.os, "geteuid", return_value=0), mock.patch.object(kit.shutil, "chown") as chown:
+            kit._fix_ownership(self.paths, self.config())
+        changed = {str(call.args[0]) for call in chown.call_args_list}
+        self.assertIn(str(self.paths.deploy_home), changed)
+        self.assertIn(str(site / "current"), changed)
 
 
 class WorkerSettings(unittest.TestCase):
@@ -1824,6 +2339,33 @@ class Packaging(unittest.TestCase):
         self.assertIn("cap_drop: [ALL]", text)
         self.assertIn("no-new-privileges:true", text)
         self.assertRegex((ROOT / "core" / "Dockerfile").read_text(), r"(?m)^USER 10001")
+
+    def test_backups_run_every_night_without_anyone_remembering(self):
+        timer = (ROOT / "systemd" / "sallskap-backup.timer").read_text()
+        self.assertIn("OnCalendar=*-*-* 03:00:00", timer)
+        self.assertIn("Persistent=true", timer)  # a server that was off catches up
+        self.assertIn("WantedBy=timers.target", timer)
+
+    def test_the_nightly_run_is_the_same_command_an_operator_would_type(self):
+        service = (ROOT / "systemd" / "sallskap-backup.service").read_text()
+        self.assertIn(f"ExecStart={kit.KIT_COMMAND} backup", service)
+        self.assertIn("Type=oneshot", service)
+
+    def test_the_nightly_run_is_skipped_rather_than_failing_before_the_setup(self):
+        service = (ROOT / "systemd" / "sallskap-backup.service").read_text()
+        self.assertIn("ExecCondition=/usr/bin/test -f /etc/sallskap/config.toml", service)
+
+    def test_a_nightly_backup_cant_make_the_server_feel_slow(self):
+        service = (ROOT / "systemd" / "sallskap-backup.service").read_text()
+        self.assertIn("IOSchedulingClass=idle", service)
+        self.assertIn("Nice=", service)
+
+    def test_the_installer_puts_restic_and_the_timer_in_place(self):
+        installer = (ROOT / "install.sh").read_text()
+        self.assertRegex(installer, r"apt-get install .*\brestic\b")
+        self.assertIn("systemd/sallskap-backup.service", installer)
+        self.assertIn("systemctl enable --now sallskap-backup.timer", installer)
+        self.assertIn("schedule_backups", installer.split("main() {")[1])
 
 
 if __name__ == "__main__":
