@@ -165,7 +165,7 @@ install_packages() {
   step "Installing base packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl git openssl python3 ufw unattended-upgrades >/dev/null
+  apt-get install -y -qq ca-certificates curl git openssl python3 restic ufw unattended-upgrades >/dev/null
 }
 
 enable_automatic_updates() {
@@ -299,6 +299,18 @@ prepare_folders() {
   ok "Data in /srv, config in $CONFIG_DIR"
 }
 
+# The nightly backup. The units come from the repo rather than a heredoc, so the
+# tests read what actually gets installed. See docs/restore.md.
+schedule_backups() {
+  step "Scheduling nightly backups"
+  install -d -m 0700 /srv/backup
+  install -m 0644 "$INSTALL_DIR/systemd/sallskap-backup.service" "$INSTALL_DIR/systemd/sallskap-backup.timer" \
+    /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable --now sallskap-backup.timer >/dev/null
+  ok "Backups run nightly: $(systemctl show -p TimersCalendar --value sallskap-backup.timer)"
+}
+
 start_core() {
   step "Starting Sällskap"
   if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
@@ -353,6 +365,7 @@ main() {
   install_docker
   prepare_folders
   fetch_kit
+  schedule_backups
   start_core
 
   say ""

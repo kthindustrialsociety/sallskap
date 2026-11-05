@@ -1,0 +1,13 @@
+[Unit]
+Description=Take a Sällskap backup every night
+
+[Timer]
+# Before the 04:30 window for automatic reboots, so an update never lands in the
+# middle of a backup. Logins and the tools pause for it; the public sites don't.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+# A server that was off at 03:00 backs up once it's on again.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
