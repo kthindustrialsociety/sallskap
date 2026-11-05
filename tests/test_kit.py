@@ -469,11 +469,11 @@ class Docker(unittest.TestCase):
 
     def test_apply_starts_caddy_then_waits_for_core(self):
         self.run_kit("apply")
-        self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"]])
+        self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
 
     def test_apply_only_rebuilds_when_asked(self):
         self.run_kit("apply", "--build")
-        self.assertEqual(self.starts()[-1], ["up", "-d", "--wait", "--build", "core"])
+        self.assertIn(["up", "-d", "--wait", "--build", "core"], self.starts())
 
     def test_a_broken_core_cannot_hold_up_the_web_server(self):
         self.run_kit("apply")
@@ -638,7 +638,7 @@ class Modules(unittest.TestCase):
         self.assertEqual(self.paths.config.stat().st_mode & 0o777, 0o600)
         self.assertIn("# keep this", self.paths.config.read_text())
         starts = [" ".join(call[call.index("up") :]) for call in self.calls if "up" in call]
-        self.assertEqual(starts, ["up -d caddy", "up -d --wait core", "up -d --wait"])
+        self.assertEqual(starts, ["up -d caddy", "up -d --wait core", "up -d --wait", "up -d --wait sync"])
         self.assertEqual(self.setup_calls, ["prepare", "setup"])
         self.assertEqual(len(self.demo_commands()), 1)
 
@@ -675,7 +675,8 @@ class Modules(unittest.TestCase):
         self.calls.clear()
         self.setup_calls.clear()
         self.run_kit("apply")
-        self.assertEqual(self.demo_commands()[-1], self.calls[-1])
+        self.assertEqual(self.demo_commands()[-1], self.calls[-2])
+        self.assertEqual(self.calls[-1][-4:], ["up", "-d", "--wait", "sync"])  # after them, as preparing one can give it a token
         self.assertEqual(self.setup_calls, ["prepare"])
 
     def test_apply_ignores_modules_that_are_off(self):
@@ -712,6 +713,12 @@ class Modules(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("isn't enabled", out)
         self.assertEqual(self.demo_commands(), [])
+
+    def test_disable_tells_the_worker_to_stop_asking_it(self):
+        self.run_kit("enable", "demo")
+        self.calls.clear()
+        self.run_kit("disable", "demo")
+        self.assertEqual(self.calls[-1][-3:], ["up", "-d", "sync"])
 
     def test_a_failed_disable_can_be_finished_by_running_it_again(self):
         """It's still marked as on, so the next run reaches the container."""
@@ -1235,6 +1242,51 @@ class Status(unittest.TestCase):
         self.assertNotIn("demo.example.org", out)
 
 
+class WorkerSettings(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
+        self.config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\nvault = true\nwebsite = true\n')
+
+    def settings(self):
+        return kit._read_env(self.paths.sync_env)
+
+    def test_it_is_private(self):
+        kit._write_sync_env(self.paths, self.config)
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_it_doesnt_get_core_secrets(self):
+        kit.prepare_core(self.paths, self.config)
+        core = kit._read_env(self.paths.core_env)
+        worker = kit._read_env(self.paths.sync_env)
+        self.assertNotEqual(worker["DJANGO_SECRET_KEY"], core["DJANGO_SECRET_KEY"])
+        self.assertNotIn("OIDC_SIGNING_KEY", worker)
+
+    def test_core_is_never_given_the_tools_tokens(self):
+        kit.prepare_core(self.paths, self.config)
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        kit.prepare_core(self.paths, self.config)
+        self.assertNotIn("the-token", self.paths.core_env.read_text())
+        self.assertNotIn("sync.env", compose_services()["core"])
+
+    def test_preparing_core_keeps_the_tokens_and_changes_nothing_else(self):
+        kit.prepare_core(self.paths, self.config)
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        before = self.paths.sync_env.read_text()
+        modified = self.paths.sync_env.stat().st_mtime_ns
+        kit.prepare_core(self.paths, self.config)
+        self.assertEqual(self.paths.sync_env.read_text(), before)
+        self.assertEqual(self.paths.sync_env.stat().st_mtime_ns, modified)
+
+    def test_turning_a_module_off_stops_asking_it_and_keeps_its_token(self):
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n'))
+        self.assertEqual(self.settings()["SYNC_MODULES"], "")
+        self.assertEqual(self.settings()["FORGEJO_ADMIN_TOKEN"], "the-token")
+
+
 class CommandLine(unittest.TestCase):
     def test_a_problem_gives_a_message_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1269,6 +1321,18 @@ def compose_services() -> dict[str, str]:
 class Packaging(unittest.TestCase):
     def test_compose_files_are_read_correctly(self):
         self.assertLessEqual({"caddy", "core"}, set(compose_services()))
+
+    def test_the_worker_has_the_same_limits_as_core_and_no_ports(self):
+        worker = compose_services()["sync"]
+        for setting in ("mem_limit:", "pids_limit:", "read_only: true", "cap_drop: [ALL]", '"no-new-privileges:true"', "restart: unless-stopped"):
+            self.assertIn(setting, worker)
+        self.assertNotIn("ports:", worker)
+
+    def test_the_worker_runs_cores_image_and_cant_change_module_code(self):
+        worker = compose_services()["sync"]
+        self.assertIn("image: sallskap-core:local", worker)
+        self.assertIn("./modules:/modules:ro", worker)
+        self.assertIn("condition: service_healthy", worker)
 
     def test_core_is_the_only_way_into_vaultwarden(self):
         vault = compose_services()["vaultwarden"]
