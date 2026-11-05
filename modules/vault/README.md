@@ -89,9 +89,11 @@ Only an Operator with SSH can do this, and it doesn't ask for 2FA, as SSH stands
 
 ## Restoring
 
-Everything is in `/srv/vault`, `/etc/sallskap/vault.env` and `/etc/sallskap/sync.env`. Keep them together, and stop Vaultwarden while copying its database. The vaults are encrypted with each person's master password, so a restore doesn't bring back anything someone has lost theirs for. The `kit` backup comes later.
+`kit backup` and `kit restore` cover this module along with everything else: see [docs/restore.md](../../docs/restore.md). It backs up `/srv/vault` together with `/etc/sallskap`, which is what matters here — `vault.env` holds the hash of the admin token and `sync.env` the token itself, and they have to match. Vaultwarden is stopped while its database is copied, and so is the emergency copy if one is running, as that writes to the same data.
 
-When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows.
+The vaults are encrypted with each person's master password, which the server never has, so **a restore doesn't bring back a vault whose master password has been lost.** It's as locked as the original.
+
+When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows. The restore checklist says to check who has left.
 
 ## Upgrading
 

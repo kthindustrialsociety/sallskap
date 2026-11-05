@@ -70,9 +70,11 @@ git clone https://git.example.org/example/some-repo.git
 
 ## Restoring
 
-Everything is in `/srv/git`, `/etc/sallskap/git.env` and `/etc/sallskap/sync.env`. Keep them together: the secret key in `git.env` is what makes Forgejo's stored login secret readable. The `kit` backup comes later.
+`kit backup` and `kit restore` cover this module along with everything else: see [docs/restore.md](../../docs/restore.md). It backs up `/srv/git` together with `/etc/sallskap`, which is what matters here — the secret key in `git.env` is what makes Forgejo's stored login secret readable, and `sync.env` holds the admin token the worker uses. Forgejo is stopped while the copy is taken, as its database runs in WAL mode and has to match the repositories.
 
 When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is cut off again by itself.
+
+Restoring can only go forwards: an older Forgejo refuses to start on a database written by a newer one, so `kit restore` stops if the versions don't match.
 
 ## Upgrading
 
