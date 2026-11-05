@@ -811,6 +811,10 @@ class GitSetup(unittest.TestCase):
     """Runs the setup with a made-up Forgejo and core, recording what they were asked."""
 
     def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
         self.calls = []
         self.sources = ""
         self.tools = ""
@@ -874,7 +878,10 @@ class GitSetup(unittest.TestCase):
         return found
 
     def setup(self):
-        kit.setup_git(None, self.config)
+        kit.setup_git(self.paths, self.config)
+
+    def keep_token(self):
+        kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="kept-token")
 
     def test_the_token_never_goes_on_a_command_line(self):
         """Anyone on the server can read those, and this token can't be deleted."""
@@ -902,10 +909,39 @@ class GitSetup(unittest.TestCase):
         self.setup()
         self.assertEqual(self.find("admin user create"), [])
 
-    def test_the_token_can_only_do_what_the_setup_needs(self):
+    def test_the_token_can_only_do_what_this_and_the_worker_need(self):
         self.setup()
         token = self.find("generate-access-token")[0]
-        self.assertIn("--scopes write:admin,write:organization ", token)
+        self.assertIn("--scopes write:admin,write:organization,write:repository,write:user ", token)
+
+    def test_the_token_is_kept_for_the_worker_and_nowhere_else(self):
+        self.setup()
+        self.assertEqual(kit._read_env(self.paths.sync_env)["FORGEJO_ADMIN_TOKEN"], "the-token")
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_the_worker_is_restarted_last_so_it_has_the_token(self):
+        self.setup()
+        self.assertTrue(self.lines()[-1].endswith("up -d --wait sync"), self.lines()[-1])
+        self.assertLess(self.index("add-oauth"), len(self.lines()) - 1)
+
+    def test_a_kept_token_is_used_rather_than_making_another(self):
+        """Forgejo 15 can't delete one with password login off, so another would leave the old one working."""
+        self.keep_token()
+        self.setup()
+        self.assertEqual(self.find("generate-access-token"), [])
+        self.assertTrue(any("Authorization: token kept-token" in (settings or "") for _, settings in self.calls))
+
+    def test_an_upgrade_gets_a_token_and_leaves_its_login_alone(self):
+        self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
+        self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
+        self.users = "ID Username\n1 sallskap-admin a@b true true false\n"
+        self.setup()
+        self.assertEqual(len(self.find("generate-access-token")), 1)
+        self.assertEqual(self.find("admin user create"), [])
+        self.assertEqual(self.find("tool add"), [])
+        self.assertEqual(self.find("add-oauth"), [])
+        self.assertEqual(self.find("update-oauth"), [])
+        self.assertEqual(self.find(" restart "), [])
 
     def test_it_creates_the_teams_a_group_can_lead_to(self):
         self.setup()
@@ -984,6 +1020,7 @@ class GitSetup(unittest.TestCase):
         self.assertLess(self.index(" restart forgejo"), self.index(" up -d --wait"))
 
     def test_a_finished_setup_does_nothing_and_makes_no_token(self):
+        self.keep_token()
         self.sources = "ID Name Type Enabled\n1\tkthis\tOAuth2\ttrue\n"
         self.tools = "forgejo  https://git.kthis.example/user/oauth2/kthis/callback\n"
         self.setup()
@@ -1007,6 +1044,7 @@ class GitSetup(unittest.TestCase):
 
     def test_a_login_source_with_no_tool_makes_no_new_token(self):
         """The login is connected last, so the organisation and teams are already there."""
+        self.keep_token()
         self.sources = "ID Name Type Enabled\n3\tkthis\tOAuth2\ttrue\n"
         self.setup()
         self.assertEqual(self.find("generate-access-token"), [])
@@ -1105,14 +1143,21 @@ class VaultSetup(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"Registered.\n  Client ID: the-id\n  Secret:    {next(self.new_secrets)}\n", "")
             if "tool remove" in line:
                 self.tools = ""
+            if "argon2" in line:
+                self.hashed.append(kwargs.get("input"))
+                return subprocess.CompletedProcess(command, 0, f"$argon2id$v=19$fake{len(self.hashed)}\n", "")
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        self.hashed = []
         patcher = mock.patch.object(kit.subprocess, "run", fake_run)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def settings(self):
         return kit._read_env(self.paths.vault_env)
+
+    def worker_settings(self):
+        return kit._read_env(self.paths.sync_env)
 
     def find(self, text):
         return [line for line in self.calls if text in line]
@@ -1133,8 +1178,50 @@ class VaultSetup(unittest.TestCase):
                 "SSO_AUTHORITY": "https://app.example.org",
                 "SSO_CLIENT_ID": "the-id",
                 "SSO_CLIENT_SECRET": "first-secret",
+                "ADMIN_TOKEN": "'$argon2id$v=19$fake1'",
             },
         )
+
+    def test_only_the_worker_has_the_admin_token(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.assertGreater(len(token), 40)
+        self.assertEqual(self.hashed, [token])
+        self.assertNotIn(token, self.paths.vault_env.read_text())
+        self.assertFalse(self.paths.core_env.exists() and token in self.paths.core_env.read_text())
+        self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
+
+    def test_the_admin_token_never_goes_on_a_command_line(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.assertFalse([line for line in self.calls if token in line])
+
+    def test_the_hash_is_quoted_or_compose_would_read_the_dollars_as_variables(self):
+        kit.prepare_vault(self.paths, self.config)
+        self.assertIn("ADMIN_TOKEN='$argon2id$", self.paths.vault_env.read_text())
+
+    def test_running_it_again_keeps_the_admin_token(self):
+        kit.prepare_vault(self.paths, self.config)
+        token, hashed = self.worker_settings()["VAULT_ADMIN_TOKEN"], self.settings()["ADMIN_TOKEN"]
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.worker_settings()["VAULT_ADMIN_TOKEN"], token)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], hashed)
+        self.assertEqual(len(self.hashed), 1)
+
+    def test_a_lost_hash_gets_a_new_token_on_both_sides(self):
+        kit.prepare_vault(self.paths, self.config)
+        token = self.worker_settings()["VAULT_ADMIN_TOKEN"]
+        self.paths.vault_env.unlink()
+        kit.prepare_vault(self.paths, self.config)
+        self.assertNotEqual(self.worker_settings()["VAULT_ADMIN_TOKEN"], token)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], "'$argon2id$v=19$fake2'")
+
+    def test_a_lost_token_gets_a_new_hash_too(self):
+        kit.prepare_vault(self.paths, self.config)
+        text = self.paths.sync_env.read_text()
+        self.paths.sync_env.write_text("".join(line for line in text.splitlines(keepends=True) if "VAULT_ADMIN_TOKEN" not in line))
+        kit.prepare_vault(self.paths, self.config)
+        self.assertEqual(self.settings()["ADMIN_TOKEN"], "'$argon2id$v=19$fake2'")
 
     def test_the_authority_has_no_trailing_slash_as_it_must_match_the_issuer_exactly(self):
         kit.prepare_vault(self.paths, self.config)
@@ -1253,6 +1340,12 @@ class WorkerSettings(unittest.TestCase):
     def settings(self):
         return kit._read_env(self.paths.sync_env)
 
+    def test_it_only_asks_modules_that_are_on_and_have_a_connector(self):
+        kit._write_sync_env(self.paths, self.config)
+        self.assertEqual(self.settings()["SYNC_MODULES"], "git,vault")
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n[modules]\nvault = true\n'))
+        self.assertEqual(self.settings()["SYNC_MODULES"], "vault")
+
     def test_it_is_private(self):
         kit._write_sync_env(self.paths, self.config)
         self.assertEqual(self.paths.sync_env.stat().st_mode & 0o777, 0o600)
@@ -1285,6 +1378,16 @@ class WorkerSettings(unittest.TestCase):
         kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n'))
         self.assertEqual(self.settings()["SYNC_MODULES"], "")
         self.assertEqual(self.settings()["FORGEJO_ADMIN_TOKEN"], "the-token")
+
+    def test_the_team_map_has_one_home(self):
+        manifest = kit.module_manifest("git")
+        self.assertEqual(manifest["teams"], {"operator": "Owners", "developer": "developers", "board": "board"})
+        self.assertEqual(manifest["admin_group"], "operator")
+        for team in kit.FORGEJO_TEAMS:
+            self.assertIn(team["name"], manifest["teams"].values())
+
+    def test_someone_who_can_only_read_never_stays_a_collaborator(self):
+        self.assertNotIn("board", kit.module_manifest("git")["collaborator_groups"])
 
 
 class CommandLine(unittest.TestCase):
