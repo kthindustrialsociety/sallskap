@@ -1895,7 +1895,6 @@ def check_vault(host, secrets_by_name):
     return {
         "core_cookies": keeper.app.cookies,
         "tokens": keeper.tokens,
-        "device": keeper.device,
         "org": org,
         "fingerprint": vault_fingerprint(),
     }
@@ -1904,6 +1903,9 @@ def check_vault(host, secrets_by_name):
 def verify_vault(host, state):
     section("Vaultwarden: did logins and data survive?")
     clear_vault_limits()
+    keeper = VaultPerson(host)
+    keeper.tokens = state["tokens"]
+    check("A session is still signed in", keeper.in_vault())
     person = VaultPerson(host)
     person.app.cookies = dict(state["core_cookies"])
     status, _ = person.sign_in()
