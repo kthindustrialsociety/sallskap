@@ -1470,6 +1470,10 @@ def _age_in_days(when: float) -> float:
 
 
 def _spoken_age(days: float) -> str:
+    """Rounded to something a person would say. Minutes matter here: a backup taken a
+    moment ago shouldn't read as "0 hours"."""
+    if days * 24 < 1:
+        return f"{max(1, round(days * 24 * 60))} minutes ago"
     if days < 1:
         return f"{days * 24:.0f} hours ago"
     return f"{days:.0f} days ago"

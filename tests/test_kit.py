@@ -1840,7 +1840,13 @@ class Backups(unittest.TestCase):
         """So the operator knows how far back to look for who has left."""
         self.run_kit("backup")
         _, out = self.run_kit("restore")
-        self.assertRegex(out, r"Restoring the backup taken .* (hours|days) ago\.")
+        self.assertRegex(out, r"Restoring the backup taken .* (minutes|hours|days) ago\.")
+
+    def test_a_backup_taken_moments_ago_isnt_called_zero_hours(self):
+        self.assertEqual(kit._spoken_age(0), "1 minutes ago")
+        self.assertEqual(kit._spoken_age(20 / 1440), "20 minutes ago")
+        self.assertEqual(kit._spoken_age(5 / 24), "5 hours ago")
+        self.assertEqual(kit._spoken_age(3), "3 days ago")
 
     def test_a_restore_stops_what_is_running_before_putting_files_back(self):
         self.run_kit("backup")
