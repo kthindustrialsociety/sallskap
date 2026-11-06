@@ -413,6 +413,19 @@ class Finishing(UpdateBase):
         self.assertEqual(code, 1)
         self.assertIn("Forgejo's own check found: the database is newer than this Forgejo", out)
 
+    def test_only_what_failed_is_named_not_what_the_backup_stopped(self):
+        rows = [
+            ("sallskap-core-1", "x", "restarting", "Restarting (1) 2 seconds ago"),
+            ("sallskap-sync-1", "x", "exited", "Exited (0) 7 seconds ago"),
+            ("sallskap-forgejo-1", "x", "exited", "Exited (137) 4 seconds ago"),
+        ]
+        self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])
+        with mock.patch.object(kit, "_project_containers", return_value=rows):
+            code, out = self.kit("update", "--finish")
+        self.assertIn("It didn't start: sallskap-core-1", out)
+        self.assertIn("It didn't start: sallskap-forgejo-1", out)
+        self.assertNotIn("sallskap-sync-1", out)
+
     def test_failing_to_start_names_what_failed_and_shows_its_log(self):
         self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])
         self.unhealthy = True

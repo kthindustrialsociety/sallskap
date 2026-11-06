@@ -1824,6 +1824,26 @@ class Backups(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(len(self.restic_calls("restore")), 1)
 
+    def test_a_restore_over_an_installation_moves_it_aside_and_restarts_caddy(self):
+        """Measured on the test server: a running Caddy follows a moved folder, not its name."""
+        self.run_kit("backup")
+        (self.paths.core_dir / "db.sqlite3").write_text("a database")
+        code, out = self.run_kit("restore", "--force")
+        self.assertEqual(code, 0, out)
+        aside = list(self.paths.core_dir.parent.glob("core.before-restore-*"))
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((aside[0] / "db.sqlite3").read_text(), "a database")
+        self.assertIn(str(aside[0]), out)
+        restore = self.calls.index(self.restic_calls("restore")[0])
+        restart = next(i for i, c in enumerate(self.calls) if c[0] == "docker" and c[-2:] == ["restart", "caddy"])
+        self.assertLess(restore, restart)
+
+    def test_a_restore_onto_a_fresh_server_moves_nothing_and_leaves_caddy(self):
+        self.run_kit("backup")
+        self.run_kit("restore")
+        self.assertFalse(list(self.paths.core_dir.parent.glob("*.before-restore-*")))
+        self.assertFalse([c for c in self.calls if c[0] == "docker" and "restart" in c])
+
     def test_a_restore_puts_everything_back_then_starts_it(self):
         self.run_kit("backup")
         code, out = self.run_kit("restore")

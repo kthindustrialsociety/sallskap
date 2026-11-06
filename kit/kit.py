@@ -1417,6 +1417,10 @@ def restore(
     _fix_ownership(paths, config)
     # Core's image for this version is still here after a rolled-back update, and
     # building it again would need the internet and the build cache an update clears.
+    if moved:
+        # Caddy runs throughout, and a bind mount follows the folder rather than its
+        # name, so it would go on using the copies just moved aside.
+        subprocess.run(_compose("restart", "caddy"), check=True)
     apply(paths, build=not _have_image(core_image()))
     if moved:
         print("\nWhat was here before is kept, in case anything in it is wanted. Delete it once you're sure:")
@@ -1600,11 +1604,18 @@ def _project_containers() -> list[tuple[str, str, str, str]]:
     return [row for row in rows if row[0] != VAULT_EMERGENCY]
 
 
-def unhealthy_containers() -> list[str]:
+def _failed(state: str, status: str) -> bool:
+    """Exited with 0 is one stopped on purpose, as a backup does, and not the failure."""
+    return "unhealthy" in status or "health: starting" in status or state == "restarting" or (
+        state != "running" and not status.startswith("Exited (0)")
+    )
+
+
+def unhealthy_containers(stopped_too: bool = True) -> list[str]:
     return [
         f"{name} ({status})"
         for name, _, state, status in _project_containers()
-        if state != "running" or "unhealthy" in status or "health: starting" in status
+        if _failed(state, status) or (stopped_too and state != "running")
     ]
 
 
@@ -1803,7 +1814,7 @@ def _clean_up_images(state: dict) -> None:
 def _show_logs_of_unhealthy() -> None:
     """What a failed start most likely needs: the end of each failed container's own log."""
     for name, _, state, status in _project_containers():
-        if state != "running" or "unhealthy" in status or "health: starting" in status:
+        if _failed(state, status):
             print(f"\nThe end of {name}'s log, which usually says why:", file=sys.stderr)
             subprocess.run(["docker", "logs", "--tail", "15", name], stdout=sys.stderr, stderr=sys.stderr)
 
@@ -1821,7 +1832,9 @@ def finish_update(paths: Paths) -> int:
     except KitError as error:
         problems = [f"It didn't start: {error}"]
     except subprocess.CalledProcessError:
-        problems = [f"It didn't start: {name}" for name in unhealthy_containers()] or ["It didn't start, and Docker's message above says why"]
+        problems = [f"It didn't start: {name}" for name in unhealthy_containers(stopped_too=False)] or [
+            "It didn't start, and Docker's message above says why"
+        ]
         _show_logs_of_unhealthy()
     if problems:
         state["result"] = "failed"
@@ -2242,6 +2255,9 @@ def _print_deploy_key(domain: str, private: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Line by line, so what it prints and its errors stay in order in a log or a pipe.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
     args = build_parser().parse_args(argv)
     paths = Paths()
     # Each module has its own Compose file, so the others always look like leftovers.
