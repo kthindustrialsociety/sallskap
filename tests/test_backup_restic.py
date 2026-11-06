@@ -249,6 +249,36 @@ class RealRestic(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(json.loads(result.stdout)), 1)
 
+    def test_a_restore_can_read_an_off_server_target_on_its_own(self):
+        """What an association with a push target and a dead server has to do. Without
+        this they would need restic by hand, which is the thing the kit is meant to spare
+        them. A folder stands in for sftp: here; restic reaches both the same way."""
+        target = self.base / "off-server"
+        self.paths.config.write_text(
+            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
+        )
+        self.run_kit("backup")
+        password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+
+        # Nothing of the installation is left: no local repository, no config, no data.
+        shutil.rmtree(self.paths.backup_dir)
+        shutil.rmtree(self.paths.core_dir)
+        shutil.rmtree(self.demo_data)
+        shutil.rmtree(self.paths.config_dir)
+
+        with mock.patch.dict(kit.os.environ, {"RESTIC_PASSWORD": password}):
+            code, out = self.run_kit("restore", "--from", str(target))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.paths.core_dir / "db.sqlite3").read_text(), SECRET)
+        self.assertEqual((self.demo_data / "repo.git").read_text(), "a repository")
+
+    def test_a_restore_with_nothing_local_says_the_two_ways_in(self):
+        (self.paths.core_dir / "db.sqlite3").unlink()  # past the guard about replacing one
+        code, out = self.run_kit("restore")
+        self.assertEqual(code, 1)
+        self.assertIn("kit restore <file>", out)
+        self.assertIn("--from", out)
+
     def test_a_second_run_copies_only_what_the_target_lacks(self):
         target = self.base / "off-server"
         self.paths.config.write_text(

@@ -74,7 +74,11 @@ That file holds the whole repository, every snapshot in it, and it's already enc
 target = "sftp:backups@storage.example.org:/sallskap"
 ```
 
-Every `kit backup` then copies to it as well. The same password is used, so a copy there and an exported file are interchangeable. Credentials that aren't an SSH key, such as S3 keys, go in `/etc/sallskap/backup.env` as extra lines; restic reads that file as its environment.
+Every `kit backup` then copies to it as well. The same password is used, so a copy there and an exported file are interchangeable, and a restore can read it directly:
+
+```sh
+kit restore --from sftp:backups@storage.example.org:/sallskap
+``` Credentials that aren't an SSH key, such as S3 keys, go in `/etc/sallskap/backup.env` as extra lines; restic reads that file as its environment.
 
 `kit status` says when the last backup was taken and when a copy last left the server, and warns when either gets old.
 
@@ -97,7 +101,7 @@ What this is for: the server is gone, or a test restore. It needs the exported f
 4. Point DNS at the new server: `app.`, every module's subdomain, and each public site with its aliases. `kit status` lists what's missing.
 5. Check it, below.
 
-`kit restore` on its own, with no file, restores from `/srv/backup` on the server itself — for a mistake rather than a disaster. It refuses to run over a working installation unless you pass `--force`.
+`kit restore --from <repository>` reads the backups where they're kept, which is the way back when the push target above is all that's left. `kit restore` on its own, with no file, restores from `/srv/backup` on the server itself — for a mistake rather than a disaster. It refuses to run over a working installation unless you pass `--force`.
 
 It also refuses if the backup was taken with different tool versions from the ones this code pins, because **restoring can only go forwards**: an older Forgejo refuses to start on a database written by a newer one. Install the version the backup was taken with, or pass `--across-versions` if you know this one is newer.
 

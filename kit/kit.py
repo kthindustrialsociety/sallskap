@@ -1172,8 +1172,8 @@ def _unpack_export(paths: Paths, source: str) -> None:
         raise KitError("That file unpacked, but holds no backup repository.")
 
 
-def _snapshot_to_restore(paths: Paths, password: str) -> dict:
-    output = _restic_read(paths, "snapshots", "--latest", "1", "--tag", BACKUP_TAG, "--json", password=password)
+def _snapshot_to_restore(paths: Paths, password: str, repo: str | None = None) -> dict:
+    output = _restic_read(paths, "snapshots", "--latest", "1", "--tag", BACKUP_TAG, "--json", password=password, repo=repo)
     if output is None:
         raise KitError("Couldn't read the backups. The password may be wrong, or the copy may be damaged.")
     snapshots = json.loads(output)
@@ -1232,7 +1232,7 @@ def _fix_ownership(paths: Paths, config: Config) -> None:
         ) from None
 
 
-def restore(paths: Paths, source: str | None, force: bool, across_versions: bool = False) -> None:
+def restore(paths: Paths, source: str | None, force: bool, across_versions: bool = False, from_repo: str | None = None) -> None:
     """A full restore onto a fresh server: the installer first, then this. It puts back
     the config and every folder in the backup, then starts everything. See docs/restore.md
     for what to check afterwards, which includes who has left since the backup was taken.
@@ -1248,13 +1248,18 @@ def restore(paths: Paths, source: str | None, force: bool, across_versions: bool
             f"This server already has an installation in {paths.core_dir}, and a restore would replace it."
             "\nRestore onto a fresh server, or run this again with --force if you mean to replace this one."
         )
+    if from_repo and source:
+        raise KitError("Give either an exported file or --from, not both.")
     if source:
         _unpack_export(paths, source)
-    if not _repo_exists(paths):
-        raise KitError(f"No backups in {paths.repo}. Give the exported file: kit restore <file>")
+    if not from_repo and not _repo_exists(paths):
+        raise KitError(
+            f"No backups in {paths.repo}. Give the exported file: kit restore <file>"
+            "\nOr read them straight from where they're kept: kit restore --from sftp:…"
+        )
 
     password = _restore_password(paths)
-    snapshot = _snapshot_to_restore(paths, password)
+    snapshot = _snapshot_to_restore(paths, password, repo=from_repo)
     _check_versions(snapshot, across_versions)
     taken = re.sub(r"(\.\d{6})\d+", r"\1", snapshot["time"])
     old = _age_in_days(datetime.fromisoformat(taken).timestamp())
@@ -1268,7 +1273,7 @@ def restore(paths: Paths, source: str | None, force: bool, across_versions: bool
     if paths.config.exists():  # anything running has to let go of the files first
         with contextlib.suppress(KitError, subprocess.CalledProcessError):
             _stop_for_backup(paths, load_config(paths))
-    _restic_run(paths, "restore", snapshot["id"], "--target", "/", password=password)
+    _restic_run(paths, "restore", snapshot["id"], "--target", "/", password=password, repo=from_repo)
 
     config = load_config(paths)
     _fix_ownership(paths, config)
@@ -1572,6 +1577,10 @@ def build_parser() -> argparse.ArgumentParser:
     restore_command.add_argument(
         "source", nargs="?", help="an exported file, or - to read one from standard input. Left out: use the backups on this server"
     )
+    restore_command.add_argument(
+        "--from", dest="from_repo", metavar="REPO",
+        help="read the backups straight from where they're kept, such as sftp:backups@host:/sallskap, instead of a file",
+    )
     restore_command.add_argument("--force", action="store_true", help="replace an installation that's already on this server")
     restore_command.add_argument(
         "--across-versions", action="store_true", help="go ahead when the backup was taken with other tool versions"
@@ -1648,7 +1657,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 run_backup(paths)
         elif args.command == "restore":
-            restore(paths, args.source, args.force, args.across_versions)
+            restore(paths, args.source, args.force, args.across_versions, args.from_repo)
         elif args.command == "emergency" and args.emergency_tool == "git":
             print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
             print("Delete it under Settings, Applications once core is back. Nothing else can.")

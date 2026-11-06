@@ -336,7 +336,7 @@ An association should never have to ask its provider how the server works. The k
 | `kit update` | Back up → fetch new version → database migrations → restart |
 | `kit backup` | Take one now. Logins and the tools pause for it; the public sites don't |
 | `kit backup export [file\|-]` | Write every backup as one encrypted file, for a copy off the server. `-`, the default, streams it to standard output, so one line over SSH takes a copy |
-| `kit restore [file\|-]` | Full restore onto a fresh server, from an exported file and the backup password. Without a file, from the backups on this server |
+| `kit restore [file\|-] [--from REPO]` | Full restore onto a fresh server, from an exported file, from an off-server target, or from the backups on this server. Needs the backup password |
 | `kit status` | Enabled modules, RAM use, last backup, certificate expiry, available updates |
 
 The same status is shown on a page in the admin.
