@@ -92,9 +92,15 @@ class UpdateBase(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "200", "")
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        self.doctor = "[1] Check paths\n - [W] Found 2 Orphaned TwoFactor without existing User\n"
+
         def forgejo_output(*args):
             self.forgejo.append(args)
             self.calls.append(["forgejo", *args])
+            if args == ("doctor", "check", "--list"):
+                return "Default\tName\tTitle\n\tgc-lfs\t\tGarbage\n*\tpaths\t\tPaths\n*\tauthorized-keys\tKeys\n\tcheck-db-consistency\tDB\n"
+            if args[:2] == ("doctor", "check"):
+                return self.doctor
             return ""
 
         self.execs = []
@@ -356,7 +362,7 @@ class Finishing(UpdateBase):
 
     def test_every_check_runs(self):
         self.kit("update", "--finish")
-        self.assertIn(("doctor", "check", "--all"), self.forgejo)
+        self.assertIn(("doctor", "check", "--run", "paths", "--run", "check-db-consistency"), self.forgejo)
         self.assertTrue([call for call in self.calls if call[-3:] == ["manage.py", "sync_tools", "--check"]])
         curl = next(call for call in self.calls if call[0] == "curl")
         self.assertIn("app.example.org:443:127.0.0.1", curl)
@@ -370,6 +376,18 @@ class Finishing(UpdateBase):
         self.assertIn("kit update --rollback", out)
         self.assertEqual(self.state()["result"], "failed")
         self.assertFalse([call for call in self.calls if call[:3] == ["docker", "image", "rm"]])
+
+    def test_a_warning_from_forgejos_check_doesnt_fail(self):
+        """It exits 0 either way, so its output is what says."""
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 0, out)
+        self.assertIn("warns: Found 2 Orphaned TwoFactor", out)
+
+    def test_an_error_from_forgejos_check_fails_the_update(self):
+        self.doctor = "[1] Check Database Version\n - [E] the database is newer than this Forgejo\n"
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 1)
+        self.assertIn("Forgejo's own check found: the database is newer than this Forgejo", out)
 
     def test_failing_to_start_is_a_failed_check_too(self):
         self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])

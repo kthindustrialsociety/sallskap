@@ -577,8 +577,13 @@ def prepare_git(paths: Paths, config: Config) -> None:
     if not paths.git_env.exists() or paths.git_env.read_text("utf-8") != text:
         _write_atomic(paths.git_env, text, 0o600)
     paths.git_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Its logs go to the console, but its own check fails if the folder its config
+    # names is missing, which would make every `kit update` look broken.
+    log_dir = paths.git_dir / "data" / "log"
+    log_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
     if os.geteuid() == 0:
-        os.chown(paths.git_dir, FORGEJO_UID, FORGEJO_UID)
+        for folder in (paths.git_dir, paths.git_dir / "data", log_dir):
+            os.chown(folder, FORGEJO_UID, FORGEJO_UID)
 
 
 def _core_output(*args: str) -> str:
@@ -1722,14 +1727,36 @@ def _switch_code(paths: Paths, current: str, commit: str, target: str) -> None:
     print(f"Switched the code to {target}.")
 
 
+# Left out of Forgejo's own check, which its upgrade guide runs with --all. Measured on
+# a healthy 15.0.11: these two always report errors here, so they'd hide a real one.
+FORGEJO_DOCTOR_SKIPPED = {
+    "gc-lfs": "a clean-up rather than a check, and it fails with LFS unused",
+    "authorized-keys": "for its SSH server, which is off",
+}
+
+
+def forgejo_doctor_problems() -> list[str]:
+    """Every check but those above. It exits 0 even when a check reports an error, so
+    its output is read for them. Warnings are shown and don't fail the update."""
+    try:
+        listed = _forgejo_output("doctor", "check", "--list")
+        names = [line.lstrip("*").split()[0] for line in listed.splitlines()[1:] if line.strip()]
+        wanted = [item for name in names if name not in FORGEJO_DOCTOR_SKIPPED for item in ("--run", name)]
+        output = _forgejo_output("doctor", "check", *wanted)
+    except KitError as error:
+        return [f"Forgejo's own check failed: {error}"]
+    for line in output.splitlines():
+        if "[W]" in line:
+            print(f"Forgejo's own check warns: {line.split('[W]', 1)[1].strip()}")
+    errors = [line.split("[E]", 1)[1].strip() for line in output.splitlines() if "[E]" in line]
+    return [f"Forgejo's own check found: {error}" for error in errors]
+
+
 def after_update_problems(paths: Paths, config: Config) -> list[str]:
     """Whether the new version works, before anything is cleaned up."""
     problems = [f"Not running properly: {name}" for name in unhealthy_containers()]
     if "git" in config.modules:
-        try:
-            _forgejo_output("doctor", "check", "--all")
-        except KitError as error:
-            problems.append(f"Forgejo's own check found problems: {error}")
+        problems += forgejo_doctor_problems()
     check = subprocess.run(_compose("exec", "-T", "sync", "python", "manage.py", "sync_tools", "--check"), capture_output=True, text=True)
     if check.returncode:
         problems.append(f"The worker can't reach every tool the way it expects: {(check.stdout + check.stderr).strip()}")

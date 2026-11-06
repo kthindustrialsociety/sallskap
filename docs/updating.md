@@ -34,7 +34,7 @@ kit update --rollback # back to before the last update, from the backup it took
 6. **Switches the code,** and hands over to the new release's own `kit`. It starts everything, and core updates its database as it starts.
 7. **Checks the new version:**
    - every container is healthy;
-   - `forgejo doctor check --all`;
+   - Forgejo's own `forgejo doctor check`, with every check but two that always report errors here: `gc-lfs`, as LFS is unused, and `authorized-keys`, as its SSH server is off. Forgejo exits 0 even when a check reports an error, so kit reads the output. Its warnings are shown, but don't fail the update;
    - the worker reaches each tool the way it expects, including the layout of Vaultwarden's admin page that it reads;
    - core's login page answers through Caddy.
 8. **If a check fails,** it stops and leaves everything as it is for you to look at. It says what failed and prints the one command that goes back: `kit update --rollback`.
