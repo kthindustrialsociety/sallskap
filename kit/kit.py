@@ -1718,7 +1718,7 @@ def _switch_code(paths: Paths, current: str, commit: str, target: str) -> None:
         "to_commit": commit,
         "snapshot": snapshot["id"],
         "started": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "images_before": sorted({image for _, image, _, _ in _project_containers()}),
+        "image_ids_before": _image_ids_in_use(),
     }
     _write_update_state(paths, state)
     # Kept by name, so Git can't tidy the old version away while it's still the way back.
@@ -1773,16 +1773,29 @@ def after_update_problems(paths: Paths, config: Config) -> list[str]:
     return problems
 
 
+def _image_ids_in_use() -> list[str]:
+    """By ID rather than name: Docker shows a container's image as a bare ID once its tag
+    has moved on, and a name-matching clean-up would then delete the image it runs."""
+    names = [name for name, _, _, _ in _project_containers()]
+    if not names:
+        return []
+    result = subprocess.run(["docker", "inspect", "--format", "{{.Image}}", *names], capture_output=True, text=True)
+    return sorted(set(result.stdout.split()))
+
+
 def _clean_up_images(state: dict) -> None:
     """Old images of this installation's own tools, keeping the ones from before this
     update, which a rollback goes back to. Nothing else on the server is touched, apart
     from Docker's build cache, which is what building core leaves behind."""
-    keep = set(state["images_before"]) | {image for _, image, _, _ in _project_containers()}
-    ours = {image.rsplit(":", 1)[0] for image in keep} | {CORE_IMAGE}
-    listed = subprocess.run(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"], capture_output=True, text=True)
-    for image in listed.stdout.split():
-        if image.rsplit(":", 1)[0] in ours and image not in keep and not image.endswith(":<none>"):
-            subprocess.run(["docker", "image", "rm", image], capture_output=True)
+    keep = set(state["image_ids_before"]) | set(_image_ids_in_use())
+    listed = subprocess.run(
+        ["docker", "image", "ls", "--no-trunc", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}"], capture_output=True, text=True
+    )
+    images = [line.split("\t") for line in listed.stdout.splitlines() if "\t" in line]
+    ours = {name.rsplit(":", 1)[0] for name, image_id in images if image_id in keep} | {CORE_IMAGE}
+    for name, image_id in images:
+        if name.rsplit(":", 1)[0] in ours and image_id not in keep and not name.endswith(":<none>"):
+            subprocess.run(["docker", "image", "rm", name], capture_output=True)
     subprocess.run(["docker", "image", "prune", "--force"], capture_output=True)
     subprocess.run(["docker", "builder", "prune", "--force"], capture_output=True)
 

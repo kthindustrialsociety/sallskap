@@ -68,7 +68,15 @@ class UpdateBase(unittest.TestCase):
         self.calls = []
         self.unhealthy = False
         self.answers = {}  # the first words of a command → its exit code
-        self.images = ["sallskap-core:0.6.0", "sallskap-core:0.7.0", "caddy:2.10-alpine", "codeberg.org/forgejo/forgejo:15.0.11-rootless", "playwright:latest"]
+        self.images = {
+            "sallskap-core:0.6.0": "sha256:old",
+            "sallskap-core:0.7.0": "sha256:core",
+            "caddy:2.10-alpine": "sha256:caddy",
+            "codeberg.org/forgejo/forgejo:15.0.11-rootless": "sha256:forgejo-old",
+            "codeberg.org/forgejo/forgejo:15.0.10-rootless": "sha256:forgejo-older",
+            "playwright:latest": "sha256:someone-elses",
+        }
+        self.in_use = ["sha256:core", "sha256:caddy", "sha256:forgejo-old"]
         self.forgejo = []
         real_run = subprocess.run
 
@@ -85,7 +93,9 @@ class UpdateBase(unittest.TestCase):
                 state = "running\tUp 1 minute (unhealthy)" if self.unhealthy else "running\tUp 1 minute (healthy)"
                 return subprocess.CompletedProcess(command, 0, f"sallskap-core-1\tsallskap-core:{self.running}\t{state}\n", "")
             if command[:3] == ["docker", "image", "ls"]:
-                return subprocess.CompletedProcess(command, 0, "\n".join(self.images) + "\n", "")
+                return subprocess.CompletedProcess(command, 0, "".join(f"{name}\t{i}\n" for name, i in self.images.items()), "")
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, "\n".join(self.in_use) + "\n", "")
             if command[0] == "restic" and "snapshots" in command:
                 return subprocess.CompletedProcess(command, 0, json.dumps([{"id": "snap1", "time": "2026-11-06T20:00:00Z", "tags": []}]), "")
             if command[0] == "curl":
@@ -274,7 +284,7 @@ class Updating(UpdateBase):
         self.kit("update", "--yes")
         state = self.state()
         self.assertEqual((state["from"], state["from_commit"], state["to"], state["snapshot"]), ("0.7.0", before, "0.7.1", "snap1"))
-        self.assertIn("sallskap-core:0.7.0", state["images_before"])
+        self.assertEqual(state["image_ids_before"], ["sha256:caddy", "sha256:core", "sha256:forgejo-old"])
         self.assertIsNone(state.get("result"))
         self.assertEqual(git("rev-parse", "refs/sallskap/before-update", cwd=self.root).strip(), before)
 
@@ -352,13 +362,27 @@ class Finishing(UpdateBase):
         self.addCleanup(patcher.stop)
 
     def test_when_every_check_passes_old_images_go_and_the_previous_ones_stay(self):
+        self.in_use = ["sha256:core-new", "sha256:caddy", "sha256:forgejo-new"]
+        self.images |= {"sallskap-core:0.7.1": "sha256:core-new", "codeberg.org/forgejo/forgejo:15.0.12-rootless": "sha256:forgejo-new"}
         code, out = self.kit("update", "--finish")
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.state()["result"], "done")
         removed = [call[-1] for call in self.calls if call[:3] == ["docker", "image", "rm"]]
-        self.assertEqual(removed, ["sallskap-core:0.6.0"])  # 0.7.0 was running before, and others' images are left alone
+        # What ran before the update stays, for a rollback, and others' images are left alone.
+        self.assertEqual(removed, ["sallskap-core:0.6.0", "codeberg.org/forgejo/forgejo:15.0.10-rootless"])
         self.assertIn(["docker", "builder", "prune", "--force"], self.calls)
         self.assertIn("Updated to 0.7.1", out)
+        self.assertEqual(self.state()["result"], "done")
+
+    def test_images_are_kept_by_id_not_by_name(self):
+        """Measured on the test server: Docker then shows it by ID, not by name."""
+        self.images = {"sallskap-core:0.7.0": "sha256:retagged", "sallskap-core:0.7.1": "sha256:core-new"}
+        self.in_use = ["sha256:core-new"]
+        state = self.state() | {"image_ids_before": ["sha256:core"]}
+        (self.paths.backup_dir / "update.json").write_text(json.dumps(state))
+        self.images["sallskap-core:0.6.0"] = "sha256:core"
+        self.kit("update", "--finish")
+        removed = [call[-1] for call in self.calls if call[:3] == ["docker", "image", "rm"]]
+        self.assertEqual(removed, ["sallskap-core:0.7.0"])  # its ID is neither running nor from before
 
     def test_every_check_runs(self):
         self.kit("update", "--finish")
