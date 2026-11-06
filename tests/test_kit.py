@@ -540,6 +540,7 @@ class Modules(unittest.TestCase):
         self.root = base / "root"
         (self.root / "modules" / "website").mkdir(parents=True)
         (self.root / "modules" / "website" / "module.toml").write_text('name = "website"\n')
+        (self.root / "VERSION").write_text("1.2.3\n")
         (self.root / "modules" / "website" / "site.caddy").write_text("(website_defaults) {\n}\n")
         demo = self.root / "modules" / "demo"
         demo.mkdir()
@@ -1337,7 +1338,11 @@ class Status(unittest.TestCase):
 
     def run_status(self, addresses):
         out = io.StringIO()
-        with mock.patch.object(kit, "_resolve_ipv4", return_value=addresses), contextlib.redirect_stdout(out):
+        with (
+            mock.patch.object(kit, "_resolve_ipv4", return_value=addresses),
+            mock.patch.object(kit, "_update_status", return_value=0),  # tested on its own, in test_update.py
+            contextlib.redirect_stdout(out),
+        ):
             code = kit.status(self.paths)
         return code, out.getvalue()
 
@@ -1661,7 +1666,7 @@ class Backups(unittest.TestCase):
         with kit._backup_lock(self.paths):
             code, out = self.run_kit("backup")
         self.assertEqual(code, 1)
-        self.assertIn("Another backup is already running", out)
+        self.assertIn("A backup or an update is already running", out)
 
     # ---- The off-server target ----------------------------------------------
 
@@ -2231,7 +2236,7 @@ class Packaging(unittest.TestCase):
 
     def test_the_worker_runs_cores_image_and_cant_change_module_code(self):
         worker = compose_services()["sync"]
-        self.assertIn("image: sallskap-core:local", worker)
+        self.assertIn("image: sallskap-core:${SALLSKAP_CORE_TAG:-local}", worker)
         self.assertIn("./modules:/modules:ro", worker)
         self.assertIn("condition: service_healthy", worker)
 

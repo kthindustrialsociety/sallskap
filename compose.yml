@@ -4,7 +4,7 @@ services:
   # No published ports: only Caddy can reach it, over Compose's own network.
   core:
     build: ./core
-    image: sallskap-core:local
+    image: sallskap-core:${SALLSKAP_CORE_TAG:-local}   # kit sets it to this version: see core_image in kit/kit.py
     restart: unless-stopped
     mem_limit: 768m       # four threads, each with room for one 100 MB password check
     pids_limit: 128
@@ -27,7 +27,7 @@ services:
   # core/accounts/sync.py. It's the only container with their admin tokens, so core's
   # web process, which faces the internet, never has them. It publishes no ports.
   sync:
-    image: sallskap-core:local   # core's: this has nothing of its own to build
+    image: sallskap-core:${SALLSKAP_CORE_TAG:-local}   # core's: this has nothing of its own to build
     pull_policy: never
     command: ["python", "manage.py", "sync_tools"]
     restart: unless-stopped

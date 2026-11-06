@@ -349,8 +349,25 @@ def render_caddyfile(config: Config) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+CORE_IMAGE = "sallskap-core"
+
+
+def core_image(version: str | None = None) -> str:
+    """Core's image is named after the version it was built from, so the one before an
+    update is still there to go back to. A tag can't hold a +, so 0.7.0+abc1234 becomes
+    0.7.0-abc1234."""
+    return f"{CORE_IMAGE}:{(version or running_version()).replace('+', '-')}"
+
+
 def _compose(*args: str) -> list[str]:
+    # compose.yml names core's image from this. Set each time, as the code under ROOT
+    # changes during an update, and the process that finishes it inherits this one's.
+    os.environ["SALLSKAP_CORE_TAG"] = core_image().split(":", 1)[1]
     return ["docker", "compose", "--project-directory", str(ROOT), *args]
+
+
+def _have_image(name: str) -> bool:
+    return subprocess.run(["docker", "image", "inspect", name], capture_output=True).returncode == 0
 
 
 def _module_compose(name: str, *args: str) -> list[str]:
@@ -1073,8 +1090,8 @@ def _backup_lock(paths: Paths):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise KitError("Another backup is already running. Try again in a few minutes.") from None
-        yield
+            raise KitError("A backup or an update is already running. Try again in a few minutes.") from None
+        yield handle
 
 
 def _module_containers(config: Config) -> list[str]:
@@ -1144,30 +1161,42 @@ def run_backup(paths: Paths) -> None:
     """Take one backup. Safe to repeat, and safe to interrupt: restic either finishes a
     snapshot or leaves the repository as it was, and the containers come back either way."""
     _require_restic()
-    config = load_config(paths)
     with _backup_lock(paths):
-        password, is_new = backup_password(paths)
-        if is_new:
-            _print_backup_password(paths, password)
-        if not _repo_exists(paths):
-            _restic_run(paths, "init")
-        # Worked out before anything stops, so a mistake in a module's manifest costs
-        # an error rather than an outage.
-        what = [str(path) for path in backup_paths(paths, config)]
-        tags = _backup_tags(config)
-        _run_backup_scripts(config)
-        paused = time.monotonic()
-        _stop_for_backup(paths, config)
-        try:
-            _restic_run(paths, "backup", *tags, "--", *what)
-        finally:
-            _start_after_backup(paths, config)
-            print(f"\nLogins and the tools were paused for {time.monotonic() - paused:.0f} seconds. The public sites weren't.")
-        _restic_run(paths, "forget", "--prune", "--tag", BACKUP_TAG, *BACKUP_KEEP)
-        if config.backup_target:
-            _copy_off_server(paths, config, password)
-        else:
-            print(f"\nNothing has left this server. Take a copy with: kit backup export {_export_name()}")
+        _take_backup(paths, load_config(paths))
+
+
+def _take_backup(paths: Paths, config: Config, leave_stopped: bool = False) -> None:
+    """The backup itself, with the lock already held. `kit update` leaves everything
+    stopped afterwards, so nothing can be written between its backup and the switch,
+    as that would be lost if the update had to be rolled back. If the copy fails,
+    everything starts again either way."""
+    password, is_new = backup_password(paths)
+    if is_new:
+        _print_backup_password(paths, password)
+    if not _repo_exists(paths):
+        _restic_run(paths, "init")
+    # Worked out before anything stops, so a mistake in a module's manifest costs
+    # an error rather than an outage.
+    what = [str(path) for path in backup_paths(paths, config)]
+    tags = _backup_tags(config)
+    _run_backup_scripts(config)
+    paused = time.monotonic()
+    _stop_for_backup(paths, config)
+    try:
+        _restic_run(paths, "backup", *tags, "--", *what)
+    except BaseException:
+        _start_after_backup(paths, config)
+        raise
+    if leave_stopped:
+        print("\nThe backup is taken. Logins and the tools stay stopped for the update. The public sites don't.")
+    else:
+        _start_after_backup(paths, config)
+        print(f"\nLogins and the tools were paused for {time.monotonic() - paused:.0f} seconds. The public sites weren't.")
+        _restic_run(paths, "forget", "--prune", "--tag", BACKUP_TAG, *BACKUP_KEEP)  # the nightly run does this during an update
+    if config.backup_target:
+        _copy_off_server(paths, config, password)
+    elif not leave_stopped:
+        print(f"\nNothing has left this server. Take a copy with: kit backup export {_export_name()}")
 
 
 def _export_name() -> str:
@@ -1247,13 +1276,15 @@ def _unpack_export(paths: Paths, source: str) -> None:
         raise KitError("That file unpacked, but holds no backup repository.")
 
 
-def _snapshot_to_restore(paths: Paths, password: str, repo: str | None = None) -> dict:
-    output = _restic_read(paths, "snapshots", "--latest", "1", "--tag", BACKUP_TAG, "--json", password=password, repo=repo)
+def _snapshot_to_restore(paths: Paths, password: str, repo: str | None = None, snapshot_id: str | None = None) -> dict:
+    """The newest backup, or the one asked for, as `kit update --rollback` does."""
+    which = [snapshot_id] if snapshot_id else ["--latest", "1"]
+    output = _restic_read(paths, "snapshots", *which, "--tag", BACKUP_TAG, "--json", password=password, repo=repo)
     if output is None:
         raise KitError("Couldn't read the backups. The password may be wrong, or the copy may be damaged.")
     snapshots = json.loads(output)
     if not snapshots:
-        raise KitError("That copy holds no backups taken by kit.")
+        raise KitError(f"That copy holds no backup {snapshot_id} taken by kit." if snapshot_id else "That copy holds no backups taken by kit.")
     return snapshots[-1]
 
 
@@ -1307,7 +1338,33 @@ def _fix_ownership(paths: Paths, config: Config) -> None:
         ) from None
 
 
-def restore(paths: Paths, source: str | None, force: bool, across_versions: bool = False, from_repo: str | None = None) -> None:
+def _move_aside(snapshot: dict, paths: Paths) -> list[Path]:
+    """Restoring over a working installation would leave whatever it has written since,
+    and restic can only delete those files from version 0.17, newer than Debian 12 and
+    Ubuntu 24.04 have. A database's `-wal` file left beside an older copy of it would
+    be read as part of it. So the folders are moved aside first, which costs no space,
+    and kept, in case something in them is wanted. The config folder stays, as the
+    restore needs its backup password, and its files are rewritten by `kit apply`."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    moved = []
+    for name in snapshot.get("paths", []):
+        folder = Path(name)
+        if folder == paths.config_dir or not folder.exists():
+            continue
+        aside = folder.with_name(f"{folder.name}.before-restore-{stamp}")
+        folder.rename(aside)
+        moved.append(aside)
+    return moved
+
+
+def restore(
+    paths: Paths,
+    source: str | None,
+    force: bool,
+    across_versions: bool = False,
+    from_repo: str | None = None,
+    snapshot_id: str | None = None,
+) -> None:
     """A full restore onto a fresh server: the installer first, then this. It puts back
     the config and every folder in the backup, then starts everything. See docs/restore.md
     for what to check afterwards, which includes who has left since the backup was taken.
@@ -1334,7 +1391,7 @@ def restore(paths: Paths, source: str | None, force: bool, across_versions: bool
         )
 
     password = _restore_password(paths)
-    snapshot = _snapshot_to_restore(paths, password, repo=from_repo)
+    snapshot = _snapshot_to_restore(paths, password, repo=from_repo, snapshot_id=snapshot_id)
     _check_versions(snapshot, across_versions)
     taken = re.sub(r"(\.\d{6})\d+", r"\1", snapshot["time"])
     old = _age_in_days(datetime.fromisoformat(taken).timestamp())
@@ -1348,11 +1405,18 @@ def restore(paths: Paths, source: str | None, force: bool, across_versions: bool
     if paths.config.exists():  # anything running has to let go of the files first
         with contextlib.suppress(KitError, subprocess.CalledProcessError):
             _stop_for_backup(paths, load_config(paths))
+    moved = _move_aside(snapshot, paths) if _looks_installed(paths) else []
     _restic_run(paths, "restore", snapshot["id"], "--target", "/", password=password, repo=from_repo)
 
     config = load_config(paths)
     _fix_ownership(paths, config)
-    apply(paths, build=True)
+    # Core's image for this version is still here after a rolled-back update, and
+    # building it again would need the internet and the build cache an update clears.
+    apply(paths, build=not _have_image(core_image()))
+    if moved:
+        print("\nWhat was here before is kept, in case anything in it is wanted. Delete it once you're sure:")
+        for folder in moved:
+            print(f"  {folder}")
     print(f"\nRestored. Two things to do now, from docs/restore.md:")
     print(f"  - REMOVE ANYONE WHO HAS LEFT in the last {_spoken_age(old).replace(' ago', '')}.")
     print("    This put everyone back as they were when the backup was taken, including people")
@@ -1360,6 +1424,414 @@ def restore(paths: Paths, source: str | None, force: bool, across_versions: bool
     print("    here will take it away: this installation no longer knows they ever left.")
     print("    Removing them is by hand, and their shared passwords still need changing.")
     print("  - A forgotten master password is gone for good: a restore can't bring one back.")
+
+
+# ---- Updates: see docs/spec.md §10.3 and docs/releasing.md -------------------
+
+UPDATE_SPARE_BYTES = 3 * 1024**3  # new images and core's build, on top of the backup
+IMAGE_LINE = re.compile(r"^\s*image:\s*([^\s$]+?):([^\s$]+?)\s*(?:#.*)?$", re.M)
+FORGEJO_RELEASES = "https://codeberg.org/forgejo/forgejo/releases"
+TOOL_NAMES = {"forgejo": "Forgejo", "vaultwarden": "Vaultwarden", "caddy": "Caddy"}
+
+
+def _update_state_file(paths: Paths) -> Path:
+    """Beside the backups, as a restore puts /etc/sallskap back as it was and would
+    take this with it. Root only, like the backups."""
+    return paths.backup_dir / "update.json"
+
+
+def _read_update_state(paths: Paths) -> dict | None:
+    state_file = _update_state_file(paths)
+    return json.loads(state_file.read_text("utf-8")) if state_file.exists() else None
+
+
+def _write_update_state(paths: Paths, state: dict) -> None:
+    paths.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_atomic(_update_state_file(paths), json.dumps(state, indent=2) + "\n", 0o600)
+
+
+def _git(*args: str) -> str:
+    result = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"git {args[0]} failed: {(result.stderr or result.stdout).strip()}")
+    return result.stdout
+
+
+def _git_from_origin(*args: str) -> str:
+    """The same, for what needs the internet, with a message that says so."""
+    try:
+        return _git(*args)
+    except KitError as error:
+        origin = subprocess.run(["git", "-C", str(ROOT), "remote", "get-url", "origin"], capture_output=True, text=True)
+        raise KitError(
+            f"Couldn't get the kit from {origin.stdout.strip() or 'where it came from'}: {error}"
+            "\nCheck this server can reach the internet, then run this again. Nothing has changed."
+        ) from None
+
+
+def available_releases() -> list[str]:
+    """Every release tag where the kit comes from, oldest first. Anything that isn't a
+    plain release number, such as a test tag, is left out."""
+    output = _git_from_origin("ls-remote", "--tags", "--refs", "origin", "v*")
+    found = []
+    for line in output.splitlines():
+        name = line.split("refs/tags/", 1)[-1]
+        with contextlib.suppress(KitError):
+            found.append((parse_release(name), name.removeprefix("v")))
+    return [name for _, name in sorted(found)]
+
+
+def _show(commit: str, path: str) -> str | None:
+    result = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:{path}"], capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def images_at(commit: str) -> dict[str, str]:
+    """Every pinned image in a commit's Compose files, by the image's own name. Core's
+    isn't pinned, as it's built here."""
+    files = _git("ls-tree", "-r", "--name-only", commit).split()
+    images = {}
+    for name in files:
+        if name == "compose.yml" or re.fullmatch(r"modules/[^/]+/compose\.yml", name):
+            for match in IMAGE_LINE.finditer(_show(commit, name) or ""):
+                images[match.group(1).rsplit("/", 1)[-1]] = f"{match.group(1)}:{match.group(2)}"
+    return images
+
+
+def _base(version: str) -> tuple[int, int, int]:
+    return parse_release(version.split("+", 1)[0])
+
+
+def _choose_target(wanted: str | None, unreleased: str | None, current: str) -> tuple[str, str]:
+    """The commit to move to and its version, fetched but not checked out. Only release
+    tags are taken unless asked otherwise, and never an older one, as an older tool
+    refuses a newer database and the backup is the only way back."""
+    if unreleased:
+        _git_from_origin("fetch", "-q", "--depth", "1", "origin", unreleased)
+        commit = _git("rev-parse", "FETCH_HEAD").strip()
+        number = (_show(commit, "VERSION") or "").strip()
+        parse_release(number)
+        if parse_release(number) < _base(current):
+            raise KitError(f"{unreleased} holds {number}, older than {current}, which this runs. Nothing has changed.")
+        return commit, f"{number}+{_git('rev-parse', '--short', commit).strip()}"
+
+    releases = available_releases()
+    if not releases:
+        raise KitError("There are no releases to update to yet. Nothing has changed.")
+    target = wanted.removeprefix("v") if wanted else releases[-1]
+    parse_release(target)
+    if target not in releases:
+        raise KitError(f"There's no release {target}. The newest is {releases[-1]}. Nothing has changed.")
+    if target == current:
+        raise KitError(f"This already runs {current}, so there's nothing to do.")
+    if parse_release(target) <= _base(current):
+        raise KitError(
+            f"{target} is older than {current}, which this runs, and an update only goes forwards:"
+            "\nan older tool refuses a database a newer one has written. Nothing has changed."
+            "\nTo go back after an update, use: kit update --rollback"
+        )
+    _git_from_origin("fetch", "-q", "--depth", "1", "origin", "tag", f"v{target}")
+    commit = _git("rev-parse", f"v{target}^{{commit}}").strip()
+    if (_show(commit, "VERSION") or "").strip() != target:
+        raise KitError(f"The tag v{target} doesn't hold release {target} in its VERSION file, so it's refused. Nothing has changed.")
+    problems = changelog_problems(_show(commit, "CHANGELOG.md") or "", target)
+    if problems:
+        raise KitError(f"Release {target}'s changelog isn't complete, so it's refused:\n  " + "\n  ".join(problems))
+    return commit, target
+
+
+def _tool_name(image: str) -> str:
+    return TOOL_NAMES.get(image, image)
+
+
+def describe_update(current: str, target: str, commit: str) -> list[str]:
+    """What someone has to read before going ahead, as `apt-listchanges` shows Debian's
+    NEWS files: each release's "Before you update", and every tool that changes."""
+    lines = [f"This server runs Sällskap {current}. This update goes to {target}.", ""]
+    releases = [
+        release
+        for release in parse_changelog(_show(commit, "CHANGELOG.md") or "")
+        if _base(current) < parse_release(release.number) <= _base(target)
+    ]
+    if "+" in target:
+        lines += ["This isn't a release, so it has no changelog of its own. Read its commits first.", ""]
+    for release in reversed(releases):  # oldest first, the order to take them in
+        lines.append(f"Before you update, from {release.number}'s changelog:")
+        lines += [f"  {line}" for line in release.before_updating.splitlines()]
+        lines.append("")
+    before, after = images_at("HEAD"), images_at(commit)
+    changed = {name: (before.get(name), image) for name, image in after.items() if before.get(name) != image}
+    if changed:
+        lines.append("Tool versions:")
+        for name, (old, new) in sorted(changed.items()):
+            lines.append(f"  {_tool_name(name)}: {old.rsplit(':', 1)[1] if old else 'new'} → {new.rsplit(':', 1)[1]}")
+        lines.append("")
+    if "forgejo" in changed:
+        lines += [
+            f"Forgejo changes version. Read its release notes for anything that breaks: {FORGEJO_RELEASES}",
+            "If you've changed Forgejo's look with your own CSS, check it against them first, as its upgrade guide says.",
+            "",
+        ]
+    lines += [
+        "What happens: the new images are prepared while everything runs. Then a backup is",
+        "taken, and logins and the tools stay down until the new version has started and",
+        "passed its checks, usually a minute or two. The public sites stay up throughout.",
+        "There's no going back to an older tool on the same data: the backup is the way back.",
+    ]
+    return lines
+
+
+def _project_containers() -> list[tuple[str, str, str, str]]:
+    """Name, image, state and status of each of the installation's containers. The vault's
+    emergency copy is left out: its health check always fails, and a backup stops it."""
+    command = [
+        "docker", "ps", "--all", "--filter", f"label=com.docker.compose.project={PROJECT}",
+        "--format", "{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise KitError(f"Couldn't ask Docker what's running: {result.stderr.strip()}")
+    rows = [tuple(line.split("\t")) for line in result.stdout.splitlines() if line.count("\t") == 3]
+    return [row for row in rows if row[0] != VAULT_EMERGENCY]
+
+
+def unhealthy_containers() -> list[str]:
+    return [
+        f"{name} ({status})"
+        for name, _, state, status in _project_containers()
+        if state != "running" or "unhealthy" in status or "health: starting" in status
+    ]
+
+
+def _bytes_in(folders: list[Path]) -> int:
+    total = 0
+    for folder in folders:
+        for parent, _, files in os.walk(folder):
+            for name in files:
+                with contextlib.suppress(OSError):
+                    total += os.lstat(os.path.join(parent, name)).st_size
+    return total
+
+
+def _check_ready_to_update(paths: Paths, config: Config) -> None:
+    """Everything that can stop an update, before anything changes. A problem that was
+    already there mustn't be blamed on the update, or found halfway through it."""
+    if os.geteuid() != 0:
+        raise KitError("An update has to run as root. Run it again with sudo.")
+    _require_restic()
+    unfinished = _read_update_state(paths)
+    if unfinished and not unfinished.get("result"):
+        raise KitError(
+            f"The update to {unfinished['to']} that started {unfinished['started']} didn't finish."
+            "\nFinish it with:   kit update --finish"
+            "\nOr go back with:  kit update --rollback"
+        )
+    unhealthy = unhealthy_containers()
+    if unhealthy:
+        raise KitError(
+            "Not everything is running properly, so updating now could hide the cause:\n  "
+            + "\n  ".join(unhealthy)
+            + "\nRun: kit apply   Then run this again once that works. Nothing has changed."
+        )
+    needed = UPDATE_SPARE_BYTES + _bytes_in(backup_paths(paths, config))
+    free = shutil.disk_usage("/").free
+    if free < needed:
+        raise KitError(
+            f"There's {free / 1024**3:.1f} GB free on this server, and an update needs about {needed / 1024**3:.1f} GB"
+            "\nfor the new images and the backup. Free some space, then run this again. Nothing has changed."
+        )
+
+
+def _prepare_images(commit: str, version: str) -> None:
+    """The slow part, while everything still runs: pull the new tools, and build core's
+    new image from the new code without checking it out."""
+    for image in sorted(set(images_at(commit).values()) - set(images_at("HEAD").values())):
+        print(f"Downloading {image}.")
+        if subprocess.run(["docker", "pull", "--quiet", image], stdout=subprocess.DEVNULL).returncode:
+            raise KitError(f"Couldn't download {image}. Check this server can reach the internet, then run this again. Nothing has changed.")
+    print(f"Building core for {version}.")
+    archive = subprocess.Popen(["git", "-C", str(ROOT), "archive", "--format=tar", f"{commit}:core"], stdout=subprocess.PIPE)
+    build = subprocess.run(["docker", "build", "--quiet", "--tag", core_image(version), "-"], stdin=archive.stdout, stdout=subprocess.DEVNULL)
+    archive.stdout.close()
+    if archive.wait() or build.returncode:
+        raise KitError(f"Core's new image didn't build, so nothing has changed. Run this again, or see: docker build {ROOT}/core")
+
+
+def _confirm(question: str, yes: bool) -> None:
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise KitError("This asks before going ahead. Run it on a screen, or add --yes. Nothing has changed.")
+    if input(f"{question} Type yes to go ahead: ").strip().lower() != "yes":
+        raise KitError("Stopped, as asked. Nothing has changed.")
+
+
+def update(paths: Paths, wanted: str | None, unreleased: str | None, yes: bool) -> None:
+    """Back up, then move to a newer release. Everything up to the backup changes
+    nothing, so a failure there leaves the old version running. From the switch on, the
+    new release's own code carries on, so it's the new code that starts itself."""
+    config = load_config(paths)
+    _check_ready_to_update(paths, config)
+    current = running_version()
+    commit, target = _choose_target(wanted, unreleased, current)
+    print("\n".join(describe_update(current, target, commit)) + "\n")
+    if unreleased:
+        print(f"WARNING: {unreleased} isn't a release. Only do this on a test server.\n")
+    _confirm(f"Update to {target}?", yes)
+
+    _prepare_images(commit, target)
+    with _backup_lock(paths) as lock:
+        if "git" in config.modules:
+            print("Telling Forgejo to finish its queued work.")
+            try:
+                _forgejo_output("manager", "flush-queues")
+            except KitError as error:
+                raise KitError(f"{error}\nNothing has changed, and everything is still running.") from None
+        print("Taking a backup. This is the way back if anything goes wrong.")
+        try:
+            _take_backup(paths, config, leave_stopped=True)
+        except (KitError, subprocess.CalledProcessError) as error:
+            raise KitError(f"The backup failed, so nothing was updated, and everything is running as before:\n{error}") from None
+        try:
+            _switch_code(paths, current, commit, target)
+        except BaseException as error:
+            _start_after_backup(paths, config)
+            _update_state_file(paths).unlink(missing_ok=True)
+            raise KitError(f"Switching to the new code failed, so the old version has been started again:\n{error}") from None
+        os.set_inheritable(lock.fileno(), True)  # the nightly backup waits until it's finished
+        kit = str(ROOT / "kit" / "kit.py")
+        os.execv(sys.executable, [sys.executable, kit, "update", "--finish"])
+
+
+def _switch_code(paths: Paths, current: str, commit: str, target: str) -> None:
+    """Record how to get back, then check out the new code. Nothing is running here."""
+    snapshot = _snapshot_to_restore(paths, backup_password(paths)[0])
+    state = {
+        "from": current,
+        "from_commit": _git("rev-parse", "HEAD").strip(),
+        "to": target,
+        "to_commit": commit,
+        "snapshot": snapshot["id"],
+        "started": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "images_before": sorted({image for _, image, _, _ in _project_containers()}),
+    }
+    _write_update_state(paths, state)
+    # Kept by name, so Git can't tidy the old version away while it's still the way back.
+    _git("update-ref", "refs/sallskap/before-update", state["from_commit"])
+    _git("checkout", "-q", "--detach", commit)
+    print(f"Switched the code to {target}.")
+
+
+def after_update_problems(paths: Paths, config: Config) -> list[str]:
+    """Whether the new version works, before anything is cleaned up."""
+    problems = [f"Not running properly: {name}" for name in unhealthy_containers()]
+    if "git" in config.modules:
+        try:
+            _forgejo_output("doctor", "check", "--all")
+        except KitError as error:
+            problems.append(f"Forgejo's own check found problems: {error}")
+    check = subprocess.run(_compose("exec", "-T", "sync", "python", "manage.py", "sync_tools", "--check"), capture_output=True, text=True)
+    if check.returncode:
+        problems.append(f"The worker can't reach every tool the way it expects: {(check.stdout + check.stderr).strip()}")
+    host = f"app.{config.domain}"
+    # Straight to Caddy on this server, as DNS may point elsewhere, and without checking
+    # the certificate, which `kit status` looks after. This is whether core answers.
+    answer = subprocess.run(
+        ["curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20",
+         "--resolve", f"{host}:443:127.0.0.1", f"https://{host}/accounts/login/"],
+        capture_output=True, text=True,
+    )
+    if answer.stdout.strip() != "200":
+        problems.append(f"The login page at {host} answered {answer.stdout.strip() or answer.stderr.strip()}, not 200")
+    return problems
+
+
+def _clean_up_images(state: dict) -> None:
+    """Old images of this installation's own tools, keeping the ones from before this
+    update, which a rollback goes back to. Nothing else on the server is touched, apart
+    from Docker's build cache, which is what building core leaves behind."""
+    keep = set(state["images_before"]) | {image for _, image, _, _ in _project_containers()}
+    ours = {image.rsplit(":", 1)[0] for image in keep} | {CORE_IMAGE}
+    listed = subprocess.run(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"], capture_output=True, text=True)
+    for image in listed.stdout.split():
+        if image.rsplit(":", 1)[0] in ours and image not in keep and not image.endswith(":<none>"):
+            subprocess.run(["docker", "image", "rm", image], capture_output=True)
+    subprocess.run(["docker", "image", "prune", "--force"], capture_output=True)
+    subprocess.run(["docker", "builder", "prune", "--force"], capture_output=True)
+
+
+def finish_update(paths: Paths) -> int:
+    """Run by the new release's code, straight after the switch."""
+    state = _read_update_state(paths)
+    if not state or state.get("result"):
+        raise KitError("There's no update waiting to be finished.")
+    print("Starting the new version. Core updates its database as it starts.")
+    config = load_config(paths)
+    try:
+        apply(paths)
+        problems = after_update_problems(paths, config)
+    except (KitError, subprocess.CalledProcessError) as error:
+        problems = [f"It didn't start: {error}"]
+    if problems:
+        state["result"] = "failed"
+        _write_update_state(paths, state)
+        print(f"\nTHE UPDATE TO {state['to']} FAILED ITS CHECKS:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        print(
+            f"\nNothing has been undone or cleaned up. The public sites are unaffected."
+            f"\nTo go back to {state['from']}, as it was at {state['started']}, run:"
+            f"\n\n  kit update --rollback\n"
+            f"\nThat puts back the backup taken just before the update. Anything written since then is lost.",
+            file=sys.stderr,
+        )
+        return 1
+    free_before = shutil.disk_usage("/").free
+    _clean_up_images(state)
+    freed = (shutil.disk_usage("/").free - free_before) / 1024**3
+    state["result"] = "done"
+    _write_update_state(paths, state)
+    print(f"\nUpdated to {state['to']}, and every check passed. Cleaning up freed {max(freed, 0):.1f} GB.")
+    print(f"The images from {state['from']} are kept. If something turns out wrong later: kit update --rollback")
+    print("That puts back the backup taken before the update, so anything written since would be lost.")
+    return 0
+
+
+def rollback_update(paths: Paths, yes: bool) -> None:
+    """Back to the code and the backup from just before the last update. The old code
+    does the restore, as it's the one that knows how its own backup goes back."""
+    state = _read_update_state(paths)
+    if not state or state.get("result") == "rolled back":
+        raise KitError("There's no update to roll back.")
+    print(f"This goes back to {state['from']}, with the backup taken {state['started']}, just before updating to {state['to']}.")
+    if state.get("result") == "done":
+        print("That update finished and passed its checks, so people may have used it since.")
+    print("Anything written since the backup is lost.\n")
+    _confirm("Go back?", yes)
+    _git("checkout", "-q", "--detach", state["from_commit"])
+    state["result"] = "rolled back"
+    _write_update_state(paths, state)
+    kit = str(ROOT / "kit" / "kit.py")
+    os.execv(sys.executable, [sys.executable, kit, "restore", "--force", "--snapshot", state["snapshot"]])
+
+
+def _update_status(paths: Paths) -> int:
+    """For `kit status`: which release this is, and whether there's a newer one."""
+    current = running_version()
+    state = _read_update_state(paths)
+    if state and state.get("result") in (None, "failed"):
+        print(f"Sällskap {current}. THE UPDATE TO {state['to']} DIDN'T FINISH. Go back with: kit update --rollback")
+        return 1
+    try:
+        newest = (available_releases() or [None])[-1]
+    except KitError:
+        print(f"Sällskap {current}. Couldn't check for a newer release.")
+        return 0
+    if newest and parse_release(newest) > _base(current):
+        print(f"Sällskap {current}. {newest} is out: see what's in it with kit update, which asks before changing anything.")
+    else:
+        print(f"Sällskap {current}, the newest release.")
+    return 0
 
 
 # ---- Sites: config and credentials -------------------------------------------
@@ -1622,6 +2094,7 @@ def status(paths: Paths) -> int:
             problems += _check_dns(name, server_ip)
     print()
     problems += _backup_status(paths)
+    problems += _update_status(paths)
     return 1 if problems else 0
 
 
@@ -1676,6 +2149,14 @@ def build_parser() -> argparse.ArgumentParser:
     restore_command.add_argument(
         "--across-versions", action="store_true", help="go ahead when the backup was taken with other tool versions"
     )
+    restore_command.add_argument("--snapshot", metavar="ID", help="restore this backup rather than the newest")
+
+    update_command = commands.add_parser("update", help="move to a newer release, after taking a backup")
+    update_command.add_argument("version", nargs="?", help="the release to move to, such as 0.7.1. The newest if left out")
+    update_command.add_argument("--yes", action="store_true", help="go ahead without asking first")
+    update_command.add_argument("--unreleased", metavar="REF", help="move to a branch or commit instead of a release: test servers only")
+    update_command.add_argument("--rollback", action="store_true", help="go back to before the last update, from the backup it took")
+    update_command.add_argument("--finish", action="store_true", help=argparse.SUPPRESS)  # run by the new code after the switch
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -1748,7 +2229,16 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 run_backup(paths)
         elif args.command == "restore":
-            restore(paths, args.source, args.force, args.across_versions, args.from_repo)
+            restore(paths, args.source, args.force, args.across_versions, args.from_repo, args.snapshot)
+        elif args.command == "update":
+            if args.finish:
+                return finish_update(paths)
+            if args.rollback:
+                rollback_update(paths, args.yes)
+            else:
+                if args.version and args.unreleased:
+                    raise KitError("Give either a release or --unreleased, not both.")
+                update(paths, args.version, args.unreleased, args.yes)
         elif args.command == "emergency" and args.emergency_tool == "git":
             print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
             print("Delete it under Settings, Applications once core is back. Nothing else can.")

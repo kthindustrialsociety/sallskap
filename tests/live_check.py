@@ -3173,7 +3173,7 @@ def check_what_is_refused(host):
     with held.open("w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = kit("backup")
-    check("A second backup is refused rather than interleaved", result.returncode == 1 and "Another backup is already running" in result.stdout + result.stderr, result.stdout[-200:])
+    check("A second backup is refused rather than interleaved", result.returncode == 1 and "A backup or an update is already running" in result.stdout + result.stderr, result.stdout[-200:])
 
     # Someone could type this on the wrong server. It must stop before touching anything.
     live = Path("/srv/core/db.sqlite3")

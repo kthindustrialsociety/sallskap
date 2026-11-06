@@ -113,6 +113,23 @@ def load_connectors(environ=os.environ):
     return connectors
 
 
+def check(connectors):
+    """For `kit update`, after a new version starts: whether each tool still answers the way
+    its connector expects. A connector says how with `check()`, which raises if not. One
+    without it only has to have loaded."""
+    problems = []
+    for connector in connectors:
+        if isinstance(connector, Unavailable):
+            problems.append(f"{connector.tool}: {connector.reason}")
+            continue
+        try:
+            if hasattr(connector, "check"):
+                connector.check()
+        except Exception as error:
+            problems.append(f"{connector.tool}: {error}")
+    return problems
+
+
 def _groups_for_tools(user):
     """Core won't let someone through to a tool until they've set up the 2FA a group
     requires, or every tool would be a way around the rule. Telling a tool about that group
