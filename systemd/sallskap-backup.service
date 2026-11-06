@@ -1,0 +1,15 @@
+[Unit]
+Description=Take a Sällskap backup
+Documentation=https://github.com/kthindustrialsociety/sallskap/blob/main/docs/restore.md
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# Skipped rather than failed on a server that has no installation yet, so the
+# journal doesn't fill with failures before the setup has been run.
+ExecCondition=/usr/bin/test -f /etc/sallskap/config.toml
+ExecStart=/usr/local/bin/kit backup
+# A backup must never be what makes the server feel slow.
+Nice=10
+IOSchedulingClass=idle

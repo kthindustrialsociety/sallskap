@@ -26,6 +26,20 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests
 
+  # The other jobs replace restic, so they check what kit asks for and not whether
+  # restic agrees. These take a real backup and restore it. One Python version is
+  # enough: what's being checked is restic, which doesn't vary by Python.
+  backups:
+    name: Backups (real restic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
+      - run: restic version
+      - run: python3 -m unittest tests.test_backup_restic -v
+
   installer:
     name: Installer lint
     runs-on: ubuntu-latest

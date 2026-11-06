@@ -19,10 +19,12 @@ bash install.sh --check
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
+| `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `install.sh` | The installer, used by every install path |
 | `cloud-init.yaml` | Runs the installer on providers with a "user data" field |
 | `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
 | `kit/` | The `kit` CLI, in progress |
+| `systemd/` | The timer that takes a backup every night |
 | `core/` | Django: accounts, login and the admin page. Who sees what is set in `core/accounts/roles.py` |
 | `modules/website/` | Public sites and redirects |
 | `modules/git/` | Forgejo, with login through core |
@@ -49,6 +51,18 @@ kit disable git    # stops it and keeps its data
 kit emergency vault  # get into a tool while core is down: see its README
 ```
 
+## Backups
+
+A backup is taken every night, encrypted. Everything else is in [docs/restore.md](docs/restore.md).
+
+```sh
+kit backup                                     # take one now
+ssh root@<server> 'kit backup export -' > backup.tar   # take a copy off the server
+kit restore backup.tar                         # put it back, on a fresh server
+```
+
+**Keep an offline copy of the backup password.** The other copy is in the vault, which is inside the backup, so if the server is gone the offline copy is the only one left. `kit backup` prints the password when it makes it, the first time it runs.
+
 ## Connect a tool
 
 Core is the login service for every other tool, using OpenID Connect. A module does this for itself. To register anything else:
@@ -65,7 +79,7 @@ A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests     # the kit
+python3 -m unittest discover -s tests     # the kit. The backup tests need restic installed
 
 docker build --tag sallskap-core:test core     # core, with fake users
 docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \

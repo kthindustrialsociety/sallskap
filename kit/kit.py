@@ -7,7 +7,9 @@ installed. Needs Python 3.11 or newer.
 
 import argparse
 import base64
+import contextlib
 import fcntl
+import getpass
 import json
 import os
 import re
@@ -22,6 +24,7 @@ import time
 import tomllib
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +61,8 @@ class Paths:
     core_dir: Path = Path(os.environ.get("SALLSKAP_CORE_DIR", "/srv/core"))
     git_dir: Path = Path(os.environ.get("SALLSKAP_GIT_DIR", "/srv/git"))
     vault_dir: Path = Path(os.environ.get("SALLSKAP_VAULT_DIR", "/srv/vault"))
+    caddy_dir: Path = Path(os.environ.get("SALLSKAP_CADDY_DIR", "/srv/caddy"))
+    backup_dir: Path = Path(os.environ.get("SALLSKAP_BACKUP_DIR", "/srv/backup"))
 
     @property
     def config(self) -> Path:
@@ -78,6 +83,16 @@ class Paths:
     @property
     def vault_env(self) -> Path:
         return self.config_dir / "vault.env"
+
+    @property
+    def backup_env(self) -> Path:
+        return self.config_dir / "backup.env"
+
+    @property
+    def repo(self) -> Path:
+        """The restic repository. Its folder also holds kit's own lock and the note of
+        when a copy was last taken off the server, which an export mustn't include."""
+        return self.backup_dir / "repo"
 
     @property
     def caddyfile(self) -> Path:
@@ -115,6 +130,7 @@ class Config:
     mail_from: str | None = None
     sites: tuple[Site, ...] = field(default_factory=tuple)
     modules: tuple[str, ...] = ()
+    backup_target: str | None = None
 
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
@@ -196,7 +212,17 @@ def parse_config(text: str) -> Config:
         if enabled:
             module_manifest(name)  # refuses one that doesn't exist
 
-    config = Config(primary, mail_from, tuple(sites), tuple(n for n, enabled in modules.items() if enabled))
+    target = raw.get("backup", {}).get("target")
+    if target is not None and (not isinstance(target, str) or not target.strip()):
+        raise KitError('Under [backup], target must be a restic repository, such as "sftp:backups@host:/srv/sallskap".')
+
+    config = Config(
+        primary,
+        mail_from,
+        tuple(sites),
+        tuple(n for n, enabled in modules.items() if enabled),
+        target.strip() if isinstance(target, str) else None,
+    )
 
     seen = set()
     services = service_hostnames(primary)
@@ -839,6 +865,428 @@ def git_emergency_token(paths: Paths, username: str) -> str:
     ).strip()  # fmt: skip
 
 
+# ---- Backups -----------------------------------------------------------------
+#
+# See docs/restore.md. One encrypted restic repository on the server, taken nightly
+# by sallskap-backup.timer, plus `kit backup export` for a copy that leaves the
+# server: by hand, or from a cron job on a machine the association trusts. The copy
+# is pulled rather than pushed where possible, as then the server holds no
+# credentials for it and can't be made to delete it.
+
+BACKUP_TAG = "sallskap"  # so a shared repository can hold other things as well
+BACKUP_KEEP = ("--keep-daily", "7", "--keep-weekly", "4", "--keep-monthly", "6")
+BACKUP_STALE_DAYS = 2
+EXPORT_STALE_DAYS = 35  # a copy taken monthly is a month and a bit old at worst
+
+
+def _require_restic() -> None:
+    if shutil.which("restic") is None:
+        raise KitError("restic isn't installed. Add it with: apt-get install restic")
+
+
+def _restic_environment(paths: Paths, password: str | None = None, **extra: str) -> dict[str, str]:
+    """`backup.env` is read as the environment, so a target that needs credentials of
+    its own, such as S3, only takes extra lines in that file. A password given here
+    wins, which is how a restore works before that file has been put back."""
+    environment = {**os.environ, **_read_env(paths.backup_env)}
+    if password:
+        environment["RESTIC_PASSWORD"] = password
+    if not environment.get("RESTIC_PASSWORD"):
+        raise KitError(f"No backup password in {paths.backup_env}. Take a backup first, or set RESTIC_PASSWORD.")
+    return {**environment, **extra}
+
+
+def _restic_run(paths: Paths, *args: str, password: str | None = None, repo: str | None = None, **extra: str) -> None:
+    """Let restic print for itself: how much it added, and how long it took, is what
+    an operator wants to see."""
+    command = ["restic", "--repo", repo or str(paths.repo), *args]
+    if subprocess.run(command, env=_restic_environment(paths, password, **extra)).returncode != 0:
+        raise KitError(f"restic {args[0]} failed. Nothing else was run.")
+
+
+def _restic_read(paths: Paths, *args: str, password: str | None = None, repo: str | None = None, **extra: str) -> str | None:
+    """None when restic refuses, which is how a missing or unreadable repository is
+    told apart from an empty one."""
+    command = ["restic", "--repo", repo or str(paths.repo), *args]
+    environment = _restic_environment(paths, password, **extra)
+    result = subprocess.run(command, env=environment, capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def _repo_exists(paths: Paths) -> bool:
+    return (paths.repo / "config").exists()
+
+
+def backup_password(paths: Paths) -> tuple[str, bool]:
+    """Made once and then kept, and whether it had to be made. Everything in a backup
+    is unreadable without it, so it goes in the vault and on an offline copy. It lives
+    in the backup too, so a restored server keeps backing up with the same one."""
+    current = _read_env(paths.backup_env)
+    if current.get("RESTIC_PASSWORD"):
+        return current["RESTIC_PASSWORD"], False
+    password = secrets.token_urlsafe(32)
+    settings = {**current, "RESTIC_PASSWORD": password}
+    _write_atomic(paths.backup_env, "".join(f"{n}={v}\n" for n, v in settings.items()), 0o600)
+    return password, True
+
+
+def _print_backup_password(paths: Paths, password: str) -> None:
+    """Only to someone's screen. The nightly run is the first backup on a server nobody
+    has touched, and printing it there would write the password into the system journal,
+    where it would outlive the installation and travel in any copy of the logs."""
+    print("\nThis installation now has a backup password, made just now.")
+    print("Nothing in a backup can be read without it, and it can't be recovered.")
+    print("Store it in the vault, and write down an offline copy kept away from the backups.\n")
+    if sys.stdout.isatty():
+        print(f"  {password}\n")
+        print(f"It's also in {paths.backup_env}, which only root can read.\n")
+    else:
+        print(f"It isn't printed here, as this isn't a screen and it would go into the logs.")
+        print(f"Read it on the server with:  sudo grep RESTIC_PASSWORD {paths.backup_env}\n")
+
+
+def backup_paths(paths: Paths, config: Config) -> list[Path]:
+    """The config, core's own folders, and every folder a module declares under `data`
+    in its `module.toml`, whether or not it's switched on: disabling a module keeps its
+    data, so a backup has to keep it too. Caddy's folder comes along for its
+    certificates, so a restored server serves HTTPS without asking for new ones, and
+    the deploy account's for the publishing keys, so CI keeps working after a restore."""
+    wanted = [paths.config_dir, paths.core_dir, paths.caddy_dir, paths.deploy_home]
+    for manifest in sorted((ROOT / "modules").glob("*/module.toml")):
+        for declared in tomllib.loads(manifest.read_text("utf-8")).get("data", []):
+            wanted.append(Path(declared))
+    present = [path for path in dict.fromkeys(wanted) if path.exists()]
+    if paths.backup_dir in present:  # a repository inside itself would grow without end
+        raise KitError(f"{paths.backup_dir} holds the backups, so it can't be backed up.")
+    return present
+
+
+def _code_version() -> str:
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def _pinned_images() -> dict[str, str]:
+    """Each module's pinned image version, read from its Compose file, keyed by the
+    image's own name so a module with several containers is covered. A restore records
+    these: an older Forgejo refuses to start on a database written by a newer one, so
+    which versions took a backup decides whether it can be restored here."""
+    images = {}
+    for compose in sorted((ROOT / "modules").glob("*/compose.yml")):
+        for match in re.finditer(r"^\s*image:\s*(\S+?):(\S+)\s*$", compose.read_text("utf-8"), re.M):
+            images[match.group(1).rsplit("/", 1)[-1]] = match.group(2)
+    return images
+
+
+def _backup_tags(config: Config) -> list[str]:
+    """What this snapshot was taken by, so a restore can say whether it belongs here.
+    restic keeps tags with the snapshot and needs no file of our own inside it."""
+    tags = [BACKUP_TAG, f"version:{_code_version()}"]
+    tags += [f"module:{name}" for name in config.modules]
+    tags += [f"image:{name}={version}" for name, version in sorted(_pinned_images().items())]
+    return [item for tag in tags for item in ("--tag", tag)]
+
+
+@contextlib.contextmanager
+def _backup_lock(paths: Paths):
+    """One at a time: the nightly run and an operator can otherwise collide, and an
+    export must not read a repository that's being written."""
+    paths.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(paths.backup_dir / "kit.lock", "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise KitError("Another backup is already running. Try again in a few minutes.") from None
+        yield
+
+
+def _module_containers(config: Config) -> list[str]:
+    return [name for name in config.modules if _has_containers(name)]
+
+
+def _run_backup_scripts(config: Config) -> None:
+    """Each module's own step before the copy, from §7.1 of the spec, while its
+    containers are still running, as a database dump needs its database up. It writes
+    inside the module's own data folder, which the copy then picks up."""
+    for name in config.modules:
+        script = ROOT / "modules" / name / "backup.sh"
+        if script.exists():
+            print(f"Running {name}'s own backup step.")
+            if subprocess.run(["sh", str(script)], cwd=script.parent).returncode != 0:
+                raise KitError(f"{name}'s backup.sh failed, so no backup was taken.")
+
+
+def _stop_for_backup(paths: Paths, config: Config) -> None:
+    """Everything but Caddy, so core's copy agrees with each tool's copy. The public
+    sites stay up throughout, as Caddy depends on none of this. STOP also reaches the
+    vault's emergency copy, which would otherwise be writing to the data being copied,
+    and which is meant to be short-lived anyway."""
+    subprocess.run(_compose("stop", "sync", "core"), check=True)
+    for name in _module_containers(config):
+        if name in STOP:
+            STOP[name](paths)
+        subprocess.run(_module_compose(name, "stop"), check=True)
+
+
+def _start_after_backup(paths: Paths, config: Config) -> None:
+    """In the same order as `kit apply`, waiting for each to be healthy as that does,
+    so a backup can't quietly leave something down. Everything is tried even if one
+    fails, as the rest still has to come back."""
+    problems = []
+    for name in _module_containers(config):
+        try:
+            subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
+        except subprocess.CalledProcessError:
+            problems.append(name)
+    for service in ("core", "sync"):
+        try:
+            subprocess.run(_compose("up", "-d", "--wait", service), check=True)
+        except subprocess.CalledProcessError:
+            problems.append(service)
+    if problems:
+        raise KitError(f"The backup finished, but these didn't come back: {', '.join(problems)}. Run: kit apply")
+
+
+def _copy_off_server(paths: Paths, config: Config, password: str) -> None:
+    """Push to the target in the config, with the same password, so the copy there and
+    an exported file are interchangeable. Its chunker parameters are copied from this
+    repository, or everything would be stored again from scratch on each run. This is
+    for an association with somewhere to put backups but no machine to pull them: a
+    pull needs no credentials here, and a server that can write to its own off-server
+    copy can also be made to delete it."""
+    target = config.backup_target
+    source = {"RESTIC_FROM_PASSWORD": password}
+    if _restic_read(paths, "cat", "config", password=password, repo=target, **source) is None:
+        print(f"Setting up {target} for the first time.")
+        _restic_run(paths, "init", "--copy-chunker-params", "--from-repo", str(paths.repo), repo=target, **source)
+    print(f"Copying off the server to {target}.")
+    _restic_run(paths, "copy", "--from-repo", str(paths.repo), repo=target, **source)
+
+
+def run_backup(paths: Paths) -> None:
+    """Take one backup. Safe to repeat, and safe to interrupt: restic either finishes a
+    snapshot or leaves the repository as it was, and the containers come back either way."""
+    _require_restic()
+    config = load_config(paths)
+    with _backup_lock(paths):
+        password, is_new = backup_password(paths)
+        if is_new:
+            _print_backup_password(paths, password)
+        if not _repo_exists(paths):
+            _restic_run(paths, "init")
+        # Worked out before anything stops, so a mistake in a module's manifest costs
+        # an error rather than an outage.
+        what = [str(path) for path in backup_paths(paths, config)]
+        tags = _backup_tags(config)
+        _run_backup_scripts(config)
+        paused = time.monotonic()
+        _stop_for_backup(paths, config)
+        try:
+            _restic_run(paths, "backup", *tags, "--", *what)
+        finally:
+            _start_after_backup(paths, config)
+            print(f"\nLogins and the tools were paused for {time.monotonic() - paused:.0f} seconds. The public sites weren't.")
+        _restic_run(paths, "forget", "--prune", "--tag", BACKUP_TAG, *BACKUP_KEEP)
+        if config.backup_target:
+            _copy_off_server(paths, config, password)
+        else:
+            print(f"\nNothing has left this server. Take a copy with: kit backup export {_export_name()}")
+
+
+def _export_name() -> str:
+    return f"sallskap-backup-{datetime.now(timezone.utc):%Y-%m-%d}.tar"
+
+
+def _note_export(paths: Paths) -> None:
+    _write_atomic(paths.backup_dir / "last-export", f"{int(time.time())}\n", 0o600)
+
+
+def export_backup(paths: Paths, destination: str) -> None:
+    """One file holding the whole repository. It's already encrypted, so the file needs
+    no password of its own, and it carries every snapshot rather than one night.
+    `-` streams it to stdout, which makes a copy off the server one line over SSH, and
+    the same line in a cron job on a machine the association trusts."""
+    with _backup_lock(paths):
+        if not _repo_exists(paths):
+            raise KitError("There's no backup to export yet. Take one with: kit backup")
+        if destination == "-":
+            if sys.stdout.isatty():
+                raise KitError(
+                    "That would print the backup to your screen. Send it somewhere:"
+                    f"\n  ssh root@this-server 'kit backup export -' > {_export_name()}"
+                    f"\n  kit backup export /root/{_export_name()}"
+                )
+            with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tar:
+                tar.add(paths.repo, arcname="repo")
+            sys.stdout.buffer.flush()
+            print(f"Exported {paths.repo} to standard output.", file=sys.stderr)
+        else:
+            path = Path(destination)
+            if path.is_dir():
+                path = path / _export_name()
+            with tarfile.open(path, mode="w") as tar:
+                tar.add(paths.repo, arcname="repo")
+            os.chmod(path, 0o600)
+            print(f"Exported to {path} ({path.stat().st_size / 1e6:.1f} MB).")
+            print("It's encrypted. Keep it away from the password, or the password protects nothing.")
+        _note_export(paths)
+
+
+# ---- Restoring ---------------------------------------------------------------
+
+
+def _restore_password(paths: Paths) -> str:
+    """From the offline copy, typed in, as the vault holding the other copy is inside
+    the backup. An existing `backup.env` is used when there is one, which is how a
+    second restore onto the same server needs no typing."""
+    for known in (os.environ.get("RESTIC_PASSWORD"), _read_env(paths.backup_env).get("RESTIC_PASSWORD")):
+        if known:
+            return known
+    try:
+        password = getpass.getpass("Backup password, from the offline copy: ")
+    except (EOFError, OSError):
+        raise KitError("No backup password. Set RESTIC_PASSWORD and run this again.") from None
+    if not password:
+        raise KitError("No backup password given.")
+    return password
+
+
+def _unpack_export(paths: Paths, source: str) -> None:
+    """An exported file back into place, so the restore then runs against a local
+    repository however the copy arrived."""
+    if _repo_exists(paths):
+        raise KitError(f"{paths.repo} already holds backups. Move that folder aside first.")
+    paths.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stream = sys.stdin.buffer if source == "-" else open(source, "rb")
+    try:
+        with tarfile.open(fileobj=stream, mode="r|*") as tar:
+            tar.extractall(paths.backup_dir, filter="data")
+    except (tarfile.TarError, EOFError) as error:
+        raise KitError(f"That isn't a backup exported by kit: {error}") from error
+    finally:
+        if stream is not sys.stdin.buffer:
+            stream.close()
+    if not _repo_exists(paths):
+        raise KitError("That file unpacked, but holds no backup repository.")
+
+
+def _snapshot_to_restore(paths: Paths, password: str, repo: str | None = None) -> dict:
+    output = _restic_read(paths, "snapshots", "--latest", "1", "--tag", BACKUP_TAG, "--json", password=password, repo=repo)
+    if output is None:
+        raise KitError("Couldn't read the backups. The password may be wrong, or the copy may be damaged.")
+    snapshots = json.loads(output)
+    if not snapshots:
+        raise KitError("That copy holds no backups taken by kit.")
+    return snapshots[-1]
+
+
+def _check_versions(snapshot: dict, force: bool) -> None:
+    """An older Forgejo refuses to start on a database written by a newer one, so code
+    older than the backup can leave it unusable. Which way round can't be worked out
+    from version numbers, so any difference stops and says what it found."""
+    taken_with = dict(
+        tag.removeprefix("image:").split("=", 1) for tag in snapshot.get("tags", []) if tag.startswith("image:")
+    )
+    here = _pinned_images()
+    differences = [
+        f"{name}: the backup was taken with {version}, this code pins {here[name]}"
+        for name, version in sorted(taken_with.items())
+        if name in here and here[name] != version
+    ]
+    if differences and not force:
+        raise KitError(
+            "The versions don't match:\n  "
+            + "\n  ".join(differences)
+            + "\nRestoring can only go forwards: an older tool refuses a newer database."
+            "\nInstall the version the backup was taken with, or, if this one is newer,"
+            "\nrun this again with --across-versions."
+        )
+    for line in differences:
+        print(f"Going ahead with a version difference, as asked: {line}")
+
+
+def _looks_installed(paths: Paths) -> bool:
+    return (paths.core_dir / "db.sqlite3").exists()
+
+
+def _fix_ownership(paths: Paths, config: Config) -> None:
+    """restic puts back the numbers it saved. The containers' users are fixed numbers in
+    the Compose files, so those are already right, but the deploy account's number is
+    whatever this server gave it, so its folders are set again by name."""
+    if os.geteuid() != 0:
+        return
+    folders = [paths.deploy_home, *(paths.site_dir(site.domain) for site in config.sites)]
+    try:
+        for folder in folders:
+            if not folder.exists():
+                continue
+            _chown_to_deploy(folder)
+            for child in folder.rglob("*"):
+                _chown_to_deploy(child)
+    except LookupError:
+        raise KitError(
+            f"There's no {DEPLOY_USER} account on this server, so the publishing folders"
+            " can't be put in its name. Run the installer first, then run this again."
+        ) from None
+
+
+def restore(paths: Paths, source: str | None, force: bool, across_versions: bool = False, from_repo: str | None = None) -> None:
+    """A full restore onto a fresh server: the installer first, then this. It puts back
+    the config and every folder in the backup, then starts everything. See docs/restore.md
+    for what to check afterwards, which includes who has left since the backup was taken.
+
+    The two guards have their own flags on purpose. Replacing a working installation and
+    crossing tool versions are different risks, and one flag for both would waive the
+    version check exactly when it matters most: rolling back a bad upgrade is the usual
+    reason to restore over a working server, and it's also the usual way to end up
+    running an older tool against a newer database."""
+    _require_restic()
+    if _looks_installed(paths) and not force:
+        raise KitError(
+            f"This server already has an installation in {paths.core_dir}, and a restore would replace it."
+            "\nRestore onto a fresh server, or run this again with --force if you mean to replace this one."
+        )
+    if from_repo and source:
+        raise KitError("Give either an exported file or --from, not both.")
+    if source:
+        _unpack_export(paths, source)
+    if not from_repo and not _repo_exists(paths):
+        raise KitError(
+            f"No backups in {paths.repo}. Give the exported file: kit restore <file>"
+            "\nOr read them straight from where they're kept: kit restore --from sftp:…"
+        )
+
+    password = _restore_password(paths)
+    snapshot = _snapshot_to_restore(paths, password, repo=from_repo)
+    _check_versions(snapshot, across_versions)
+    taken = re.sub(r"(\.\d{6})\d+", r"\1", snapshot["time"])
+    old = _age_in_days(datetime.fromisoformat(taken).timestamp())
+    print(
+        f"Restoring the backup taken {snapshot['time'][:19].replace('T', ' ')}"
+        f" on {snapshot.get('hostname', '?')}, {_spoken_age(old)}."
+    )
+    for path in snapshot.get("paths", []):
+        print(f"  {path}")
+
+    if paths.config.exists():  # anything running has to let go of the files first
+        with contextlib.suppress(KitError, subprocess.CalledProcessError):
+            _stop_for_backup(paths, load_config(paths))
+    _restic_run(paths, "restore", snapshot["id"], "--target", "/", password=password, repo=from_repo)
+
+    config = load_config(paths)
+    _fix_ownership(paths, config)
+    apply(paths, build=True)
+    print(f"\nRestored. Two things to do now, from docs/restore.md:")
+    print(f"  - REMOVE ANYONE WHO HAS LEFT in the last {_spoken_age(old).replace(' ago', '')}.")
+    print("    This put everyone back as they were when the backup was taken, including people")
+    print("    who have left since. They are members again, with working access, and nothing")
+    print("    here will take it away: this installation no longer knows they ever left.")
+    print("    Removing them is by hand, and their shared passwords still need changing.")
+    print("  - A forgotten master password is gone for good: a restore can't bring one back.")
+
+
 # ---- Sites: config and credentials -------------------------------------------
 
 
@@ -1017,6 +1465,62 @@ def _check_dns(name: str, server_ip: str) -> int:
     return 1
 
 
+def _age_in_days(when: float) -> float:
+    return max(0.0, (time.time() - when) / 86400)
+
+
+def _spoken_age(days: float) -> str:
+    """Rounded to something a person would say. Minutes matter here: a backup taken a
+    moment ago shouldn't read as "0 hours"."""
+    if days * 24 < 1:
+        return f"{max(1, round(days * 24 * 60))} minutes ago"
+    if days < 1:
+        return f"{days * 24:.0f} hours ago"
+    return f"{days:.0f} days ago"
+
+
+def _backup_status(paths: Paths) -> int:
+    """When the last backup was taken, and when a copy last left the server. Both are
+    problems when they get old: a backup nobody has ever taken off the server doesn't
+    survive losing the server. See docs/restore.md."""
+    print("Backups:")
+    if shutil.which("restic") is None:
+        print("  warn restic isn't installed, so no backups are being taken. Add it: apt-get install restic")
+        return 1
+    if not _repo_exists(paths) or not _read_env(paths.backup_env).get("RESTIC_PASSWORD"):
+        print("  warn no backups have been taken yet. Take one: kit backup")
+        return 1
+
+    problems = 0
+    output = _restic_read(paths, "snapshots", "--latest", "1", "--tag", BACKUP_TAG, "--json")
+    snapshots = json.loads(output) if output else []
+    if not snapshots:
+        print("  warn the backups can't be read, or hold nothing. Take one: kit backup")
+        return 1
+    # restic reports nanoseconds, which datetime doesn't read.
+    stamp = re.sub(r"(\.\d{6})\d+", r"\1", snapshots[-1]["time"])
+    days = _age_in_days(datetime.fromisoformat(stamp).timestamp())
+    if days > BACKUP_STALE_DAYS:
+        print(f"  warn the last backup was {_spoken_age(days)}. Check: systemctl status sallskap-backup.timer")
+        problems += 1
+    else:
+        print(f"  ok   last backup {_spoken_age(days)}")
+
+    note = paths.backup_dir / "last-export"
+    try:
+        when = float(note.read_text("utf-8").strip())
+    except (OSError, ValueError):
+        print(f"  warn no copy has ever left this server. Take one: kit backup export {_export_name()}")
+        return problems + 1
+    days = _age_in_days(when)
+    if days > EXPORT_STALE_DAYS:
+        print(f"  warn the last copy off this server was {_spoken_age(days)}. Take one: kit backup export {_export_name()}")
+        problems += 1
+    else:
+        print(f"  ok   last copy off this server {_spoken_age(days)}")
+    return problems
+
+
 def status(paths: Paths) -> int:
     config = load_config(paths)
     try:
@@ -1041,6 +1545,8 @@ def status(paths: Paths) -> int:
         print(f"{site.domain}: {published}")
         for name in (site.domain, *site.redirects):
             problems += _check_dns(name, server_ip)
+    print()
+    problems += _backup_status(paths)
     return 1 if problems else 0
 
 
@@ -1066,6 +1572,23 @@ def build_parser() -> argparse.ArgumentParser:
     vault = emergency.add_parser("vault", help="start a private copy of the vault that takes master passwords, reached over SSH")
     vault.add_argument("--off", action="store_true", help="stop it again")
     emergency.add_parser("git", help="make a token on someone's own Forgejo account").add_argument("username")
+
+    backup = commands.add_parser("backup", help="take a backup, or export one to take off this server")
+    backup_actions = backup.add_subparsers(dest="backup_action")
+    export = backup_actions.add_parser("export", help="write the backups as one file, or - for standard output")
+    export.add_argument("destination", nargs="?", default="-", help="a file, a folder, or - for standard output")
+    restore_command = commands.add_parser("restore", help="put a backup back onto a fresh server")
+    restore_command.add_argument(
+        "source", nargs="?", help="an exported file, or - to read one from standard input. Left out: use the backups on this server"
+    )
+    restore_command.add_argument(
+        "--from", dest="from_repo", metavar="REPO",
+        help="read the backups straight from where they're kept, such as sftp:backups@host:/sallskap, instead of a file",
+    )
+    restore_command.add_argument("--force", action="store_true", help="replace an installation that's already on this server")
+    restore_command.add_argument(
+        "--across-versions", action="store_true", help="go ahead when the backup was taken with other tool versions"
+    )
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
     tool = tool.add_subparsers(dest="tool_action", required=True)
@@ -1132,6 +1655,13 @@ def main(argv: list[str] | None = None) -> int:
             status(paths)
         elif args.command == "disable":
             disable_module(paths, args.module)
+        elif args.command == "backup":
+            if args.backup_action == "export":
+                export_backup(paths, args.destination)
+            else:
+                run_backup(paths)
+        elif args.command == "restore":
+            restore(paths, args.source, args.force, args.across_versions, args.from_repo)
         elif args.command == "emergency" and args.emergency_tool == "git":
             print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
             print("Delete it under Settings, Applications once core is back. Nothing else can.")

@@ -157,7 +157,7 @@ type   = "bool"
 2. Modules never read or write each other's data; sharing goes through core.
 3. Dependencies are declared in `module.toml` and switched on automatically.
 4. Every container has a memory limit.
-5. Backup and restore are identical for every module: restic over `/srv/<module>`, plus an optional `backup.sh`.
+5. Backup and restore are identical for every module: restic over the folders it declares under `data`, plus an optional `backup.sh` run before the copy. A module that is switched off is still backed up, because disabling one keeps its data.
 6. Disabling a module keeps its data. Only an explicit `kit remove` deletes it.
 7. Only Caddy publishes ports. Ports published by Docker bypass the server's firewall, so any other published port is a bug, and the tests fail on it.
 
@@ -175,7 +175,7 @@ smtp_host = "…"
 from      = "no-reply@example.org"
 
 [backup]
-target = "sftp:…"
+target = "sftp:…"            # optional: also push each backup here. See §10.4
 
 [modules]
 website  = true
@@ -334,15 +334,24 @@ An association should never have to ask its provider how the server works. The k
 | `kit site rollback <domain>` | Switch a site back to its previous release |
 | `kit domain move <new>` | Move the installation to a new primary domain (§7.5) |
 | `kit update` | Back up → fetch new version → database migrations → restart |
-| `kit backup` / `kit restore` | Manual backup; full restore onto a fresh server |
+| `kit backup` | Take one now. Logins and the tools pause for it; the public sites don't |
+| `kit backup export [file\|-]` | Write every backup as one encrypted file, for a copy off the server. `-`, the default, streams it to standard output, so one line over SSH takes a copy |
+| `kit restore [file\|-] [--from REPO]` | Full restore onto a fresh server, from an exported file, from an off-server target, or from the backups on this server. Needs the backup password |
 | `kit status` | Enabled modules, RAM use, last backup, certificate expiry, available updates |
 
 The same status is shown on a page in the admin.
 
 ### 10.4 Backups
-- A nightly restic run covers `/srv` and the config, encrypted, to an off-server target (SFTP or S3-compatible).
-- A periodic offline copy (e.g. monthly) guards against losing the provider account.
-- A **test restore every semester** is part of the handover checklist.
+
+Three layers, in [docs/restore.md](restore.md). Nothing in them depends on the hosting provider, so an association on any provider gets the same safety net and the same restore.
+
+1. **A nightly encrypted backup on the server,** restic over the config and every folder a module declares, kept for 7 days, 4 weeks and 6 months. Logins and the tools pause for it, so that core's copy agrees with each tool's copy; the public sites stay up. This covers a deleted repository or a wrecked database, and it's what the other two layers carry.
+2. **A copy off the server.** `kit backup export` writes every backup as one encrypted file, streaming to standard output by default, so one line over SSH takes a copy by hand, and the same line in a cron job on a machine the association trusts takes one automatically. Pulling is preferred: a server that can write to its own off-server copy can also be made to delete it. For an association with storage but no machine, `[backup] target` pushes to any restic repository (SFTP or S3-compatible) on each run.
+3. **An offline copy of the password,** written down, kept away from both the server and the backups. The other copy is in the vault, which is inside the backup, so only the offline one survives losing the server. Whoever holds both a backup and the password can read everything, so that should be someone who already has root; the password alone opens nothing.
+
+`kit status` warns when the last backup, or the last copy off the server, gets old.
+
+A **test restore every semester** is part of the handover checklist, onto a throwaway server, using the offline copy of the password alone. That copy holds real personal data, so deleting the server afterwards is part of the test.
 
 ### 10.5 Monitoring
 - An external uptime check (not on the same server) emails the operator.
