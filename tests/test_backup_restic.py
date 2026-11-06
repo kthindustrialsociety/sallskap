@@ -40,6 +40,7 @@ class RealRestic(unittest.TestCase):
         self.root = base / "root"
         module = self.root / "modules" / "demo"
         module.mkdir(parents=True)
+        (self.root / "VERSION").write_text("1.2.3\n")  # a backup is tagged with the release
         self.demo_data = base / "srv" / "demo"
         (module / "module.toml").write_text(f'name = "demo"\ndata = ["{self.demo_data}"]\n')
         (module / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo:9.9.9\n")
