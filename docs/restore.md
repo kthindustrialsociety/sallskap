@@ -99,7 +99,9 @@ What this is for: the server is gone, or a test restore. It needs the exported f
 
 `kit restore` on its own, with no file, restores from `/srv/backup` on the server itself — for a mistake rather than a disaster. It refuses to run over a working installation unless you pass `--force`.
 
-It also refuses if the backup was taken with different tool versions from the ones this code pins, because **restoring can only go forwards**: an older Forgejo refuses to start on a database written by a newer one. Install the version the backup was taken with, or pass `--force` if you know this one is newer.
+It also refuses if the backup was taken with different tool versions from the ones this code pins, because **restoring can only go forwards**: an older Forgejo refuses to start on a database written by a newer one. Install the version the backup was taken with, or pass `--across-versions` if you know this one is newer.
+
+Those are two separate flags on purpose. Rolling back a bad upgrade is the usual reason to restore over a working server, and it is also the usual way to end up running an older tool against a newer database — so `--force` deliberately does not waive the version check as well.
 
 ## After a restore
 

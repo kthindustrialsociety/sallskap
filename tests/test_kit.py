@@ -1862,9 +1862,25 @@ class Backups(unittest.TestCase):
     def test_a_version_difference_can_be_overridden_once_it_has_been_seen(self):
         self.run_kit("backup")
         (self.demo / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo/demo:8.0.0\n")
-        code, out = self.run_kit("restore", "--force")
+        code, out = self.run_kit("restore", "--across-versions")
         self.assertEqual(code, 0, out)
         self.assertIn("Going ahead with a version difference", out)
+
+    def test_replacing_an_installation_doesnt_also_waive_the_version_check(self):
+        """Rolling back a bad upgrade is the usual reason to restore over a working
+        server, and the usual way to end up with an older tool and a newer database.
+        One flag for both risks would skip the check exactly then."""
+        self.run_kit("backup")
+        (self.paths.core_dir / "db.sqlite3").write_text("a database")
+        (self.demo / "compose.yml").write_text("services:\n  demo:\n    image: example.org/demo/demo:8.0.0\n")
+        code, out = self.run_kit("restore", "--force")
+        self.assertEqual(code, 1)
+        self.assertIn("The versions don't match", out)
+        self.assertIn("--across-versions", out)
+        self.assertEqual(self.restic_calls("restore"), [])
+        code, out = self.run_kit("restore", "--force", "--across-versions")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.restic_calls("restore")), 1)
 
     def test_a_restore_from_an_exported_file_unpacks_it_first(self):
         self.run_kit("backup")

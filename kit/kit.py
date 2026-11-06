@@ -1200,7 +1200,8 @@ def _check_versions(snapshot: dict, force: bool) -> None:
             "The versions don't match:\n  "
             + "\n  ".join(differences)
             + "\nRestoring can only go forwards: an older tool refuses a newer database."
-            "\nInstall the version the backup was taken with, or run this again with --force if this one is newer."
+            "\nInstall the version the backup was taken with, or, if this one is newer,"
+            "\nrun this again with --across-versions."
         )
     for line in differences:
         print(f"Going ahead with a version difference, as asked: {line}")
@@ -1231,10 +1232,16 @@ def _fix_ownership(paths: Paths, config: Config) -> None:
         ) from None
 
 
-def restore(paths: Paths, source: str | None, force: bool) -> None:
+def restore(paths: Paths, source: str | None, force: bool, across_versions: bool = False) -> None:
     """A full restore onto a fresh server: the installer first, then this. It puts back
     the config and every folder in the backup, then starts everything. See docs/restore.md
-    for what to check afterwards, which includes who has left since the backup was taken."""
+    for what to check afterwards, which includes who has left since the backup was taken.
+
+    The two guards have their own flags on purpose. Replacing a working installation and
+    crossing tool versions are different risks, and one flag for both would waive the
+    version check exactly when it matters most: rolling back a bad upgrade is the usual
+    reason to restore over a working server, and it's also the usual way to end up
+    running an older tool against a newer database."""
     _require_restic()
     if _looks_installed(paths) and not force:
         raise KitError(
@@ -1248,7 +1255,7 @@ def restore(paths: Paths, source: str | None, force: bool) -> None:
 
     password = _restore_password(paths)
     snapshot = _snapshot_to_restore(paths, password)
-    _check_versions(snapshot, force)
+    _check_versions(snapshot, across_versions)
     taken = re.sub(r"(\.\d{6})\d+", r"\1", snapshot["time"])
     old = _age_in_days(datetime.fromisoformat(taken).timestamp())
     print(
@@ -1565,8 +1572,9 @@ def build_parser() -> argparse.ArgumentParser:
     restore_command.add_argument(
         "source", nargs="?", help="an exported file, or - to read one from standard input. Left out: use the backups on this server"
     )
+    restore_command.add_argument("--force", action="store_true", help="replace an installation that's already on this server")
     restore_command.add_argument(
-        "--force", action="store_true", help="go ahead over an existing installation, or across tool versions"
+        "--across-versions", action="store_true", help="go ahead when the backup was taken with other tool versions"
     )
 
     tool = commands.add_parser("tool", help="manage the tools that can use the login service")
@@ -1640,7 +1648,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 run_backup(paths)
         elif args.command == "restore":
-            restore(paths, args.source, args.force)
+            restore(paths, args.source, args.force, args.across_versions)
         elif args.command == "emergency" and args.emergency_tool == "git":
             print(f"Token for {args.username}, for the API and Git:\n\n{git_emergency_token(paths, args.username)}\n")
             print("Delete it under Settings, Applications once core is back. Nothing else can.")
