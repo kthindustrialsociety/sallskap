@@ -1664,7 +1664,11 @@ def _prepare_images(commit: str, version: str) -> None:
     for image in sorted(set(images_at(commit).values()) - set(images_at("HEAD").values())):
         print(f"Downloading {image}.")
         if subprocess.run(["docker", "pull", "--quiet", image], stdout=subprocess.DEVNULL).returncode:
-            raise KitError(f"Couldn't download {image}. Check this server can reach the internet, then run this again. Nothing has changed.")
+            raise KitError(
+                f"Couldn't download {image}, and Docker's message above says why. Nothing has changed."
+                "\nIf it's the connection, run this again once this server can reach the internet."
+                "\nIf the image isn't found, the release names one that doesn't exist: wait for the next one."
+            )
     print(f"Building core for {version}.")
     archive = subprocess.Popen(["git", "-C", str(ROOT), "archive", "--format=tar", f"{commit}:core"], stdout=subprocess.PIPE)
     build = subprocess.run(["docker", "build", "--quiet", "--tag", core_image(version), "-"], stdin=archive.stdout, stdout=subprocess.DEVNULL)
