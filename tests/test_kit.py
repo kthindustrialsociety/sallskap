@@ -1779,7 +1779,7 @@ class Backups(unittest.TestCase):
         self.run_kit("backup")
         with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
             problems, out = self.status_lines()
-        self.assertIn("ok   last backup 1 hours ago", out)
+        self.assertIn("ok   last backup 1 hour ago", out)
         self.assertEqual(problems, 1)
         self.assertIn("no copy has ever left this server", out)
 
@@ -1850,7 +1850,7 @@ class Backups(unittest.TestCase):
         self.assertRegex(out, r"Restoring the backup taken .* (minutes|hours|days) ago\.")
 
     def test_a_backup_taken_moments_ago_isnt_called_zero_hours(self):
-        self.assertEqual(kit._spoken_age(0), "1 minutes ago")
+        self.assertEqual(kit._spoken_age(0), "1 minute ago")
         self.assertEqual(kit._spoken_age(20 / 1440), "20 minutes ago")
         self.assertEqual(kit._spoken_age(5 / 24), "5 hours ago")
         self.assertEqual(kit._spoken_age(3), "3 days ago")

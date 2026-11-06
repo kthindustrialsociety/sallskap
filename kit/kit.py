@@ -1800,6 +1800,14 @@ def _clean_up_images(state: dict) -> None:
     subprocess.run(["docker", "builder", "prune", "--force"], capture_output=True)
 
 
+def _show_logs_of_unhealthy() -> None:
+    """What a failed start most likely needs: the end of each failed container's own log."""
+    for name, _, state, status in _project_containers():
+        if state != "running" or "unhealthy" in status or "health: starting" in status:
+            print(f"\nThe end of {name}'s log, which usually says why:", file=sys.stderr)
+            subprocess.run(["docker", "logs", "--tail", "15", name], stdout=sys.stderr, stderr=sys.stderr)
+
+
 def finish_update(paths: Paths) -> int:
     """Run by the new release's code, straight after the switch."""
     state = _read_update_state(paths)
@@ -1810,8 +1818,11 @@ def finish_update(paths: Paths) -> int:
     try:
         apply(paths)
         problems = after_update_problems(paths, config)
-    except (KitError, subprocess.CalledProcessError) as error:
+    except KitError as error:
         problems = [f"It didn't start: {error}"]
+    except subprocess.CalledProcessError:
+        problems = [f"It didn't start: {name}" for name in unhealthy_containers()] or ["It didn't start, and Docker's message above says why"]
+        _show_logs_of_unhealthy()
     if problems:
         state["result"] = "failed"
         _write_update_state(paths, state)
@@ -2059,11 +2070,14 @@ def _age_in_days(when: float) -> float:
 def _spoken_age(days: float) -> str:
     """Rounded to something a person would say. Minutes matter here: a backup taken a
     moment ago shouldn't read as "0 hours"."""
+    def counted(number: int, unit: str) -> str:
+        return f"{number} {unit}{'' if number == 1 else 's'} ago"
+
     if days * 24 < 1:
-        return f"{max(1, round(days * 24 * 60))} minutes ago"
+        return counted(max(1, round(days * 24 * 60)), "minute")
     if days < 1:
-        return f"{days * 24:.0f} hours ago"
-    return f"{days:.0f} days ago"
+        return counted(round(days * 24), "hour")
+    return counted(round(days), "day")
 
 
 def _backup_status(paths: Paths) -> int:

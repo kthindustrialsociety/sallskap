@@ -413,11 +413,14 @@ class Finishing(UpdateBase):
         self.assertEqual(code, 1)
         self.assertIn("Forgejo's own check found: the database is newer than this Forgejo", out)
 
-    def test_failing_to_start_is_a_failed_check_too(self):
+    def test_failing_to_start_names_what_failed_and_shows_its_log(self):
         self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])
+        self.unhealthy = True
         code, out = self.kit("update", "--finish")
         self.assertEqual(code, 1)
-        self.assertIn("It didn't start", out)
+        self.assertIn("It didn't start: sallskap-core-1 (Up 1 minute (unhealthy))", out)
+        self.assertIn("The end of sallskap-core-1's log", out)
+        self.assertIn(["docker", "logs", "--tail", "15", "sallskap-core-1"], self.calls)
 
     def test_there_has_to_be_an_update_to_finish(self):
         self.kit("update", "--finish")
