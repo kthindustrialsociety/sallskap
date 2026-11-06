@@ -961,11 +961,86 @@ def backup_paths(paths: Paths, config: Config) -> list[Path]:
     return present
 
 
-def _code_version() -> str:
+def _code_version(root: Path | None = None) -> str:
     result = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+        ["git", "-C", str(root or ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True
     )
     return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+# ---- Releases: see docs/releasing.md -----------------------------------------
+
+RELEASE_NUMBER = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+CHANGELOG_HEADING = re.compile(r"^## (\d+\.\d+\.\d+) \((\d{4}-\d{2}-\d{2})\)$", re.M)
+BEFORE_UPDATING = "### Before you update"
+
+
+def parse_release(text: str) -> tuple[int, int, int]:
+    """A release number such as 0.7.0, as numbers, so 0.10.0 sorts after 0.9.0."""
+    match = RELEASE_NUMBER.fullmatch(text.strip().removeprefix("v"))
+    if not match:
+        raise KitError(f"{text!r} isn't a release number such as 0.7.0.")
+    return tuple(int(part) for part in match.groups())
+
+
+def release_number(root: Path | None = None) -> str:
+    """The newest release this code contains, from VERSION. It only changes in a release."""
+    text = ((root or ROOT) / "VERSION").read_text("utf-8").strip()
+    parse_release(text)
+    return text
+
+
+def running_version(root: Path | None = None) -> str:
+    """The release, if this checkout is exactly its tag, as the installer and `kit update`
+    leave it. Anything else is that release plus the commit, such as 0.6.0+abc1234."""
+    root = root or ROOT
+    number = release_number(root)
+    tags = subprocess.run(
+        ["git", "-C", str(root), "tag", "--points-at", "HEAD"], capture_output=True, text=True
+    ).stdout.split()
+    return number if f"v{number}" in tags else f"{number}+{_code_version(root)}"
+
+
+@dataclass(frozen=True)
+class Release:
+    number: str
+    date: str
+    text: str  # everything under its heading
+
+    @property
+    def before_updating(self) -> str:
+        """The part someone updating has to read first, without its heading."""
+        start = self.text.find(BEFORE_UPDATING)
+        if start < 0:
+            return ""
+        body = self.text[start + len(BEFORE_UPDATING) :]
+        end = body.find("\n### ")
+        return (body if end < 0 else body[:end]).strip()
+
+
+def parse_changelog(text: str) -> list[Release]:
+    """Each release in CHANGELOG.md, newest first, as the file has them."""
+    headings = list(CHANGELOG_HEADING.finditer(text))
+    releases = []
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        releases.append(Release(heading.group(1), heading.group(2), text[heading.end() : end].strip()))
+    return releases
+
+
+def changelog_problems(text: str, version: str) -> list[str]:
+    """What's wrong with a changelog, for CI and for `kit update` to refuse a release by."""
+    releases = parse_changelog(text)
+    problems = []
+    if version not in [release.number for release in releases]:
+        problems.append(f"There's no section for {version}, the number in VERSION.")
+    for release in releases:
+        if not release.before_updating:
+            problems.append(f"{release.number} has no '{BEFORE_UPDATING}' part, or it's empty. Write 'Nothing.' if there's nothing.")
+    numbers = [parse_release(release.number) for release in releases]
+    if numbers != sorted(numbers, reverse=True) or len(set(numbers)) != len(numbers):
+        problems.append("The sections aren't newest first, or one appears twice.")
+    return problems
 
 
 def _pinned_images() -> dict[str, str]:
@@ -983,7 +1058,7 @@ def _pinned_images() -> dict[str, str]:
 def _backup_tags(config: Config) -> list[str]:
     """What this snapshot was taken by, so a restore can say whether it belongs here.
     restic keeps tags with the snapshot and needs no file of our own inside it."""
-    tags = [BACKUP_TAG, f"version:{_code_version()}"]
+    tags = [BACKUP_TAG, f"version:{_code_version()}", f"release:{running_version()}"]
     tags += [f"module:{name}" for name in config.modules]
     tags += [f"image:{name}={version}" for name, version in sorted(_pinned_images().items())]
     return [item for tag in tags for item in ("--tag", tag)]
@@ -1553,8 +1628,20 @@ def status(paths: Paths) -> int:
 # ---- Command line ------------------------------------------------------------
 
 
+class _ShowVersion(argparse.Action):
+    """Worked out only when asked, so other commands don't run git first."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"Sällskap {running_version()}")
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kit", description="Operate a Sällskap installation.")
+    parser.add_argument("--version", action=_ShowVersion, help="show which release this is")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="create the first config").add_argument("domain", help="the primary domain")
     apply_command = commands.add_parser("apply", help="start the containers and switch to the current web server config")
