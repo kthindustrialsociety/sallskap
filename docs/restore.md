@@ -78,7 +78,9 @@ Every `kit backup` then copies to it as well. The same password is used, so a co
 
 ```sh
 kit restore --from sftp:backups@storage.example.org:/sallskap
-``` Credentials that aren't an SSH key, such as S3 keys, go in `/etc/sallskap/backup.env` as extra lines; restic reads that file as its environment.
+```
+
+Credentials that aren't an SSH key, such as S3 keys, go in `/etc/sallskap/backup.env` as extra lines; restic reads that file as its environment.
 
 `kit status` says when the last backup was taken and when a copy last left the server, and warns when either gets old.
 
@@ -86,7 +88,7 @@ kit restore --from sftp:backups@storage.example.org:/sallskap
 
 ## Restoring onto a fresh server
 
-What this is for: the server is gone, or a test restore. It needs the exported file and the backup password, and nothing else from the old server.
+What this is for: the server is gone, or a test restore. It needs the backup password and either an exported file or an off-server target — and nothing else from the old server.
 
 1. Rent a server that meets §13 of the spec, with the same operating system, and add your SSH key.
 2. Run the installer on it, the same line as any other install. It stops and says to set a domain; don't. The restore brings the config with it.
