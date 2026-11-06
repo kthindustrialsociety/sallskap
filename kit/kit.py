@@ -1249,7 +1249,12 @@ def restore(paths: Paths, source: str | None, force: bool) -> None:
     password = _restore_password(paths)
     snapshot = _snapshot_to_restore(paths, password)
     _check_versions(snapshot, force)
-    print(f"Restoring the backup taken {snapshot['time'][:19].replace('T', ' ')} on {snapshot.get('hostname', '?')}.")
+    taken = re.sub(r"(\.\d{6})\d+", r"\1", snapshot["time"])
+    old = _age_in_days(datetime.fromisoformat(taken).timestamp())
+    print(
+        f"Restoring the backup taken {snapshot['time'][:19].replace('T', ' ')}"
+        f" on {snapshot.get('hostname', '?')}, {_spoken_age(old)}."
+    )
     for path in snapshot.get("paths", []):
         print(f"  {path}")
 
@@ -1261,10 +1266,12 @@ def restore(paths: Paths, source: str | None, force: bool) -> None:
     config = load_config(paths)
     _fix_ownership(paths, config)
     apply(paths, build=True)
-    print("\nRestored. Two things to do now, from docs/restore.md:")
-    print("  - Check who has left since the backup was taken. They lose access by themselves,")
-    print("    as the worker goes over everyone when it starts, but no follow-up is opened for")
-    print("    them, so any shared passwords they saw still need changing.")
+    print(f"\nRestored. Two things to do now, from docs/restore.md:")
+    print(f"  - REMOVE ANYONE WHO HAS LEFT in the last {_spoken_age(old).replace(' ago', '')}.")
+    print("    This put everyone back as they were when the backup was taken, including people")
+    print("    who have left since. They are members again, with working access, and nothing")
+    print("    here will take it away: this installation no longer knows they ever left.")
+    print("    Removing them is by hand, and their shared passwords still need changing.")
     print("  - A forgotten master password is gone for good: a restore can't bring one back.")
 
 

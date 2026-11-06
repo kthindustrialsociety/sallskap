@@ -93,7 +93,9 @@ Only an Operator with SSH can do this, and it doesn't ask for 2FA, as SSH stands
 
 The vaults are encrypted with each person's master password, which the server never has, so **a restore doesn't bring back a vault whose master password has been lost.** It's as locked as the original.
 
-When the worker starts, it goes over everyone, including accounts deleted in core, so someone who left after the backup was taken is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows. The restore checklist says to check who has left.
+If you put **only this module's data** back, while core is current, the worker sorts it out: it goes over everyone when it starts, including accounts deleted in core, so an account its backup brings back is turned off again by itself. The passwords they could see still need changing, and no follow-up says so, as it's already been dealt with once as far as core knows.
+
+A **full restore is different**, because core is rolled back too. Someone who left since the backup comes back as a member, their vault account is turned on again, and core no longer knows they left. Remove them by hand, and change the shared passwords: see [docs/restore.md](../../docs/restore.md).
 
 ## Upgrading
 

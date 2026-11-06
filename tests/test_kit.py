@@ -1826,11 +1826,21 @@ class Backups(unittest.TestCase):
         self.assertEqual(restore[-2:], ["--target", "/"])
         self.assertIn(["kit", "apply"], self.calls)
 
-    def test_a_restore_says_what_to_check_afterwards(self):
+    def test_a_restore_says_to_remove_whoever_has_left(self):
+        """Measured on a real restore: a person deleted in core after the backup came
+        back as an active member, and core no longer knew they had left. Nothing takes
+        their access away, so the only thing that can is the person reading this."""
         self.run_kit("backup")
         _, out = self.run_kit("restore")
-        self.assertIn("who has left since the backup", out)
+        self.assertIn("REMOVE ANYONE WHO HAS LEFT", out)
+        self.assertIn("no longer knows they ever left", out)
         self.assertIn("master password", out)
+
+    def test_a_restore_says_how_old_the_backup_is(self):
+        """So the operator knows how far back to look for who has left."""
+        self.run_kit("backup")
+        _, out = self.run_kit("restore")
+        self.assertRegex(out, r"Restoring the backup taken .* (hours|days) ago\.")
 
     def test_a_restore_stops_what_is_running_before_putting_files_back(self):
         self.run_kit("backup")

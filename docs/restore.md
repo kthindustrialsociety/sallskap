@@ -105,7 +105,7 @@ It also refuses if the backup was taken with different tool versions from the on
 
 | Check | Why |
 |---|---|
-| **Who has left since the backup was taken** | They lose access by themselves, because the worker goes over everyone when it starts, including accounts deleted in core. But **no follow-up is opened for them**, so any shared passwords they could see still need changing by hand. Nothing will remind you |
+| **Remove anyone who has left since the backup was taken** | A restore puts *everyone* back as they were, including people who have left since. They are members again, with working access to every tool, and **nothing will take it away**: core no longer knows they ever left, so the worker sees a member in good standing and keeps their access rather than removing it. No follow-up is opened either, so their shared passwords still need changing. This is the first thing to do after a restore, and the only thing nothing else will catch |
 | Open follow-ups on the admin page | Ones that were open when the backup was taken are back, including any that had been dealt with since |
 | Everyone can log in, with 2FA | Core's database came back whole |
 | Forgejo: a repository, and a push | Its database and its repositories match |
@@ -113,7 +113,9 @@ It also refuses if the backup was taken with different tool versions from the on
 | The public sites, and their certificates | Caddy's folder came back, so no new certificate was needed |
 | `kit status` | DNS, published releases, and that a backup has been taken since the restore |
 
-Two things a restore can't do:
+Three things a restore can't do:
+
+- **It can't know who has left.** Measured on a real restore: someone deleted in core after the backup was taken came back as an active member of their group, and core held no record of the departure. Restoring one tool from an older copy is the opposite case — there core is current, so the worker corrects the tool by itself — but a full restore rolls core back with everything else.
 
 - **It can't bring back a forgotten master password.** Vault entries are encrypted with each person's own, which the server never has. A restored vault is as locked as the original.
 - **It can't undo what someone already copied.** Anyone who left before the backup was taken may still hold passwords they saw, and those have to be changed at the site each one belongs to.
