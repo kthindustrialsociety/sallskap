@@ -68,6 +68,10 @@ class FakeForgejo:
         return Answer(status, json.dumps(content).encode() if content is not None else b"")
 
     def answer(self, method, path, body):
+        if path.startswith("/admin/users?limit="):
+            return 200, [self.account]
+        if path == "/orgs/example":
+            return 200, {"username": "example"}
         if path.startswith("/admin/users?login_name="):
             sub = path.split("=")[1].split("&")[0]
             return 200, [self.account] if self.account and self.account["login_name"] == sub else []
@@ -107,6 +111,16 @@ class Forgejo(unittest.TestCase):
     def test_nothing_happens_for_someone_who_has_never_signed_in(self):
         self.apply(sub="999", groups=["developer"])
         self.assertEqual(self.forgejo.writes(), [])
+
+    def test_the_check_after_an_update_reads_and_changes_nothing(self):
+        self.connector.check()
+        self.assertEqual(self.forgejo.writes(), [])
+        self.assertEqual([path for _, path, _ in self.forgejo.calls], ["/admin/users?limit=1", "/orgs/example"])
+
+    def test_the_check_after_an_update_fails_when_the_api_has_changed(self):
+        self.forgejo.broken = "/orgs/example"
+        with self.assertRaisesRegex(RuntimeError, "500"):
+            self.connector.check()
 
     def test_it_changes_nothing_for_someone_already_right(self):
         self.apply(groups=["developer"])
@@ -353,6 +367,21 @@ class Vaultwarden(unittest.TestCase):
 
         with mock.patch.object(vault.urllib.request, "urlopen", changed), self.assertRaisesRegex(RuntimeError, "isn't what this expects"):
             self.apply(allowed=False)
+
+    def test_the_check_after_an_update_reads_the_page_and_changes_nothing(self):
+        self.vaultwarden.add("u1", "7", "someone@example.org")
+        self.connector.check()
+        self.assertEqual(self.vaultwarden.writes(), [])
+
+    def test_the_check_after_an_update_fails_when_the_page_has_changed(self):
+        real = self.vaultwarden.__call__
+
+        def changed(request, timeout=None):
+            answer = real(request, timeout)
+            return Answer(200, b"<html>Something else</html>") if request.full_url.endswith("/users/overview") else answer
+
+        with mock.patch.object(vault.urllib.request, "urlopen", changed), self.assertRaisesRegex(RuntimeError, "isn't what this expects"):
+            self.connector.check()
 
     def test_a_page_with_no_table_is_an_error_too(self):
         real = self.vaultwarden.__call__

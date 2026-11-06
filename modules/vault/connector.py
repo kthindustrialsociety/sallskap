@@ -83,6 +83,10 @@ class Connector:
             accounts[html.unescape(identifier.group(1)).strip()] = account.group(1)
         return accounts
 
+    def check(self):
+        """For `kit update`: its admin page still has the layout this reads."""
+        self._account_ids()
+
     def apply(self, person, note):
         account_id = self._account_ids().get(f"{self.issuer}/{person.sub}")
         if account_id is None:

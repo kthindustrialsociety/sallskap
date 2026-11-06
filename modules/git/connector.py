@@ -69,6 +69,11 @@ class Connector:
                 return account
         return None
 
+    def check(self):
+        """For `kit update`: its admin API still takes the token, and the organisation is there."""
+        self._expect("GET", "/admin/users?limit=1", 200)
+        self._expect("GET", f"/orgs/{_quoted(self.org)}", 200)
+
     def apply(self, person, note):
         account = self._find(person.sub)
         if account is None:
