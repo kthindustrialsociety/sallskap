@@ -8,6 +8,26 @@ Newest first. Each release has three parts:
 
 A section is never edited once its release is tagged. A mistake is put right in the next release's section. See [docs/releasing.md](docs/releasing.md).
 
+## 0.7.0 (2026-11-08)
+
+The first release that can update itself. From here on, an installation moves to a newer release with `kit update`, which takes a backup first, and goes back with `kit update --rollback`.
+
+### Before you update
+
+- 0.6.0 has no `kit update`, so there's no update from it. Install 0.7.0 with `install.sh`, which now installs the newest release by default.
+- A restore with `--force` now moves the folders it replaces aside, instead of restoring over them, and prints where they went. Delete them once you're sure.
+
+### Tool versions
+
+- Caddy 2.10 → 2.11.9, for its path-matcher fixes (CVE-2026-27587 and others). Caddy's path rules are what keep the closed Vaultwarden and Forgejo routes closed.
+- Forgejo 15.0.11 and Vaultwarden 1.37.5, unchanged.
+
+### Changes
+
+- feat: record releases in VERSION and CHANGELOG.md (#16). `kit --version` says which release runs, and backups record it.
+- feat: add kit update (#17). It shows what to read first and asks, prepares the new images while everything runs, backs up, switches, then checks the new version. If a check fails, it stops and prints `kit update --rollback`. Core's image is named after its version, so the previous one stays for a rollback. `kit status` says when a newer release is out. See [docs/updating.md](docs/updating.md).
+- fix: update caddy to 2.11.9 for its path matcher fixes (#18).
+
 ## 0.6.0 (2026-11-06)
 
 The first tagged version, at the end of build step 6. Sällskap is still in early development and not ready for others to use. Anything can change before 1.0.
