@@ -540,6 +540,7 @@ class Modules(unittest.TestCase):
         self.root = base / "root"
         (self.root / "modules" / "website").mkdir(parents=True)
         (self.root / "modules" / "website" / "module.toml").write_text('name = "website"\n')
+        (self.root / "VERSION").write_text("1.2.3\n")
         (self.root / "modules" / "website" / "site.caddy").write_text("(website_defaults) {\n}\n")
         demo = self.root / "modules" / "demo"
         demo.mkdir()
@@ -1337,7 +1338,11 @@ class Status(unittest.TestCase):
 
     def run_status(self, addresses):
         out = io.StringIO()
-        with mock.patch.object(kit, "_resolve_ipv4", return_value=addresses), contextlib.redirect_stdout(out):
+        with (
+            mock.patch.object(kit, "_resolve_ipv4", return_value=addresses),
+            mock.patch.object(kit, "_update_status", return_value=0),  # tested on its own, in test_update.py
+            contextlib.redirect_stdout(out),
+        ):
             code = kit.status(self.paths)
         return code, out.getvalue()
 
@@ -1661,7 +1666,7 @@ class Backups(unittest.TestCase):
         with kit._backup_lock(self.paths):
             code, out = self.run_kit("backup")
         self.assertEqual(code, 1)
-        self.assertIn("Another backup is already running", out)
+        self.assertIn("A backup or an update is already running", out)
 
     # ---- The off-server target ----------------------------------------------
 
@@ -1774,7 +1779,7 @@ class Backups(unittest.TestCase):
         self.run_kit("backup")
         with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
             problems, out = self.status_lines()
-        self.assertIn("ok   last backup 1 hours ago", out)
+        self.assertIn("ok   last backup 1 hour ago", out)
         self.assertEqual(problems, 1)
         self.assertIn("no copy has ever left this server", out)
 
@@ -1819,6 +1824,26 @@ class Backups(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(len(self.restic_calls("restore")), 1)
 
+    def test_a_restore_over_an_installation_moves_it_aside_and_restarts_caddy(self):
+        """Measured on the test server: a running Caddy follows a moved folder, not its name."""
+        self.run_kit("backup")
+        (self.paths.core_dir / "db.sqlite3").write_text("a database")
+        code, out = self.run_kit("restore", "--force")
+        self.assertEqual(code, 0, out)
+        aside = list(self.paths.core_dir.parent.glob("core.before-restore-*"))
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((aside[0] / "db.sqlite3").read_text(), "a database")
+        self.assertIn(str(aside[0]), out)
+        restore = self.calls.index(self.restic_calls("restore")[0])
+        restart = next(i for i, c in enumerate(self.calls) if c[0] == "docker" and c[-2:] == ["restart", "caddy"])
+        self.assertLess(restore, restart)
+
+    def test_a_restore_onto_a_fresh_server_moves_nothing_and_leaves_caddy(self):
+        self.run_kit("backup")
+        self.run_kit("restore")
+        self.assertFalse(list(self.paths.core_dir.parent.glob("*.before-restore-*")))
+        self.assertFalse([c for c in self.calls if c[0] == "docker" and "restart" in c])
+
     def test_a_restore_puts_everything_back_then_starts_it(self):
         self.run_kit("backup")
         code, out = self.run_kit("restore")
@@ -1845,7 +1870,7 @@ class Backups(unittest.TestCase):
         self.assertRegex(out, r"Restoring the backup taken .* (minutes|hours|days) ago\.")
 
     def test_a_backup_taken_moments_ago_isnt_called_zero_hours(self):
-        self.assertEqual(kit._spoken_age(0), "1 minutes ago")
+        self.assertEqual(kit._spoken_age(0), "1 minute ago")
         self.assertEqual(kit._spoken_age(20 / 1440), "20 minutes ago")
         self.assertEqual(kit._spoken_age(5 / 24), "5 hours ago")
         self.assertEqual(kit._spoken_age(3), "3 days ago")
@@ -2231,7 +2256,7 @@ class Packaging(unittest.TestCase):
 
     def test_the_worker_runs_cores_image_and_cant_change_module_code(self):
         worker = compose_services()["sync"]
-        self.assertIn("image: sallskap-core:local", worker)
+        self.assertIn("image: sallskap-core:${SALLSKAP_CORE_TAG:-local}", worker)
         self.assertIn("./modules:/modules:ro", worker)
         self.assertIn("condition: service_healthy", worker)
 

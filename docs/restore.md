@@ -109,6 +109,10 @@ It also refuses if the backup was taken with different tool versions from the on
 
 Those are two separate flags on purpose. Rolling back a bad upgrade is the usual reason to restore over a working server, and it is also the usual way to end up running an older tool against a newer database — so `--force` deliberately does not waive the version check as well.
 
+To go back after an update, use `kit update --rollback` rather than these flags. It goes back to the old code as well, so the versions match. See [updating.md](updating.md).
+
+With `--force`, the folders it replaces are moved aside first, not mixed with the backup, and their new names are printed. A database left with a newer version's `-wal` file beside it would read that file as part of itself.
+
 ## After a restore
 
 | Check | Why |

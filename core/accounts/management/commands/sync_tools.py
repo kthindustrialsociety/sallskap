@@ -4,7 +4,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import close_old_connections
 from django.utils import timezone
 
@@ -20,8 +20,16 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--once", action="store_true", help="work through who's waiting, then stop")
+        parser.add_argument("--check", action="store_true", help="check each tool answers as expected, change nothing, and stop")
 
-    def handle(self, *args, once=False, **options):
+    def handle(self, *args, once=False, check=False, **options):
+        if check:
+            connectors = sync.load_connectors()
+            problems = sync.check(connectors)
+            if problems:
+                raise CommandError("; ".join(problems))
+            self.stdout.write(f"Every tool answers as expected: {', '.join(c.tool for c in connectors) or 'none'}")
+            return
         # Python ignores SIGTERM as a container's first process. Stopping partway loses
         # nothing, as someone only stops waiting once they've been dealt with.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

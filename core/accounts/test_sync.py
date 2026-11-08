@@ -13,7 +13,7 @@ from allauth.idp.oidc.models import Client
 from allauth.mfa.models import Authenticator
 from allauth.mfa.totp.internal.auth import TOTP, generate_totp_secret
 from django.contrib.auth.models import Group
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.db import transaction
 from django.urls import reverse
 from django.utils import timezone
@@ -489,6 +489,41 @@ class Loading(Base):
 
     def test_no_modules_means_no_connectors(self):
         self.assertEqual(sync.load_connectors({"SYNC_MODULES": ""}), [])
+
+
+class Checking(Base):
+    """What `kit update` runs once the new version is up."""
+
+    def test_every_connector_that_works_passes(self):
+        class Checked(FakeConnector):
+            def check(self):
+                self.checked = True
+
+        checked = Checked("checked")
+        self.assertEqual(sync.check([checked, FakeConnector("plain")]), [])
+        self.assertTrue(checked.checked)
+
+    def test_each_problem_is_named_with_its_tool(self):
+        class Changed(FakeConnector):
+            def check(self):
+                raise RuntimeError("its page isn't what this expects")
+
+        problems = sync.check([Changed("vaultwarden"), sync.Unavailable("forgejo", "it has no token yet")])
+        self.assertEqual(problems, ["vaultwarden: its page isn't what this expects", "forgejo: it has no token yet"])
+
+    def test_the_command_fails_on_a_problem_and_asks_nobody_about_anyone(self):
+        user, _ = make_user()
+        AccessSync.objects.all().delete()
+        broken = sync.Unavailable("demo", "it has no token yet")
+        with mock.patch.object(sync, "load_connectors", return_value=[broken]), self.assertRaisesRegex(CommandError, "demo: it has no token yet"):
+            call_command("sync_tools", "--check", stdout=io.StringIO())
+        self.assertEqual(AccessSync.objects.filter(user=user).count(), 0)
+
+    def test_the_command_says_so_when_every_tool_answers(self):
+        out = io.StringIO()
+        with mock.patch.object(sync, "load_connectors", return_value=[FakeConnector("demo")]):
+            call_command("sync_tools", "--check", stdout=out)
+        self.assertIn("Every tool answers as expected: demo", out.getvalue())
 
 
 class Command(Base):

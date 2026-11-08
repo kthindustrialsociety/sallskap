@@ -63,6 +63,15 @@ kit restore backup.tar                         # put it back, on a fresh server
 
 **Keep an offline copy of the backup password.** The other copy is in the vault, which is inside the backup, so if the server is gone the offline copy is the only one left. `kit backup` prints the password when it makes it, the first time it runs.
 
+## Updates
+
+```sh
+kit update             # back up, then move to the newest release. It shows what changes and asks first
+kit update --rollback  # go back to before the last update
+```
+
+What it does and what it checks is in [docs/updating.md](docs/updating.md). What each release changes is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Connect a tool
 
 Core is the login service for every other tool, using OpenID Connect. A module does this for itself. To register anything else:

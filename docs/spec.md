@@ -333,10 +333,10 @@ An association should never have to ask its provider how the server works. The k
 | `kit site key <domain>` | Replace a site's deploy key |
 | `kit site rollback <domain>` | Switch a site back to its previous release |
 | `kit domain move <new>` | Move the installation to a new primary domain (§7.5) |
-| `kit update` | Back up → fetch new version → database migrations → restart |
+| `kit update [<version>]` / `kit update --rollback` | Show what to read first and ask → prepare the new images while everything runs → back up → switch and restart, which runs the database migrations → check the new version, and stop with the way back if a check fails. `--rollback` goes back to the code and backup from before the last update. See [updating.md](updating.md) |
 | `kit backup` | Take one now. Logins and the tools pause for it; the public sites don't |
 | `kit backup export [file\|-]` | Write every backup as one encrypted file, for a copy off the server. `-`, the default, streams it to standard output, so one line over SSH takes a copy |
-| `kit restore [file\|-] [--from REPO]` | Full restore onto a fresh server, from an exported file, from an off-server target, or from the backups on this server. Needs the backup password |
+| `kit restore [file\|-] [--from REPO] [--snapshot ID]` | Full restore onto a fresh server, from an exported file, from an off-server target, or from the backups on this server. Needs the backup password |
 | `kit status` | Enabled modules, RAM use, last backup, certificate expiry, available updates |
 
 The same status is shown on a page in the admin.

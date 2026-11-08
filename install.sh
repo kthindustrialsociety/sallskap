@@ -8,7 +8,7 @@
 #
 # Overrides, mainly for testing:
 #   SALLSKAP_REPO      git URL or path of the kit
-#   SALLSKAP_VERSION   branch or tag to install
+#   SALLSKAP_VERSION   tag or branch to install. The newest release by default
 
 # /etc/os-release exists only on the target system, not where this is linted.
 # shellcheck disable=SC1091
@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # Named KIT_* because /etc/os-release assigns VERSION, NAME and ID, and sourcing
 # it over a readonly variable of the same name kills the script.
 readonly KIT_REPO="${SALLSKAP_REPO:-https://github.com/kthindustrialsociety/sallskap.git}"
-readonly KIT_VERSION="${SALLSKAP_VERSION:-main}"
+readonly KIT_VERSION="${SALLSKAP_VERSION:-}"   # empty: the newest release, found in fetch_kit
 readonly INSTALL_DIR=/opt/sallskap
 readonly CONFIG_DIR=/etc/sallskap
 readonly DEPLOY_USER=sallskap-deploy
@@ -275,16 +275,38 @@ EOF
   ok "$(docker --version)"
 }
 
+# The newest release tag, by version number rather than by date.
+newest_release() {
+  git ls-remote --tags --refs "$KIT_REPO" 'v*' \
+    | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' \
+    | sort -V | tail -n 1
+}
+
+# Running this again keeps the version that's installed: moving to another one is
+# `kit update`, which takes a backup first. Only SALLSKAP_VERSION moves it here.
 fetch_kit() {
-  step "Fetching Sällskap ($KIT_VERSION)"
+  local version="$KIT_VERSION"
+  if [[ -d "$INSTALL_DIR/.git" && -z "$version" ]]; then
+    ln -sf "$INSTALL_DIR/kit/kit.py" /usr/local/bin/kit
+    ok "Sällskap is already in $INSTALL_DIR, and stays at $(kit --version). Move to a newer release with: kit update"
+    return
+  fi
+  if [[ -z "$version" ]]; then
+    version=$(newest_release)
+    [[ -n "$version" ]] || { bad "Found no release of Sällskap at $KIT_REPO."; return 1; }
+  fi
+  step "Fetching Sällskap ($version)"
+  # A tag is fetched as a tag, so the kit can tell it's running exactly that release.
+  local what=("$version")
+  [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && what=(tag "$version")
   if [[ -d "$INSTALL_DIR/.git" ]]; then
-    git -C "$INSTALL_DIR" fetch -q --depth 1 origin "$KIT_VERSION"
+    git -C "$INSTALL_DIR" fetch -q --depth 1 origin "${what[@]}"
     git -C "$INSTALL_DIR" checkout -q --detach FETCH_HEAD
   else
-    git clone -q --depth 1 --branch "$KIT_VERSION" "$KIT_REPO" "$INSTALL_DIR"
+    git clone -q --depth 1 --branch "$version" "$KIT_REPO" "$INSTALL_DIR"
   fi
   ln -sf "$INSTALL_DIR/kit/kit.py" /usr/local/bin/kit
-  ok "Installed in $INSTALL_DIR"
+  ok "Installed $(kit --version) in $INSTALL_DIR"
 }
 
 # Sites are published over SSH by this account. Its keys can only run
