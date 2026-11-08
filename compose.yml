@@ -55,7 +55,7 @@ services:
       start_interval: 2s
 
   caddy:
-    image: caddy:2.10-alpine
+    image: caddy:2.11.9-alpine   # the exact version, so `kit update` shows and downloads each change
     restart: unless-stopped
     mem_limit: 256m
     cap_drop: [ALL]
