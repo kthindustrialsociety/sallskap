@@ -1391,6 +1391,7 @@ class Backups(unittest.TestCase):
             f'name = "website"\ndata = ["{base / "srv" / "website"}"]\n'
         )
         (self.root / "modules" / "website" / "site.caddy").write_text("(website_defaults) {\n}\n")
+        (self.root / "VERSION").write_text("1.2.3\n")
         self.demo = self.root / "modules" / "demo"
         self.demo.mkdir()
         self.demo_data = base / "srv" / "demo"
@@ -1633,6 +1634,7 @@ class Backups(unittest.TestCase):
         self.run_kit("backup")
         tags = self.restic_calls("backup")[0]
         self.assertIn("version:abc1234", tags)
+        self.assertIn("release:1.2.3+abc1234", tags)  # the fake git says HEAD carries no tag
         self.assertIn("image:demo=9.9.9", tags)
         self.assertIn("module:demo", tags)
 

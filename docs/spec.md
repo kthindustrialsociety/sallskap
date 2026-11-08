@@ -400,7 +400,7 @@ Moving to another server or provider is `kit restore` onto a fresh installation 
 
 - **License:** AGPL-3.0.
 - **Code:** the public repo lives on GitHub for visibility, owned by a KTHIS organisation account, not a personal one. It is mirrored to KTHIS's own Forgejo.
-- **Releases:** semantic versions, a changelog, versioned container images.
+- **Releases:** semantic versions, at 0.x until another association can install and update the kit on its own, a changelog that says first what someone updating has to do, and versioned container images. See [releasing.md](releasing.md) and [CHANGELOG.md](../CHANGELOG.md).
 - **Docs:**
   - installation guide with screenshots
   - operator handbook
