@@ -3,8 +3,10 @@
 # Sällskap installer: turns a fresh Debian or Ubuntu server into a secured host
 # ready to run the kit. Safe to run again. See docs/spec.md §10.
 #
-#   curl -fsSL <url>/install.sh | sudo bash    install
-#   bash install.sh --check                    run the checks, change nothing
+#   curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | sudo bash
+#   bash install.sh --check     run the checks, change nothing
+#
+# docs/installing.md goes through the whole install.
 #
 # Overrides, mainly for testing:
 #   SALLSKAP_REPO      git URL or path of the kit
@@ -354,7 +356,7 @@ main() {
     "") ;;
     --check) check_only=true ;;
     -h | --help)
-      sed -n '3,11p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '3,13p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//'
       return 0
       ;;
     *)
