@@ -294,7 +294,7 @@ fetch_kit() {
   local version="$KIT_VERSION"
   if [[ -d "$INSTALL_DIR/.git" && -z "$version" ]]; then
     ln -sf "$INSTALL_DIR/kit/kit.py" /usr/local/bin/kit
-    ok "Sällskap is already in $INSTALL_DIR, and stays at $(kit --version). Move to a newer release with: kit update"
+    ok "Already installed in $INSTALL_DIR, and left as it is: $(kit --version). A newer release is installed with: kit update"
     return
   fi
   if [[ -z "$version" ]]; then
