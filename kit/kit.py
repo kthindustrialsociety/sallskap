@@ -1947,7 +1947,9 @@ def _update_status(paths: Paths) -> int:
     current = running_version()
     state = _read_update_state(paths)
     if state and state.get("result") in (None, "failed"):
-        print(f"Sällskap {current}. THE UPDATE TO {state['to']} DIDN'T FINISH. Go back with: kit update --rollback")
+        print(f"Sällskap {current}. THE UPDATE TO {state['to']} DIDN'T FINISH.")
+        print("       Once what failed is fixed, check again with: kit update --finish")
+        print("       Or go back to before the update with: kit update --rollback")
         return 1
     try:
         newest = (available_releases() or [None])[-1]

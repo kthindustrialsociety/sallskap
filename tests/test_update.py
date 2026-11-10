@@ -525,6 +525,7 @@ class Status(UpdateBase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(kit._update_status(self.paths), 1)
+        self.assertIn("kit update --finish", out.getvalue())
         self.assertIn("kit update --rollback", out.getvalue())
 
 
