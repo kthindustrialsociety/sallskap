@@ -19,4 +19,5 @@ class Command(BaseCommand):
         if not user.is_active:
             raise CommandError(f"The account for {email} is turned off.")
         self.stdout.write(f"This link lets {email} choose a password, once, within 24 hours:\n{password_link(user)}")
+        self.stdout.write("Treat it like a password: whoever opens it first chooses the password. Send it to them privately, and don't paste it anywhere else.")
         self.stdout.write("If they use 2FA, they'll still need it to log in.")

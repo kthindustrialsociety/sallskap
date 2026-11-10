@@ -469,13 +469,47 @@ class Docker(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("PRIVATE KEY", out)
 
+    def test_a_deploy_key_written_to_a_file_is_the_key_alone(self):
+        """So `ssh root@server 'kit site key x' > file` saves a key that works. Measured on
+        the first real install: one copied out of a terminal lost its BEGIN and END lines."""
+        self.run_kit("site", "add", "x.org")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(kit.main(["site", "key", "x.org"]), 0)
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(lines[0], "-----BEGIN OPENSSH PRIVATE KEY-----")
+        self.assertEqual(lines[-1], "-----END OPENSSH PRIVATE KEY-----")
+        self.assertIn("ssh-keygen -y -f", err.getvalue())
+
+    def test_on_a_screen_the_key_comes_with_what_it_is_for(self):
+        out = io.StringIO()
+        out.isatty = lambda: True
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            kit.main(["site", "add", "x.org"])
+        text = out.getvalue()
+        self.assertIn("-----BEGIN OPENSSH PRIVATE KEY-----", text)
+        self.assertIn("can publish this one site, and nothing else", text)
+        self.assertIn("'kit site key x.org' > x.org-deploy-key", text)
+
     def test_apply_starts_caddy_then_waits_for_core(self):
         self.run_kit("apply")
         self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
 
     def test_apply_only_rebuilds_when_asked(self):
+        builds = lambda: [call for call in self.calls if call[-2:] == ["build", "core"]]  # noqa: E731
+        self.run_kit("apply")
+        self.assertEqual(builds(), [])
         self.run_kit("apply", "--build")
-        self.assertIn(["up", "-d", "--wait", "--build", "core"], self.starts())
+        self.assertEqual(len(builds()), 1)
+        self.assertLess(self.calls.index(builds()[0]), next(i for i, c in enumerate(self.calls) if "core" in c and "up" in c and i > self.calls.index(builds()[0])))
+
+    def test_compose_is_quiet_and_never_asks_a_registry_for_core(self):
+        """Measured on the first real install: Compose's build log was a page long, and it
+        asked Docker Hub for core's image, which only exists on the server."""
+        self.run_kit("apply")
+        self.assertTrue(all(call[2:4] == ["--progress", "quiet"] for call in self.calls if call[1] == "compose"))
+        core = compose_services()["core"]
+        self.assertIn("pull_policy: never", core)
 
     def test_a_broken_core_cannot_hold_up_the_web_server(self):
         self.run_kit("apply")
@@ -647,7 +681,7 @@ class Modules(unittest.TestCase):
 
     def test_a_module_joins_the_same_project_as_core(self):
         self.run_kit("enable", "demo")
-        self.assertEqual(self.demo_commands()[0][:5], ["docker", "compose", "--project-name", "sallskap", "--project-directory"])
+        self.assertEqual(self.demo_commands()[0][:7], ["docker", "compose", "--progress", "quiet", "--project-name", "sallskap", "--project-directory"])
         self.assertIn("name: sallskap", (ROOT / "compose.yml").read_text())
 
     def test_enabling_twice_leaves_the_config_alone(self):
@@ -1341,6 +1375,7 @@ class Status(unittest.TestCase):
         with (
             mock.patch.object(kit, "_resolve_ipv4", return_value=addresses),
             mock.patch.object(kit, "_update_status", return_value=0),  # tested on its own, in test_update.py
+            mock.patch.object(kit, "_public_dns", return_value=None),  # tested on its own, below
             contextlib.redirect_stdout(out),
         ):
             code = kit.status(self.paths)
@@ -1349,7 +1384,7 @@ class Status(unittest.TestCase):
     def test_a_missing_record_for_the_app_hostname_is_reported(self):
         code, out = self.run_status(set())
         self.assertEqual(code, 1)
-        self.assertIn("Add this record: app.example.org A 203.0.113.1", out)
+        self.assertIn("app.example.org has no record yet. Add this one: app.example.org A 203.0.113.1", out)
 
     def test_the_app_hostname_pointing_here_is_fine(self):
         code, out = self.run_status({"203.0.113.1"})
@@ -1358,6 +1393,50 @@ class Status(unittest.TestCase):
         # The only thing left to report is that nothing has been backed up yet.
         self.assertEqual(code, 1)
         self.assertIn("no backups have been taken yet", out)
+
+    def test_a_public_answer_is_used_with_its_ttl_for_a_record_just_changed(self):
+        """Measured on production: this server's own resolver kept the old answer."""
+        out = io.StringIO()
+        with (
+            mock.patch.object(kit, "_public_dns", return_value=({"198.51.100.7"}, 3600)),
+            mock.patch.object(kit, "_resolve_ipv4", return_value={"203.0.113.1"}),
+            contextlib.redirect_stdout(out),
+        ):
+            problems = kit._check_dns("app.example.org", "203.0.113.1")
+        self.assertEqual(problems, 1)
+        self.assertIn("still points at 198.51.100.7", out.getvalue())
+        self.assertIn("can last up to 60 minutes", out.getvalue())
+        self.assertIn("change it to: app.example.org A 203.0.113.1", out.getvalue())
+
+    def test_a_public_answer_pointing_here_is_ok(self):
+        out = io.StringIO()
+        with mock.patch.object(kit, "_public_dns", return_value=({"203.0.113.1"}, 60)), contextlib.redirect_stdout(out):
+            self.assertEqual(kit._check_dns("app.example.org", "203.0.113.1"), 0)
+        self.assertIn("ok   app.example.org", out.getvalue())
+
+    def test_without_a_public_answer_the_local_one_is_used(self):
+        out = io.StringIO()
+        with (
+            mock.patch.object(kit, "_public_dns", return_value=None),
+            mock.patch.object(kit, "_resolve_ipv4", return_value={"198.51.100.7"}),
+            contextlib.redirect_stdout(out),
+        ):
+            kit._check_dns("app.example.org", "203.0.113.1")
+        self.assertIn("the record's TTL, often an hour", out.getvalue())
+
+    def test_the_public_answer_reads_a_records_and_the_lowest_ttl(self):
+        answer = {"Answer": [
+            {"name": "app.example.org", "type": 5, "TTL": 300, "data": "elsewhere.example.net."},
+            {"name": "elsewhere.example.net", "type": 1, "TTL": 120, "data": "198.51.100.7"},
+            {"name": "elsewhere.example.net", "type": 1, "TTL": 60, "data": "198.51.100.8"},
+        ]}
+        response = io.BytesIO(json.dumps(answer).encode())
+        with mock.patch.object(kit.urllib.request, "urlopen", return_value=contextlib.nullcontext(response)):
+            self.assertEqual(kit._public_dns("app.example.org"), ({"198.51.100.7", "198.51.100.8"}, 60))
+
+    def test_no_public_answer_when_it_cant_be_reached(self):
+        with mock.patch.object(kit.urllib.request, "urlopen", side_effect=OSError("no network")):
+            self.assertIsNone(kit._public_dns("app.example.org"))
 
     def fake_module(self):
         root = Path(self._tmp.name) / "root"
@@ -1372,7 +1451,7 @@ class Status(unittest.TestCase):
         self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
         code, out = self.run_status(set())
         self.assertEqual(code, 1)
-        self.assertIn("Add this record: demo.example.org A 203.0.113.1", out)
+        self.assertIn("Add this one: demo.example.org A 203.0.113.1", out)
 
     def test_a_module_that_is_off_needs_no_record(self):
         self.fake_module()
@@ -1552,7 +1631,38 @@ class Backups(unittest.TestCase):
         password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
         self.assertNotIn(password, out)
         self.assertIn("can't be recovered", out)
-        self.assertIn("grep RESTIC_PASSWORD", out)
+        self.assertIn("kit backup password", out)
+
+    def test_the_password_is_shown_on_a_screen_and_noted(self):
+        self.run_kit("backup")
+        password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+        code, out = self.run_kit("backup", "password", a_screen=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn(password, out)
+        self.assertIn("shared organisation", out)
+        self.assertTrue((self.paths.backup_dir / "password-shown").exists())
+
+    def test_the_password_isnt_shown_where_it_would_go_into_a_log(self):
+        self.run_kit("backup")
+        password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+        code, out = self.run_kit("backup", "password")
+        self.assertEqual(code, 1)
+        self.assertNotIn(password, out)
+        self.assertIn("ssh -t", out)
+        self.assertFalse((self.paths.backup_dir / "password-shown").exists())
+
+    def test_status_warns_until_someone_has_seen_the_password(self):
+        """Measured on production: the nightly backup made it before anyone looked."""
+        self.run_kit("backup")
+        self.note_export(days_ago=1)
+        with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
+            problems, out = self.status_lines()
+        self.assertEqual(problems, 1)
+        self.assertIn("kit backup password", out)
+        self.run_kit("backup", "password", a_screen=True)
+        with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
+            problems, out = self.status_lines()
+        self.assertEqual(problems, 0, out)
 
     def test_a_backup_without_a_password_refuses_rather_than_making_one_silently(self):
         """Only `kit backup` may make the password, as only it prints it."""
@@ -1777,14 +1887,18 @@ class Backups(unittest.TestCase):
 
     def test_status_reports_a_fresh_backup_and_nags_about_the_copy(self):
         self.run_kit("backup")
+        self.note_password_shown()
         with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
             problems, out = self.status_lines()
         self.assertIn("ok   last backup 1 hour ago", out)
         self.assertEqual(problems, 1)
         self.assertIn("no copy has ever left this server", out)
+        # A copy written on the server doesn't leave it, so it says how to pull one.
+        self.assertIn("ssh root@<this server> 'kit backup export -' > sallskap-backup-", out)
 
     def test_status_reports_a_backup_that_has_stopped_running(self):
         self.run_kit("backup")
+        self.note_password_shown()
         self.note_export(days_ago=1)
         with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 5 * 86400):
             problems, out = self.status_lines()
@@ -1794,12 +1908,16 @@ class Backups(unittest.TestCase):
 
     def test_status_reports_a_copy_off_the_server_that_has_got_old(self):
         self.run_kit("backup")
+        self.note_password_shown()
         self.note_export(days_ago=40)
         with mock.patch.object(kit.time, "time", return_value=self.snapshot_timestamp() + 3600):
             problems, out = self.status_lines()
         self.assertIn("ok   last backup", out)
         self.assertIn("the last copy off this server was 40 days ago", out)
         self.assertEqual(problems, 1)
+
+    def note_password_shown(self):
+        (self.paths.backup_dir / "password-shown").write_text("1\n")
 
     def note_export(self, days_ago):
         when = self.snapshot_timestamp() - days_ago * 86400 + 3600

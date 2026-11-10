@@ -392,7 +392,7 @@ class Finishing(UpdateBase):
         self.assertIn("app.example.org:443:127.0.0.1", curl)
 
     def test_a_failed_check_stops_says_what_to_run_and_cleans_nothing(self):
-        self.answers[("docker", "compose", "--project-directory", str(self.root), "exec", "-T", "sync")] = 1
+        self.answers[("docker", "compose", *kit.COMPOSE_QUIET, "--project-directory", str(self.root), "exec", "-T", "sync")] = 1
         code, out = self.kit("update", "--finish")
         self.assertEqual(code, 1)
         self.assertIn("FAILED ITS CHECKS", out)

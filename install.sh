@@ -166,6 +166,7 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq ca-certificates curl git openssl python3 restic ufw unattended-upgrades >/dev/null
+  ok "Base packages installed"
 }
 
 enable_automatic_updates() {
@@ -178,6 +179,7 @@ EOF
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:30";
 EOF
+  ok "Security updates install by themselves, and the server restarts at 04:30 if one needs it"
 }
 
 # Only the keys of someone who can administer the server count. Locking out
@@ -241,6 +243,7 @@ disable_llmnr() {
   install -d -m 0755 /etc/systemd/resolved.conf.d
   printf '%s\n' "$wanted" >"$conf"
   systemctl restart systemd-resolved
+  ok "Local-network name lookups are off"
 }
 
 install_docker() {
@@ -271,7 +274,7 @@ EOF
 
   apt-get update -qq
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
-  systemctl enable --now docker >/dev/null
+  systemctl enable --now docker >/dev/null 2>&1   # its "Synchronizing state…" lines say nothing useful
   ok "$(docker --version)"
 }
 
@@ -301,12 +304,12 @@ fetch_kit() {
   [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && what=(tag "$version")
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     git -C "$INSTALL_DIR" fetch -q --depth 1 origin "${what[@]}"
-    git -C "$INSTALL_DIR" checkout -q --detach FETCH_HEAD
+    git -C "$INSTALL_DIR" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
   else
-    git clone -q --depth 1 --branch "$version" "$KIT_REPO" "$INSTALL_DIR"
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" "$KIT_REPO" "$INSTALL_DIR"
   fi
   ln -sf "$INSTALL_DIR/kit/kit.py" /usr/local/bin/kit
-  ok "Installed $(kit --version) in $INSTALL_DIR"
+  ok "Installed $(kit --version) in $INSTALL_DIR, with the kit command that runs it: kit --help"
 }
 
 # Sites are published over SSH by this account. Its keys can only run
@@ -329,14 +332,15 @@ schedule_backups() {
   install -m 0644 "$INSTALL_DIR/systemd/sallskap-backup.service" "$INSTALL_DIR/systemd/sallskap-backup.timer" \
     /etc/systemd/system/
   systemctl daemon-reload
-  systemctl enable --now sallskap-backup.timer >/dev/null
-  ok "Backups run nightly: $(systemctl show -p TimersCalendar --value sallskap-backup.timer)"
+  systemctl enable --now sallskap-backup.timer >/dev/null 2>&1
+  ok "A backup runs every night at about 03:00"
 }
 
 start_core() {
   step "Starting Sällskap"
   if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
-    say "  The server is ready. Next, set your primary domain: kit init example.org"
+    say "  The server is ready. Next, set your primary domain, as in step 3 of docs/installing.md:"
+    say "    kit init example.org"
     return
   fi
   kit apply --build

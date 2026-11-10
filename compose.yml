@@ -5,6 +5,7 @@ services:
   core:
     build: ./core
     image: sallskap-core:${SALLSKAP_CORE_TAG:-local}   # kit sets it to this version: see core_image in kit/kit.py
+    pull_policy: never   # it only exists here, so never ask a registry for it. kit builds it
     restart: unless-stopped
     mem_limit: 768m       # four threads, each with room for one 100 MB password check
     pids_limit: 128
