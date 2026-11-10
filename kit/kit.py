@@ -492,7 +492,7 @@ def apply(paths: Paths, build: bool = False) -> None:
             if _has_containers(name):
                 if name in PREPARE:
                     PREPARE[name](paths, config)
-                print(f"Starting {module_manifest(name).get('description', name)}, and waiting until it's ready.")
+                print(f"Starting the {name} module, and waiting until it's ready.")
                 subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
                 if name in AFTER_START:
                     AFTER_START[name](paths, config)
@@ -2132,11 +2132,14 @@ def _public_dns(name: str) -> tuple[set[str], int | None] | None:
 
 
 def _spoken_seconds(seconds: int) -> str:
+    def counted(number: int, unit: str) -> str:
+        return f"{number} {unit}{'' if number == 1 else 's'}"
+
     if seconds < 120:
-        return f"{seconds} seconds"
-    if seconds < 7200:
-        return f"{round(seconds / 60)} minutes"
-    return f"{round(seconds / 3600)} hours"
+        return counted(seconds, "second")
+    if seconds < 3600:
+        return counted(round(seconds / 60), "minute")
+    return counted(round(seconds / 3600), "hour")
 
 
 def _check_dns(name: str, server_ip: str) -> int:

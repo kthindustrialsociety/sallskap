@@ -1405,7 +1405,7 @@ class Status(unittest.TestCase):
             problems = kit._check_dns("app.example.org", "203.0.113.1")
         self.assertEqual(problems, 1)
         self.assertIn("still points at 198.51.100.7", out.getvalue())
-        self.assertIn("can last up to 60 minutes", out.getvalue())
+        self.assertIn("can last up to 1 hour", out.getvalue())
         self.assertIn("change it to: app.example.org A 203.0.113.1", out.getvalue())
 
     def test_a_public_answer_pointing_here_is_ok(self):
@@ -1413,6 +1413,9 @@ class Status(unittest.TestCase):
         with mock.patch.object(kit, "_public_dns", return_value=({"203.0.113.1"}, 60)), contextlib.redirect_stdout(out):
             self.assertEqual(kit._check_dns("app.example.org", "203.0.113.1"), 0)
         self.assertIn("ok   app.example.org", out.getvalue())
+
+    def test_ttls_are_said_the_way_a_person_would(self):
+        self.assertEqual([kit._spoken_seconds(n) for n in (1, 60, 300, 3600, 86400)], ["1 second", "60 seconds", "5 minutes", "1 hour", "24 hours"])
 
     def test_without_a_public_answer_the_local_one_is_used(self):
         out = io.StringIO()
