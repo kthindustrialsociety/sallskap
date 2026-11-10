@@ -16,6 +16,7 @@ Versions are semantic: `MAJOR.MINOR.PATCH`. They stay at 0.x until another assoc
    ```sh
    gh release create v<version> --target <merge commit> --notes-file <the section>
    ```
+4. **The `Release` workflow attaches `install.sh` and `SHA256SUMS`** to the release, from the tag. The install guide downloads both from the newest release. It fails, saying so on the release, if the tag doesn't match `VERSION`.
 
 ## Rules
 

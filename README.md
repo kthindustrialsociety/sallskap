@@ -8,11 +8,13 @@ Sällskap is built by KTH Industrial Society, which is also its first installati
 
 ## Install
 
-[docs/installing.md](docs/installing.md) goes from renting a server to logins, the vault, Git hosting and your website, with backups and a copy off the server. In short, as root on a fresh Debian or Ubuntu server:
+[docs/installing.md](docs/installing.md) goes from renting a server to logins, the vault, Git hosting and your website, with backups and a copy off the server. In short, as root on a fresh Debian or Ubuntu server, with the installer from the newest release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | bash -s -- --check   # changes nothing
-curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | bash
+curl -fsSLO https://github.com/kthindustrialsociety/sallskap/releases/latest/download/install.sh
+less install.sh            # it runs as root, so read it first
+bash install.sh --check    # changes nothing
+bash install.sh
 kit init example.org
 ```
 

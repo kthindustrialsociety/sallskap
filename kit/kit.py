@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import time
 import tomllib
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -350,6 +351,10 @@ def render_caddyfile(config: Config) -> str:
 
 
 CORE_IMAGE = "sallskap-core"
+# Compose's progress bars and build logs are a page per command, which looks alarming to
+# someone who isn't a developer. kit says what it's doing instead, and Compose still
+# prints its errors.
+COMPOSE_QUIET = ("--progress", "quiet")
 
 
 def core_image(version: str | None = None) -> str:
@@ -363,7 +368,7 @@ def _compose(*args: str) -> list[str]:
     # compose.yml names core's image from this. Set each time, as the code under ROOT
     # changes during an update, and the process that finishes it inherits this one's.
     os.environ["SALLSKAP_CORE_TAG"] = core_image().split(":", 1)[1]
-    return ["docker", "compose", "--project-directory", str(ROOT), *args]
+    return ["docker", "compose", *COMPOSE_QUIET, "--project-directory", str(ROOT), *args]
 
 
 def _have_image(name: str) -> bool:
@@ -375,7 +380,7 @@ def _module_compose(name: str, *args: str) -> list[str]:
     Caddy can reach it over the project's network. Only the running modules' files
     are ever needed, and nothing else has to know which those are."""
     file = ROOT / "modules" / name / "compose.yml"
-    return ["docker", "compose", "--project-name", PROJECT, "--project-directory", str(ROOT), "--file", str(file), *args]
+    return ["docker", "compose", *COMPOSE_QUIET, "--project-name", PROJECT, "--project-directory", str(ROOT), "--file", str(file), *args]
 
 
 # What a module needs beyond starting its containers. Everything here has to be safe
@@ -459,10 +464,13 @@ def apply_web(paths: Paths) -> None:
         candidate.unlink()
         raise KitError(f"Caddy rejected the new config, so nothing changed:\n{check.stderr}")
     os.replace(candidate, paths.caddyfile)
-    subprocess.run(
+    reload = subprocess.run(
         [*in_container, "reload", "--adapter", "caddyfile", "--config", "/etc/caddy/Caddyfile"],
-        check=True,
+        capture_output=True,
+        text=True,
     )
+    if reload.returncode != 0:  # its log lines are only worth showing when it fails
+        raise KitError(f"Caddy didn't take the new config:\n{reload.stderr}")
 
 
 def apply(paths: Paths, build: bool = False) -> None:
@@ -471,18 +479,25 @@ def apply(paths: Paths, build: bool = False) -> None:
     each module is healthy when this returns. The worker goes after the modules, as
     preparing one can give it a new token, and it starts even if one fails, as the others
     still have to hear about changes."""
+    print("Starting the web server.")
     apply_web(paths)
-    subprocess.run(_compose("up", "-d", "--wait", *(["--build"] if build else []), "core"), check=True)
+    if build or not _have_image(core_image()):
+        print("Building the login service. The first time, this takes a minute or two.")
+        subprocess.run(_compose("build", "core"), check=True)
+    print("Starting the login service, and waiting until it's ready.")
+    subprocess.run(_compose("up", "-d", "--wait", "core"), check=True)
     config = load_config(paths)
     try:
         for name in config.modules:
             if _has_containers(name):
                 if name in PREPARE:
                     PREPARE[name](paths, config)
+                print(f"Starting the {name} module, and waiting until it's ready.")
                 subprocess.run(_module_compose(name, "up", "-d", "--wait"), check=True)
                 if name in AFTER_START:
                     AFTER_START[name](paths, config)
     finally:
+        print("Starting the worker that tells the tools about changes.")
         subprocess.run(_compose("up", "-d", "--wait", "sync"), check=True)
 
 
@@ -962,9 +977,35 @@ def _print_backup_password(paths: Paths, password: str) -> None:
     if sys.stdout.isatty():
         print(f"  {password}\n")
         print(f"It's also in {paths.backup_env}, which only root can read.\n")
+        _note_password_shown(paths)
     else:
         print(f"It isn't printed here, as this isn't a screen and it would go into the logs.")
-        print(f"Read it on the server with:  sudo grep RESTIC_PASSWORD {paths.backup_env}\n")
+        print("Show it on a screen with:  kit backup password\n")
+
+
+def _password_note(paths: Paths) -> Path:
+    return paths.backup_dir / "password-shown"
+
+
+def _note_password_shown(paths: Paths) -> None:
+    paths.backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _password_note(paths).write_text(f"{time.time()}\n", "utf-8")
+
+
+def show_backup_password(paths: Paths) -> None:
+    """For writing it down. The nightly backup usually makes it, with nobody watching, so
+    this is how someone sees it the first time. Only to a screen, for the reason above."""
+    password = _read_env(paths.backup_env).get("RESTIC_PASSWORD")
+    if not password:
+        raise KitError("There's no backup password yet. It's made with the first backup: kit backup")
+    if not sys.stdout.isatty():
+        raise KitError("This shows a secret, so only on a screen. Over SSH, add -t: ssh -t root@<server> 'kit backup password'")
+    print("The backup password. Nothing in a backup can be read without it, and it can't be recovered.\n")
+    print(f"  {password}\n")
+    print("Write it down, and keep that copy away from this server and from the backups.")
+    print("Save a second copy in a shared organisation in the vault, so the board can find it.")
+    print("The paper copy is the one that counts: the vault is inside the backups. See docs/restore.md.")
+    _note_password_shown(paths)
 
 
 def backup_paths(paths: Paths, config: Config) -> list[Path]:
@@ -2069,14 +2110,55 @@ def _resolve_ipv4(name: str) -> set[str]:
         return set()
 
 
+PUBLIC_DNS = "https://cloudflare-dns.com/dns-query"
+
+
+def _public_dns(name: str) -> tuple[set[str], int | None] | None:
+    """The addresses and their TTL, asked of a public resolver over HTTPS. This server's
+    own resolver may still hold an answer from before a change, and can't say how long
+    for, which is what someone who has just changed a record needs to know. None if it
+    can't be asked, and the local resolver is used instead."""
+    request = urllib.request.Request(
+        f"{PUBLIC_DNS}?name={urllib.parse.quote(name)}&type=A", headers={"Accept": "application/dns-json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            answer = json.loads(response.read())
+    except (OSError, ValueError):
+        return None
+    records = [record for record in answer.get("Answer", []) if record.get("type") == 1]
+    ttl = min((record["TTL"] for record in records), default=None)
+    return {record["data"] for record in records}, ttl
+
+
+def _spoken_seconds(seconds: int) -> str:
+    def counted(number: int, unit: str) -> str:
+        return f"{number} {unit}{'' if number == 1 else 's'}"
+
+    if seconds < 120:
+        return counted(seconds, "second")
+    if seconds < 3600:
+        return counted(round(seconds / 60), "minute")
+    return counted(round(seconds / 3600), "hour")
+
+
 def _check_dns(name: str, server_ip: str) -> int:
-    """Print whether a hostname points here, and return the number of problems."""
-    addresses = _resolve_ipv4(name)
-    if server_ip in addresses and len(addresses) == 1:
+    """Print whether a hostname points here, and return the number of problems. A record
+    that points elsewhere may have been changed already, so it says how long the old
+    answer can last, as well as what to change it to."""
+    public = _public_dns(name)
+    addresses, ttl = public if public is not None else (_resolve_ipv4(name), None)
+    if addresses == {server_ip}:
         print(f"  ok   {name}")
         return 0
-    found = ", ".join(sorted(addresses)) or "nothing"
-    print(f"  DNS  {name} points at {found}. Add this record: {name} A {server_ip}")
+    if not addresses:
+        print(f"  DNS  {name} has no record yet. Add this one: {name} A {server_ip}")
+        return 1
+    found = ", ".join(sorted(addresses))
+    lasts = _spoken_seconds(ttl) if ttl is not None else "the record's TTL, often an hour"
+    print(f"  DNS  {name} still points at {found}.")
+    print(f"       If you've just changed it, the old answer can last up to {lasts}: check again then.")
+    print(f"       If not, change it to: {name} A {server_ip}")
     return 1
 
 
@@ -2097,7 +2179,7 @@ def _spoken_age(days: float) -> str:
     return counted(round(days), "day")
 
 
-def _backup_status(paths: Paths) -> int:
+def _backup_status(paths: Paths, server: str = "<this server>") -> int:
     """When the last backup was taken, and when a copy last left the server. Both are
     problems when they get old: a backup nobody has ever taken off the server doesn't
     survive losing the server. See docs/restore.md."""
@@ -2123,16 +2205,21 @@ def _backup_status(paths: Paths) -> int:
         problems += 1
     else:
         print(f"  ok   last backup {_spoken_age(days)}")
+    if not _password_note(paths).exists():
+        print("  warn nobody has noted the backup password yet. Show it on a screen: kit backup password")
+        problems += 1
 
+    # Run from another computer: a copy written here doesn't leave the server.
+    pull = f"ssh root@{server} 'kit backup export -' > {_export_name()}"
     note = paths.backup_dir / "last-export"
     try:
         when = float(note.read_text("utf-8").strip())
     except (OSError, ValueError):
-        print(f"  warn no copy has ever left this server. Take one: kit backup export {_export_name()}")
+        print(f"  warn no copy has ever left this server. From another computer, take one:\n       {pull}")
         return problems + 1
     days = _age_in_days(when)
     if days > EXPORT_STALE_DAYS:
-        print(f"  warn the last copy off this server was {_spoken_age(days)}. Take one: kit backup export {_export_name()}")
+        print(f"  warn the last copy off this server was {_spoken_age(days)}. From another computer, take one:\n       {pull}")
         problems += 1
     else:
         print(f"  ok   last copy off this server {_spoken_age(days)}")
@@ -2164,7 +2251,7 @@ def status(paths: Paths) -> int:
         for name in (site.domain, *site.redirects):
             problems += _check_dns(name, server_ip)
     print()
-    problems += _backup_status(paths)
+    problems += _backup_status(paths, server_ip)
     problems += _update_status(paths)
     return 1 if problems else 0
 
@@ -2206,6 +2293,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     backup = commands.add_parser("backup", help="take a backup, or export one to take off this server")
     backup_actions = backup.add_subparsers(dest="backup_action")
+    backup_actions.add_parser("password", help="show the backup password, to write it down")
     export = backup_actions.add_parser("export", help="write the backups as one file, or - for standard output")
     export.add_argument("destination", nargs="?", default="-", help="a file, a folder, or - for standard output")
     restore_command = commands.add_parser("restore", help="put a backup back onto a fresh server")
@@ -2253,9 +2341,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_deploy_key(domain: str, private: str) -> None:
-    print(f"\nDeploy key for {domain}. Store it as a CI secret now; it isn't kept on this server.\n")
-    print(private)
-    print(f"Publish from CI with:\n  tar -C dist -czf - . | ssh -o IdentitiesOnly=yes -i <key> {DEPLOY_USER}@<server>")
+    """On a screen, with what it's for. Otherwise the key alone, so that
+    `ssh root@server 'kit site key example.org' > key` saves a file that works: a key
+    copied out of a terminal breaks easily, as seen on the first real install, where its
+    BEGIN and END lines were left behind."""
+    if not sys.stdout.isatty():
+        print(private.strip())
+        print(f"Wrote the deploy key for {domain} to standard output. Check the file with: ssh-keygen -y -f <file>", file=sys.stderr)
+        return
+    print(f"\nThe deploy key for {domain}, shown once: this server doesn't keep it.")
+    print("It can publish this one site, and nothing else: it can't log in or reach anything else here.\n")
+    print(private.strip())
+    print("\nCopy everything from the BEGIN line to the END line. Or, more safely, have it written")
+    print(f"straight into a file from your own computer, which replaces this one:\n")
+    print(f"  ssh root@<server> 'kit site key {domain}' > {domain}-deploy-key && chmod 600 {domain}-deploy-key\n")
+    print("Then either save it as a secret in the CI that builds the site, such as DEPLOY_KEY in")
+    print("GitHub Actions, or keep the file and publish by hand. Either way, publishing is:\n")
+    print(f"  tar -C <folder> -czf - . | ssh -o IdentitiesOnly=yes -i <key file> {DEPLOY_USER}@<server>\n")
+    print(f"If it's lost, `kit site key {domain}` makes a new one and cancels this one. See modules/website/README.md.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2270,10 +2373,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             init_config(paths, args.domain)
             apply(paths)
-            print(f"Created {paths.config}.")
-            print("Create the first admin with: kit admin you@example.org")
-            print(f"Add a public site with: kit site add {args.domain}\n")
+            print(f"Created {paths.config}.\n")
             status(paths)
+            print(f"\nNext, add the DNS record for app.{args.domain} above at your registrar.")
+            print("While it spreads, create the first admin, whose link works once the record has:")
+            print("  kit admin you@example.org")
+            print("The rest is in docs/installing.md.")
         elif args.command == "apply":
             apply(paths, build=args.build)
         elif args.command == "admin":
@@ -2300,6 +2405,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "backup":
             if args.backup_action == "export":
                 export_backup(paths, args.destination)
+            elif args.backup_action == "password":
+                show_backup_password(paths)
             else:
                 run_backup(paths)
         elif args.command == "restore":
@@ -2332,8 +2439,10 @@ def main(argv: list[str] | None = None) -> int:
             add_site(paths, site)
             # Shown first: it's kept nowhere else, so a later failure mustn't lose it.
             _print_deploy_key(site.domain, create_deploy_key(paths, site.domain))
-            apply_web(paths)
-            status(paths)
+            # Only the key goes to a file or a pipe, so what follows goes to the screen.
+            with contextlib.redirect_stdout(sys.stdout if sys.stdout.isatty() else sys.stderr):
+                apply_web(paths)
+                status(paths)
         elif args.action == "remove":
             remove_site(paths, args.domain)
             apply_web(paths)

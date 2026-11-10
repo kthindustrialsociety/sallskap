@@ -38,3 +38,4 @@ class Command(BaseCommand):
             self.stdout.write("Their 2FA and recovery codes are removed. They'll set up 2FA again before using the admin page.")
         if not user.has_usable_password():
             self.stdout.write(f"This link lets them choose a password, once, within 24 hours:\n{password_link(user)}")
+            self.stdout.write("Treat it like a password: whoever opens it first chooses the password. Send it to them privately, and don't paste it anywhere else.")

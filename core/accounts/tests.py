@@ -737,6 +737,14 @@ class Commands(Base):
         self.assertFalse(user.has_usable_password())
         self.assertIn(f"https://{settings.APP_HOST}/set-password/", output)
 
+    def test_every_printed_link_says_to_treat_it_like_a_password(self):
+        """On the first real install, the first admin's link was pasted into a chat. Whoever
+        opens it first chooses the password, then sets up 2FA with their own phone."""
+        output = self.run_command("create_admin", "admin@example.org")
+        self.assertIn("Treat it like a password", output)
+        make_user("someone@example.org", ["member"])
+        self.assertIn("Treat it like a password", self.run_command("password_link", "someone@example.org"))
+
     def test_create_admin_again_changes_nothing(self):
         self.run_command("create_admin", "admin@example.org")
         user = User.objects.get(email="admin@example.org")
