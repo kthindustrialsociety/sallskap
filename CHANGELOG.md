@@ -8,6 +8,29 @@ Newest first. Each release has three parts:
 
 A section is never edited once its release is tagged. A mistake is put right in the next release's section. See [docs/releasing.md](docs/releasing.md).
 
+## 0.7.1 (2026-11-10)
+
+Fixes for what the first real install found, by following the install guide alone, the way another association would.
+
+### Before you update
+
+- After updating, `kit status` warns that nobody has noted the backup password, even if you already have, as nothing recorded it before. Run `kit backup password` once, on a screen (over SSH, `ssh -t`), and the warning goes.
+- The install guide now downloads the installer from the newest release, with a checksum, rather than from `main`.
+
+### Tool versions
+
+- None changed.
+
+### Changes
+
+- fix: what the first real install found (#21).
+  - `kit status` checks DNS with a public resolver, so a cached answer can't look current. For a record that points elsewhere, it says how long the old answer can last.
+  - `kit backup password` shows the password on a screen, and `kit status` warns until someone has seen it. It suggests pulling a copy off the server from another computer.
+  - `kit site add` and `kit site key` print the key alone when it goes to a file, so it can be saved without copying it out of a terminal.
+  - Quieter output: one line per step, with Compose's and Caddy's own output only when something fails. Core is never asked for from a registry.
+  - The installer ends each step with `ok`, and introduces the `kit` command. `kit admin` and `kit link` say to treat the link like a password.
+  - The install guide is rewritten, and a `Release` workflow attaches `install.sh` and `SHA256SUMS` to each release.
+
 ## 0.7.0 (2026-11-08)
 
 The first release that can update itself. From here on, an installation moves to a newer release with `kit update`, which takes a backup first, and goes back with `kit update --rollback`.
