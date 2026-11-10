@@ -6,12 +6,14 @@ Sällskap is built by KTH Industrial Society, which is also its first installati
 
 **Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
 
-## Check a server
+## Install
 
-This changes nothing on the server:
+[docs/installing.md](docs/installing.md) goes from renting a server to logins, the vault, Git hosting and your website, with backups and a copy off the server. In short, as root on a fresh Debian or Ubuntu server:
 
 ```sh
-bash install.sh --check
+curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | bash -s -- --check   # changes nothing
+curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | bash
+kit init example.org
 ```
 
 ## Layout
@@ -19,7 +21,9 @@ bash install.sh --check
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
+| `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
+| `docs/updating.md` | What `kit update` does |
 | `install.sh` | The installer, used by every install path |
 | `cloud-init.yaml` | Runs the installer on providers with a "user data" field |
 | `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
