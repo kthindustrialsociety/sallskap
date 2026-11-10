@@ -2,4 +2,4 @@
 # For providers with a "user data" field. Runs the same installer as every
 # other install path.
 runcmd:
-  - curl -fsSL https://raw.githubusercontent.com/kthindustrialsociety/sallskap/main/install.sh | bash
+  - curl -fsSL https://github.com/kthindustrialsociety/sallskap/releases/latest/download/install.sh | bash

@@ -1,0 +1,35 @@
+name: Release
+
+# When a release is published, attach the installer it was tagged with, and its
+# checksum. docs/installing.md downloads both from the newest release, so nobody runs
+# an installer from `main` that no release has been tested with.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  attach:
+    name: Attach the installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to upload the release's files, and nothing else
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      # kit update refuses such a tag anyway. Failing here says so on the release itself.
+      - name: The tag matches VERSION
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: test "v$(cat VERSION)" = "$TAG" || { echo "::error::$TAG holds VERSION $(cat VERSION)"; exit 1; }
+      - run: sha256sum install.sh > SHA256SUMS && cat SHA256SUMS
+      - name: Attach them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" install.sh SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
