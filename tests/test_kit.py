@@ -837,6 +837,13 @@ class GitSecrets(unittest.TestCase):
         self.assertGreater(len(self.settings()["FORGEJO__security__SECRET_KEY"]), 50)
         self.assertGreater(len(self.settings()["FORGEJO__security__INTERNAL_TOKEN"]), 50)
 
+    def test_the_folders_forgejos_own_check_requires_exist_from_the_start(self):
+        """Production's first update failed Forgejo's check: a fresh install has no repos,
+        so no repositories folder, which Forgejo only makes with the first one."""
+        kit.prepare_git(self.paths, self.config)
+        self.assertTrue((self.paths.git_dir / "git" / "repositories").is_dir())
+        self.assertTrue((self.paths.git_dir / "data" / "log").is_dir())
+
     def test_the_data_folder_is_private(self):
         kit.prepare_git(self.paths, self.config)
         self.assertEqual(self.paths.git_dir.stat().st_mode & 0o777, 0o700)

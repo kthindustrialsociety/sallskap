@@ -592,12 +592,16 @@ def prepare_git(paths: Paths, config: Config) -> None:
     if not paths.git_env.exists() or paths.git_env.read_text("utf-8") != text:
         _write_atomic(paths.git_env, text, 0o600)
     paths.git_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Its logs go to the console, but its own check fails if the folder its config
-    # names is missing, which would make every `kit update` look broken.
+    # Its own check fails if a folder its config names is missing, which would make every
+    # `kit update` look broken. Its logs go to the console, so the log folder stays empty,
+    # and it only makes the repositories folder with the first repo, which a fresh
+    # install doesn't have yet: production's first update failed on that.
     log_dir = paths.git_dir / "data" / "log"
-    log_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
+    repositories = paths.git_dir / "git" / "repositories"
+    for folder in (log_dir, repositories):
+        folder.mkdir(mode=0o750, parents=True, exist_ok=True)
     if os.geteuid() == 0:
-        for folder in (paths.git_dir, paths.git_dir / "data", log_dir):
+        for folder in (paths.git_dir, paths.git_dir / "data", log_dir, paths.git_dir / "git", repositories):
             os.chown(folder, FORGEJO_UID, FORGEJO_UID)
 
 
@@ -1796,15 +1800,25 @@ def forgejo_doctor_problems() -> list[str]:
     its output is read for them. Warnings are shown and don't fail the update."""
     try:
         listed = _forgejo_output("doctor", "check", "--list")
-        names = [line.lstrip("*").split()[0] for line in listed.splitlines()[1:] if line.strip()]
-        wanted = [item for name in names if name not in FORGEJO_DOCTOR_SKIPPED for item in ("--run", name)]
-        output = _forgejo_output("doctor", "check", *wanted)
     except KitError as error:
         return [f"Forgejo's own check failed: {error}"]
-    for line in output.splitlines():
+    names = [line.lstrip("*").split()[0] for line in listed.splitlines()[1:] if line.strip()]
+    wanted = [item for name in names if name not in FORGEJO_DOCTOR_SKIPPED for item in ("--run", name)]
+    # Run directly rather than through _forgejo_output: a failed configuration check
+    # exits non-zero, and its [E] lines, which name the problem, are on standard output.
+    # Seen on production's first update, where only "1 configuration files with errors" showed.
+    result = subprocess.run(_module_compose("git", "exec", "-T", "forgejo", "forgejo", "doctor", "check", *wanted), capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+    for line in lines:
         if "[W]" in line:
             print(f"Forgejo's own check warns: {line.split('[W]', 1)[1].strip()}")
-    errors = [line.split("[E]", 1)[1].strip() for line in output.splitlines() if "[E]" in line]
+    errors = [
+        line.split("[E]", 1)[1].strip()
+        for line in lines
+        if "[E]" in line and "Please check your configuration files" not in line
+    ]
+    if result.returncode and not errors:
+        errors = [(result.stderr or result.stdout).strip().splitlines()[-1] if (result.stderr or result.stdout).strip() else f"it exited with {result.returncode}"]
     return [f"Forgejo's own check found: {error}" for error in errors]
 
 
@@ -1867,7 +1881,9 @@ def _show_logs_of_unhealthy() -> None:
 def finish_update(paths: Paths) -> int:
     """Run by the new release's code, straight after the switch."""
     state = _read_update_state(paths)
-    if not state or state.get("result"):
+    # A failed update can be finished once its cause is fixed: the checks run again, and
+    # nothing is restored. Without this, the only way out was a rollback.
+    if not state or state.get("result") not in (None, "failed"):
         raise KitError("There's no update waiting to be finished.")
     print("Starting the new version. Core updates its database as it starts.")
     config = load_config(paths)
@@ -1889,7 +1905,9 @@ def finish_update(paths: Paths) -> int:
             print(f"  - {problem}", file=sys.stderr)
         print(
             f"\nNothing has been undone or cleaned up. The public sites are unaffected."
-            f"\nTo go back to {state['from']}, as it was at {state['started']}, run:"
+            f"\nIf you can fix what's wrong, do, then run the checks again, which changes nothing else:"
+            f"\n\n  kit update --finish\n"
+            f"\nOtherwise, go back to {state['from']}, as it was at {state['started']}:"
             f"\n\n  kit update --rollback\n"
             f"\nThat puts back the backup taken just before the update. Anything written since then is lost.",
             file=sys.stderr,
