@@ -89,6 +89,9 @@ class UpdateBase(unittest.TestCase):
             for start, code in self.answers.items():
                 if command[: len(start)] == list(start):
                     return subprocess.CompletedProcess(command, code, "", "it failed")
+            if "doctor" in command and "--list" not in command:  # Forgejo's own check, run directly
+                self.forgejo.append(tuple(command[command.index("doctor"):]))
+                return subprocess.CompletedProcess(command, self.doctor_exit, self.doctor, "Command error: 1 configuration files with errors" if self.doctor_exit else "")
             if command[:2] == ["docker", "ps"]:
                 state = "running\tUp 1 minute (unhealthy)" if self.unhealthy else "running\tUp 1 minute (healthy)"
                 return subprocess.CompletedProcess(command, 0, f"sallskap-core-1\tsallskap-core:{self.running}\t{state}\n", "")
@@ -103,6 +106,7 @@ class UpdateBase(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.doctor = "[1] Check paths\n - [W] Found 2 Orphaned TwoFactor without existing User\n"
+        self.doctor_exit = 0
 
         def forgejo_output(*args):
             self.forgejo.append(args)
@@ -426,6 +430,40 @@ class Finishing(UpdateBase):
         self.assertIn("It didn't start: sallskap-forgejo-1", out)
         self.assertNotIn("sallskap-sync-1", out)
 
+    def test_an_error_that_makes_forgejos_check_exit_non_zero_is_named(self):
+        """Production's first update: a fresh install had no repositories folder yet, and
+        all that showed was "1 configuration files with errors"."""
+        self.doctor_exit = 1
+        self.doctor = (
+            "[1] Check paths and basic configuration\n"
+            ' - [I] Repository Root Path:       "/var/lib/gitea/git/repositories"\n'
+            " - [E]     Is REQUIRED but is not accessible. ERROR: stat /var/lib/gitea/git/repositories: no such file or directory\n"
+            " - [E] Please check your configuration files and try again.\n"
+        )
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 1)
+        self.assertIn("stat /var/lib/gitea/git/repositories: no such file or directory", out)
+        self.assertNotIn("Please check your configuration files", out)
+
+    def test_a_non_zero_exit_with_no_error_lines_still_fails_and_says_something(self):
+        self.doctor_exit = 1
+        self.doctor = ""
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 1)
+        self.assertIn("Forgejo's own check found: Command error: 1 configuration files with errors", out)
+
+    def test_a_failed_update_can_be_finished_once_its_cause_is_fixed(self):
+        self.doctor_exit = 1
+        self.doctor = " - [E] something wrong\n"
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 1)
+        self.assertIn("kit update --finish", out)
+        self.assertEqual(self.state()["result"], "failed")
+        self.doctor_exit, self.doctor = 0, ""
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.state()["result"], "done")
+
     def test_failing_to_start_names_what_failed_and_shows_its_log(self):
         self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])
         self.unhealthy = True
@@ -487,6 +525,7 @@ class Status(UpdateBase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(kit._update_status(self.paths), 1)
+        self.assertIn("kit update --finish", out.getvalue())
         self.assertIn("kit update --rollback", out.getvalue())
 
 

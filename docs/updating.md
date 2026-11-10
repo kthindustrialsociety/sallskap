@@ -5,6 +5,7 @@
 ```sh
 kit update            # the newest release. It shows what changes and asks first
 kit update 0.7.1      # a particular release
+kit update --finish   # after a failed check, once its cause is fixed: check again
 kit update --rollback # back to before the last update, from the backup it took
 ```
 
@@ -37,10 +38,18 @@ kit update --rollback # back to before the last update, from the backup it took
    - Forgejo's own `forgejo doctor check`, with every check but two that always report errors here: `gc-lfs`, as LFS is unused, and `authorized-keys`, as its SSH server is off. Forgejo exits 0 even when a check reports an error, so kit reads the output. Its warnings are shown, but don't fail the update;
    - the worker reaches each tool the way it expects, including the layout of Vaultwarden's admin page that it reads;
    - core's login page answers through Caddy.
-8. **If a check fails,** it stops and leaves everything as it is for you to look at. It says what failed and prints the one command that goes back: `kit update --rollback`.
+8. **If a check fails,** it stops and leaves everything as it is for you to look at. It says what failed, and offers two ways on:
+   - `kit update --finish`, once you've fixed the cause, runs the checks again and changes nothing else;
+   - `kit update --rollback` goes back.
 9. **If every check passes,** it removes older images of the kit's own tools, keeping the ones from before this update, and clears Docker's build cache. Images that aren't the kit's are left alone.
 
 Logins are usually down for a minute or two, from the backup until the checks.
+
+## A failed check
+
+A failed check doesn't always mean the new version is broken. On the first real install, the update to 0.7.1 failed Forgejo's own check only because a fresh install had no repositories folder yet. Everything was running.
+
+So read what failed first. If it can be fixed where it is, fix it, then run the checks again with `kit update --finish`. Updating to a newer release, once there is one, also works after a failed update. Roll back when the new version itself is wrong.
 
 ## Rolling back
 

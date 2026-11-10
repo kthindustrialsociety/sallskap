@@ -8,6 +8,25 @@ Newest first. Each release has three parts:
 
 A section is never edited once its release is tagged. A mistake is put right in the next release's section. See [docs/releasing.md](docs/releasing.md).
 
+## 0.7.2 (2026-11-10)
+
+The update to 0.7.1 failed its last check on a fresh install. This fixes the check, and lets a failed update be finished without a rollback.
+
+### Before you update
+
+- If your update to 0.7.1 failed with "Forgejo's own check failed: … 1 configuration files with errors", nothing is wrong with your installation, and there's nothing to do first. Run `kit update`. It updates to 0.7.2, and this time the check passes.
+
+### Tool versions
+
+- None changed.
+
+### Changes
+
+- fix: let forgejo's check pass on a fresh install, and finish a failed update (#23).
+  - Forgejo only makes its repositories folder with the first repo, and its own check fails without it. `kit` now makes it, as it already did the log folder.
+  - When Forgejo's check exits with an error, `kit update` shows the lines that name the problem, not only "1 configuration files with errors".
+  - `kit update --finish` runs the checks again after a failed update, once its cause is fixed. Before, the only way out it offered was a rollback. A failed update and `kit status` both say so.
+
 ## 0.7.1 (2026-11-10)
 
 Fixes for what the first real install found, by following the install guide alone, the way another association would.
