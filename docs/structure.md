@@ -14,7 +14,7 @@ Example Federation              association, the root
 ├─ Spring hackathon 2027        team, a project: has an end date
 └─ Example Robotics             association, inside the root
    ├─ Operations                team, no end date
-   └─ Development               team, no end date: its lead is Robotics' vice chair, by rule
+   └─ Development               team, no end date: here its lead is Robotics' vice chair, by a seat rule
       └─ UAVs                   team inside a team
          └─ Drone race 2027     team, a project
 ```
@@ -61,23 +61,35 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 
 A position's **role** is one of a fixed set of keys that the kit understands. Each association can rename their labels, and add its own titles.
 
-| Role key | Typically held in | Can, in its unit and every unit below it |
-|---|---|---|
-| `chair`, `vice_chair` | association | Appoint and end positions. Create, change and archive units. Everything the board can |
-| `treasurer` | association | Fees and treasury. Everything the board can |
-| `secretary` | association | Documents and minutes. Everything the board can |
-| `board_member` | association | Manage memberships, events, mailings and documents, and see members |
-| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there |
+| Role key | Typically held in | Can | Where |
+|---|---|---|---|
+| `chair`, `vice_chair` | association | Appoint and end positions. Create, change and archive units. Give grants (below). Everything the board can | The association and everything inside it, associations inside it included |
+| `treasurer` | association | Fees and treasury, and everything a `board_member` can | The association and its teams only |
+| `secretary` | association | Documents and minutes, and everything a `board_member` can | The association and its teams only |
+| `board_member` | association | Manage memberships, events, mailings and documents, and see members | The association and its teams only |
+| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there | The team and the teams under it |
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
 The keys never change and are never shown. What people see comes from the dictionary below.
 
-- **Authority flows down the tree.** You can manage a unit if your position in it, or in any unit above it, allows that action. An association's chair runs it and everything inside it, and the root's board can step in anywhere.
+- **Authority is scoped.** You can manage a unit if a position you hold covers it, as the table says, or a grant does. Only the chair and vice chair reach into the associations inside theirs. Every other board role stops at its association's edge. So the root's treasurer has no say in Robotics, unless a chair gives them one.
 - **The head of a unit** is the `chair` or `vice_chair` of an association, or the `lead` of a team. Heads appoint the heads of the units directly under them and approve what's proposed there. So Development's lead appoints the lead of UAVs, and UAVs' lead approves a new project inside it. Anyone with authority higher up can do the same.
 - **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server.
 - **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members.
 - **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators.
+
+### Grants
+
+A `chair` or `vice_chair` can **give a role a specific permission** anywhere they have authority themselves. For example, KTHIS's president could give:
+- KTHIS's treasurer fees and treasury in every society;
+- KTHIS's board members a view of every society's members, for the annual meeting;
+- Robotics' Operations lead the right to send Robotics' mailings.
+
+- **The permissions are a fixed list:** see members, manage memberships, manage events, send mailings, manage documents, and fees and treasury. Appointing people and giving grants can't be given away, so authority over people stays with chairs, vice chairs and heads.
+- **A grant goes to a role in a unit, not to a person,** such as "KTHIS's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too.
+- **It covers one unit,** or that unit and everything under it.
+- **It's dated like a tie,** records who gave it, and lasts until a chair or vice chair ends it. It doesn't end when the person who gave it leaves.
 
 ### Seats that come with another position
 
@@ -88,6 +100,8 @@ A unit can have **seat rules:** holding one position gives you a seat in another
 
 A rule names the role it gives here, the role it comes from, and where that role is held: one named unit, or every association directly under a named one.
 
+- **Rules are optional,** and each unit sets its own, or none. They're for posts that statutes tie together. Otherwise, positions are appointed one by one: Development's lead can just as well be appointed directly.
+- **A seat gives exactly its role, scoped as above.** Robotics' chair, seated on KTHIS's board, can do what a KTHIS `board_member` can in KTHIS and its teams, and nothing in the other societies.
 - **A seat is a position like any other.** It gives the same access, needs 2FA if its role does, and stays in the record when it ends.
 - **It starts and ends with the position it comes from,** so a new chair gets the board seat, and its rooms and documents, the moment they're appointed. It can't be set or ended by hand: change the rule, or the position behind it.
 - **Rules are set by whoever can appoint in the unit** that has the seats.
@@ -109,7 +123,7 @@ Anyone can propose a new team or association, through the `proposals` app planne
 - someone proposes a new association under the root: the root's chair or vice chair approves it;
 - someone proposes a project inside UAVs: UAVs' lead approves it.
 
-Approval creates the unit, with the proposer's suggested lead or chair in position, and the tools catch up as for any other change.
+A proposal suggests a lead or chair, who may be the proposer or someone else. Whoever approves it confirms that person or picks another. Approval creates the unit with them in position, and the tools catch up as for any other change.
 
 ## 5. Access to the tools
 
