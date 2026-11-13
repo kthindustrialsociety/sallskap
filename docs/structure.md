@@ -1,6 +1,6 @@
 # Structure: associations, people, and doing everything from a command line
 
-*Design, agreed 2026-11-13. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
+*Working design, first agreed 2026-11-13, and expected to change as it's built and used. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
 
 Everything here is the same for every installation. An association's own structure is data in core's database, not code or config.
 
@@ -14,7 +14,7 @@ Example Federation              association, the root
 ├─ Spring hackathon 2027        team, a project: has an end date
 └─ Example Robotics             association, inside the root
    ├─ Operations                team, no end date
-   └─ Development               team, no end date: its lead is Robotics' vice chair, by rule
+   └─ Development               team, no end date: here its lead is Robotics' vice chair, by a seat rule
       └─ UAVs                   team inside a team
          └─ Drone race 2027     team, a project
 ```
@@ -61,23 +61,35 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 
 A position's **role** is one of a fixed set of keys that the kit understands. Each association can rename their labels, and add its own titles.
 
-| Role key | Typically held in | Can, in its unit and every unit below it |
-|---|---|---|
-| `chair`, `vice_chair` | association | Appoint and end positions. Create, change and archive units. Everything the board can |
-| `treasurer` | association | Fees and treasury. Everything the board can |
-| `secretary` | association | Documents and minutes. Everything the board can |
-| `board_member` | association | Manage memberships, events, mailings and documents, and see members |
-| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there |
+| Role key | Typically held in | Can | Where |
+|---|---|---|---|
+| `chair`, `vice_chair` | association | Appoint and end positions. Create, change and archive units. Give grants (below). Everything the board can | The association and everything inside it, associations inside it included |
+| `treasurer` | association | Fees and treasury, and everything a `board_member` can | The association and its teams only |
+| `secretary` | association | Documents and minutes, and everything a `board_member` can | The association and its teams only |
+| `board_member` | association | Manage memberships, events, mailings and documents, and see members | The association and its teams only |
+| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there | The team and the teams under it |
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
 The keys never change and are never shown. What people see comes from the dictionary below.
 
-- **Authority flows down the tree.** You can manage a unit if your position in it, or in any unit above it, allows that action. An association's chair runs it and everything inside it, and the root's board can step in anywhere.
+- **Authority is scoped.** You can manage a unit if a position you hold covers it, as the table says, or a grant does. Only the chair and vice chair reach into the associations inside theirs. Every other board role stops at its association's edge. So the root's treasurer has no say in Robotics, unless a chair gives them one.
 - **The head of a unit** is the `chair` or `vice_chair` of an association, or the `lead` of a team. Heads appoint the heads of the units directly under them and approve what's proposed there. So Development's lead appoints the lead of UAVs, and UAVs' lead approves a new project inside it. Anyone with authority higher up can do the same.
 - **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server.
 - **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members.
 - **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators.
+
+### Grants
+
+A `chair` or `vice_chair` can **give a role a specific permission** anywhere they have authority themselves. For example, KTHIS's president could give:
+- KTHIS's treasurer fees and treasury in every society;
+- KTHIS's board members a view of every society's members, for the annual meeting;
+- Robotics' Operations lead the right to send Robotics' mailings.
+
+- **The permissions are a fixed list:** see members, manage memberships, manage events, send mailings, manage documents, and fees and treasury. Appointing people and giving grants can't be given away, so authority over people stays with chairs, vice chairs and heads.
+- **A grant goes to a role in a unit, not to a person,** such as "KTHIS's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too.
+- **It covers one unit,** or that unit and everything under it.
+- **It's dated like a tie,** records who gave it, and lasts until a chair or vice chair ends it. It doesn't end when the person who gave it leaves.
 
 ### Seats that come with another position
 
@@ -88,6 +100,8 @@ A unit can have **seat rules:** holding one position gives you a seat in another
 
 A rule names the role it gives here, the role it comes from, and where that role is held: one named unit, or every association directly under a named one.
 
+- **Rules are optional,** and each unit sets its own, or none. They're for posts that statutes tie together. Otherwise, positions are appointed one by one: Development's lead can just as well be appointed directly.
+- **A seat gives exactly its role, scoped as above.** Robotics' chair, seated on KTHIS's board, can do what a KTHIS `board_member` can in KTHIS and its teams, and nothing in the other societies.
 - **A seat is a position like any other.** It gives the same access, needs 2FA if its role does, and stays in the record when it ends.
 - **It starts and ends with the position it comes from,** so a new chair gets the board seat, and its rooms and documents, the moment they're appointed. It can't be set or ended by hand: change the rule, or the position behind it.
 - **Rules are set by whoever can appoint in the unit** that has the seats.
@@ -109,7 +123,7 @@ Anyone can propose a new team or association, through the `proposals` app planne
 - someone proposes a new association under the root: the root's chair or vice chair approves it;
 - someone proposes a project inside UAVs: UAVs' lead approves it.
 
-Approval creates the unit, with the proposer's suggested lead or chair in position, and the tools catch up as for any other change.
+A proposal suggests a lead or chair, who may be the proposer or someone else. Whoever approves it confirms that person or picks another. Approval creates the unit with them in position, and the tools catch up as for any other change.
 
 ## 5. Access to the tools
 
@@ -132,7 +146,7 @@ Access is **worked out from current memberships and positions,** never set by ha
 
 - **Every subscription is confirmed by email** before anything is sent to it. Every mailing has a one-click unsubscribe, in the message and in its headers.
 - **Subscriptions live in core,** next to the person, not in `mailings`. That way unsubscribing, export and deletion cover every app at once.
-- **Sending goes through the hosted provider** (§11 of the spec), at a rate it allows.
+- **Mailings have their own sending settings,** separate from the app's own mail. A server provider's relay is usually for notifications only: Hostup's, for example, excludes marketing mailings and is capped at 15,000 emails a month for all of a customer's servers together (checked 2026-11-13). So `mailings` sends through a provider the association chooses for it, preferably one in the EU, at the rate that provider allows. Without one set up, `mailings` is switched off, and confirmation emails for single sign-ups still go out as app mail.
 
 ## 7. One set of actions, three ways in
 
@@ -166,6 +180,12 @@ sk mailing send robotics news --file spring.md
 - **It runs on your own computer** and talks to the API over HTTPS, like `gh` talks to GitHub. Nobody gets a shell on the server, as §12 of the spec requires.
 - **The server decides, never the CLI.** A changed CLI gets the same answer as an honest one: the action is refused. `sk --help` and `sk whoami` show only what you can do.
 - **Login is the device login** that `gh auth login` uses (OAuth 2.0 device authorization, RFC 8628), through core's login service. It's switched on for the CLI alone, and stays off for every tool. You approve it in the browser, with your password and 2FA.
+- **How core checks the CLI's tokens** (checked against django-allauth 65.21.1, which core runs, on 2026-11-13):
+  - allauth's login service supports the device login, and comes with a check for its own tokens on an API built with django-ninja. That's the API library to use.
+  - **Only the CLI's tokens may call the API.** The check only asks whether a token carries the right scope, so a tool's token, such as Forgejo's, would otherwise pass. The API needs its own scope, which only the CLI is allowed to ask for. Each token is also tied to `app.<domain>/api/`.
+  - **The device approval page needs core's own guard,** as the tools' login page has: someone whose role needs 2FA and who hasn't set it up yet is sent to set it up first.
+  - **The check doesn't look at whether the account is still active,** so the API does, on every call, along with the person's current ties.
+  - **Token lifetimes are one setting for the whole installation,** and refresh tokens never expire unless set. The API sets a limit on both, and shortens it for roles that need 2FA by checking when the person last approved a login.
 - **Tokens:**
   - They're kept in the operating system's keychain where there is one, and otherwise in a file only you can read.
   - They expire, and sooner for roles that need 2FA.
@@ -179,5 +199,4 @@ sk mailing send robotics news --file spring.md
 ## 9. Open questions
 
 1. **Associations inside a federation as separate legal entities.** This design assumes the root is the only data controller. A federation whose associations are each their own legal entity would need a controller for each. Suggested: leave it out until an installation needs it.
-2. **Sending in bulk.** Whether the hosted provider's limits and terms allow mailings at the expected volume, or whether mailings need a provider of their own.
-3. **Protecting the API with core's login tokens.** Whether django-allauth's login service can check its own tokens on core's API directly, as its documentation suggests. To check before building, as was done for Vaultwarden.
+2. **Which provider sends KTHIS's mailings,** and the volume to expect.
