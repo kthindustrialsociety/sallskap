@@ -1,6 +1,6 @@
 # Structure: associations, people, and doing everything from a command line
 
-*Design, agreed 2026-11-13. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
+*Design, agreed 2026-11-13, with the default dictionary still to choose. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
 
 Everything here is the same for every installation. An association's own structure is data in core's database, not code or config.
 
@@ -50,6 +50,8 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 - **Membership is inherited upwards.** A member of a division is a member of the root, for example to vote at its annual meeting, so joining once is enough. Someone can also be a member of the root directly, outside every division.
 - **Apps add and end ties and reasons,** and delete their own data when its time is up.
 - **A person with no account, no current tie and no live reason is deleted** after a short grace period.
+- **The record of who was involved is kept.** When someone is deleted, their ended positions stay, board and team alike, with their name and nothing else: no email and no other ties. So every unit keeps a full list of who led it and who took part, and when. It's kept as the association's records, which the privacy policy says, and it's the one exception to deletion. Plain memberships, sign-ups and subscriptions are deleted.
+- **Non-members can take part in teams,** as a `participant`, such as a partner's employee or a student from elsewhere. Their position is their tie. They can never hold a board role or be a `lead`.
 - **Alumni:** when a membership ends, the person is offered to stay as an alumnus, with their consent, as a `Reason` that's renewed every few years.
 
 ## 4. Roles and authority
@@ -66,10 +68,30 @@ A position's **role** is one of a fixed set of keys that the kit understands. Ea
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
+The keys never change and are never shown. What people see comes from the dictionary below.
+
 - **Authority flows down the tree.** You can manage a unit if your position in it, or in any unit above it, allows that action. A division's chair runs the division, and the root's board can step in anywhere.
 - **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server.
 - **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members.
 - **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators.
+
+### The dictionary
+
+Every installation has its own **dictionary:** the word shown for each role key, unit kind and tie, in Swedish and English, singular and plural.
+
+- **The kit ships a default,** and an installation can replace any word in it: `sk words set lead "Officer" --sv "Ansvarig"`.
+- **A unit can override words for itself and the units below it,** such as a robotics team calling its lead "Captain". The nearest override up the tree wins.
+- **It changes words only.** What a role can do comes from its key, so renaming `lead` to "Officer" changes nobody's access.
+- **Custom titles** are still free text on a single position, such as "Head of PR", shown beside the word for its role.
+- **The kinds of unit have words too:** the root, an association inside another, a project team and a service team. KTHIS could call them Federation, Society, Project and Committee.
+
+### Proposing a new unit
+
+Anyone can propose a new team or association, through the `proposals` app planned beside recruitment. **It's approved one level up,** by the `chair` or `vice_chair` of the unit it would sit under:
+- a Robotics member proposes a Robotics project: Robotics' chair or vice chair approves it;
+- someone proposes a new association under the root: the root's chair or vice chair approves it.
+
+Approval creates the unit, with the proposer's suggested lead or chair in position, and the tools catch up as for any other change.
 
 ## 5. Access to the tools
 
@@ -138,9 +160,6 @@ sk mailing send robotics news --file spring.md
 
 ## 9. Open questions
 
-1. **Non-members in teams.** Can someone who isn't a member hold a `participant` position, such as a partner's employee or a student from elsewhere? Suggested: yes, with a `Reason` of their own, but never a board role or `lead`.
-2. **Old board positions after deletion.** Board posts are also recorded in the minutes. Suggested: keep a deleted person's ended board positions with their name, as part of the association's records, and delete every other tie.
-3. **Divisions as separate legal entities.** This design assumes the root is the only data controller. A federation whose divisions are each their own legal entity would need a controller per division. Suggested: leave it out until an installation needs it.
-4. **Sending in bulk.** Whether the hosted provider's limits and terms allow mailings at the expected volume, or whether mailings need a provider of their own.
-5. **Who approves new teams and associations,** through the `proposals` app that's planned beside recruitment: the board of the unit above, or an annual meeting for an association.
-6. **Protecting the API with core's login tokens.** Whether django-allauth's login service can check its own tokens on core's API directly, as its documentation suggests. To check before building, as was done for Vaultwarden.
+1. **Divisions as separate legal entities.** This design assumes the root is the only data controller. A federation whose divisions are each their own legal entity would need a controller per division. Suggested: leave it out until an installation needs it.
+2. **Sending in bulk.** Whether the hosted provider's limits and terms allow mailings at the expected volume, or whether mailings need a provider of their own.
+3. **Protecting the API with core's login tokens.** Whether django-allauth's login service can check its own tokens on core's API directly, as its documentation suggests. To check before building, as was done for Vaultwarden.
