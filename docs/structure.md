@@ -9,21 +9,24 @@ Everything here is the same for every installation. An association's own structu
 Every installation is one tree of **units**. A unit is either an **association** or a **team**.
 
 ```
-Example Society                 association, the root
-├─ Website                      team, a service: no end date
+Example Federation              association, the root
+├─ Extended board               team: seats filled by rule (§4)
 ├─ Spring hackathon 2027        team, a project: has an end date
-└─ Example Robotics             association, a division of the root
-   ├─ Competition 2027          team, a project
-   └─ Example Robotics Junior   association, a division of a division
+└─ Example Robotics             association, inside the root
+   ├─ Operations                team, no end date
+   └─ Development               team, no end date: its lead is Robotics' vice chair, by rule
+      └─ UAVs                   team inside a team
+         └─ Drone race 2027     team, a project
 ```
 
 - **The root is the installation's association,** and the legal entity. Most installations have no other associations: a root with teams under it.
 - **A federation is an association with associations under it.** There's no separate kind. KTHIS, for example, is the root, with its societies under it.
 - **Any depth is allowed.** Pages are designed for the usual two or three levels.
 - **Projects and services are both teams.** A project has an end date and a service doesn't. When a project ends, it's archived: everyone's access through it ends, and its history is kept.
+- **Teams can contain teams,** to any depth. That's how an association splits into departments, such as Operations and Development, which have teams of their own, which have projects.
 - **Each unit has a fixed key,** such as `robotics`, unique in the installation, plus a name, a description, and its own logo and colours if it wants them. Renaming a unit never changes its key, so it never changes anyone's access.
 - **A team can involve other associations.** It has one owning unit, which appoints its lead, and a list of associations taking part.
-- **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's chair can end the arrangement.
+- **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's head (§4) can end the arrangement.
 
 ## 2. People
 
@@ -42,12 +45,12 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 | Tie | Fields | Meaning |
 |---|---|---|
 | `Membership` | person, association, kind (ordinary, honorary), start, end | A member of that association, **and of every association above it** |
-| `Position` | person, unit, role, title, start, end, appointed by, minutes | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms |
+| `Position` | person, unit, role, title, start, end, appointed by, minutes, seat rule | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms. A position that comes from a seat rule (§4) records which one |
 | `Registration` | person, event, ticket, status, checked in | Signed up for an event (§6) |
 | `Subscription` | person, unit, topic (events, news), include units below, confirmed, ended | Follows a unit's events or news (§6) |
 | `Reason` | person, kind, unit, source, legal basis, expires | Why data is held on someone with no other tie: applicant, alumnus, partner contact, contact-form sender |
 
-- **Membership is inherited upwards.** A member of a division is a member of the root, for example to vote at its annual meeting, so joining once is enough. Someone can also be a member of the root directly, outside every division.
+- **Membership is only of associations, and is inherited upwards.** A member of Robotics is a member of the root, for example to vote at its annual meeting, so joining once is enough. Someone can also be a member of the root directly, outside every association inside it. In teams, people hold positions instead.
 - **Apps add and end ties and reasons,** and delete their own data when its time is up.
 - **A person with no account, no current tie and no live reason is deleted** after a short grace period.
 - **The record of who was involved is kept.** When someone is deleted, their ended positions stay, board and team alike, with their name and nothing else: no email and no other ties. So every unit keeps a full list of who led it and who took part, and when. It's kept as the association's records, which the privacy policy says, and it's the one exception to deletion. Plain memberships, sign-ups and subscriptions are deleted.
@@ -64,32 +67,47 @@ A position's **role** is one of a fixed set of keys that the kit understands. Ea
 | `treasurer` | association | Fees and treasury. Everything the board can |
 | `secretary` | association | Documents and minutes. Everything the board can |
 | `board_member` | association | Manage memberships, events, mailings and documents, and see members |
-| `lead` | team | Manage the team's participants, events and mailings |
+| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there |
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
 The keys never change and are never shown. What people see comes from the dictionary below.
 
-- **Authority flows down the tree.** You can manage a unit if your position in it, or in any unit above it, allows that action. A division's chair runs the division, and the root's board can step in anywhere.
+- **Authority flows down the tree.** You can manage a unit if your position in it, or in any unit above it, allows that action. An association's chair runs it and everything inside it, and the root's board can step in anywhere.
+- **The head of a unit** is the `chair` or `vice_chair` of an association, or the `lead` of a team. Heads appoint the heads of the units directly under them and approve what's proposed there. So Development's lead appoints the lead of UAVs, and UAVs' lead approves a new project inside it. Anyone with authority higher up can do the same.
 - **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server.
 - **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members.
 - **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators.
+
+### Seats that come with another position
+
+A unit can have **seat rules:** holding one position gives you a seat in another unit, for as long as you hold the first one. For example:
+- **On a federation's board:** the chair of each association directly under the root holds a `board_member` seat on the root;
+- **An extended board:** a team whose participants are the root's board, plus the chair and vice chair of each association directly under the root;
+- **A department led by the vice chair:** Robotics' vice chair is the `lead` of Development.
+
+A rule names the role it gives here, the role it comes from, and where that role is held: one named unit, or every association directly under a named one.
+
+- **A seat is a position like any other.** It gives the same access, needs 2FA if its role does, and stays in the record when it ends.
+- **It starts and ends with the position it comes from,** so a new chair gets the board seat, and its rooms and documents, the moment they're appointed. It can't be set or ended by hand: change the rule, or the position behind it.
+- **Rules are set by whoever can appoint in the unit** that has the seats.
 
 ### The dictionary
 
 Every installation has its own **dictionary:** the word shown for each role key, unit kind and tie, in Swedish and English, singular and plural.
 
 - **The kit ships plain words:** Chair, Vice chair, Treasurer, Secretary, Board member, Lead, Participant, Member, Association and Team. An installation can replace any of them: `sk words set treasurer "Head of Treasury" --sv "Kassör"`.
-- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while its divisions keep Chair: `sk words set chair "President" --unit kthis`.
+- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while the associations inside it keep Chair: `sk words set chair "President" --unit kthis`.
 - **It changes words only.** What a role can do comes from its key, so renaming `lead` to "Officer" changes nobody's access.
 - **Custom titles** are still free text on a single position, such as "Head of PR", shown beside the word for its role.
 - **The kinds of unit have words too,** such as Society for an association, or Committee for a team.
 
 ### Proposing a new unit
 
-Anyone can propose a new team or association, through the `proposals` app planned beside recruitment. **It's approved one level up,** by the `chair` or `vice_chair` of the unit it would sit under:
+Anyone can propose a new team or association, through the `proposals` app planned beside recruitment. **It's approved one level up,** by the head of the unit it would sit under:
 - a Robotics member proposes a Robotics project: Robotics' chair or vice chair approves it;
-- someone proposes a new association under the root: the root's chair or vice chair approves it.
+- someone proposes a new association under the root: the root's chair or vice chair approves it;
+- someone proposes a project inside UAVs: UAVs' lead approves it.
 
 Approval creates the unit, with the proposer's suggested lead or chair in position, and the tools catch up as for any other change.
 
@@ -124,7 +142,7 @@ Every change, such as creating a team, appointing a lead or opening an event, is
 |---|---|---|
 | **The API,** at `app.<domain>/api/v1/` | The CLI, scripts and CI | JSON over HTTPS. Versioned, so old CLIs keep working across a release |
 | **Member pages** | Chairs, leads and members in a browser | Server-rendered, as §9 of the spec says |
-| **The admin page** | Operators: a back office | Django's admin can only give permissions across the whole installation, so it's for operators, not for a division's board |
+| **The admin page** | Operators: a back office | Django's admin can only give permissions across the whole installation, so it's for operators, not for the board of an association inside another |
 
 There's no action that only one way in can do. A test checks that every action has its API endpoint and its check.
 
@@ -160,6 +178,6 @@ sk mailing send robotics news --file spring.md
 
 ## 9. Open questions
 
-1. **Divisions as separate legal entities.** This design assumes the root is the only data controller. A federation whose divisions are each their own legal entity would need a controller per division. Suggested: leave it out until an installation needs it.
+1. **Associations inside a federation as separate legal entities.** This design assumes the root is the only data controller. A federation whose associations are each their own legal entity would need a controller for each. Suggested: leave it out until an installation needs it.
 2. **Sending in bulk.** Whether the hosted provider's limits and terms allow mailings at the expected volume, or whether mailings need a provider of their own.
 3. **Protecting the API with core's login tokens.** Whether django-allauth's login service can check its own tokens on core's API directly, as its documentation suggests. To check before building, as was done for Vaultwarden.

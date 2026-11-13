@@ -48,7 +48,7 @@ KTHIS builds it and is its first installation. Any other association should be a
 | Developer | Git, build runner |
 | Operator (IT, 1–2 people) | Server, backups, updates, module config |
 
-Roles come from the structure in [structure.md](structure.md): an association, its divisions and its teams, and each person's memberships and positions in them. A board role in a division gives board access to that division and everything under it, not the whole installation. Operator is the one role given by hand. Someone signed up for an event or following an association needs no account. Every module maps access to roles (§8).
+Roles come from the structure in [structure.md](structure.md): an association, the associations and teams inside it, and each person's memberships and positions in them. A board role in an association inside another gives board access to that association and everything under it, not the whole installation. Operator is the one role given by hand. Someone signed up for an event or following an association needs no account. Every module maps access to roles (§8).
 
 ## 5. Principles
 
@@ -275,14 +275,14 @@ All feature apps are always installed and switched on or off in the admin with *
 **Invoices and requisitions** (in `treasury`):
 - **Invoices** bill a customer or partner. **Requisitions** claim money from a funder under a grant decision, and record the decision, project and funder's reference.
 - The treasurer creates both in the dashboard and downloads a finished PDF with the association's logo, organisation number and payment details.
-- Either can be issued in the name of the association or one of its divisions, with that division's name and logo.
+- Either can be issued in the name of the association or one of the associations inside it, with that association's name and logo.
 - Numbers are assigned automatically and run in sequence, and an issued document can't be edited. A mistake is corrected with a new document, so the records stay reliable for bookkeeping.
 - Each one has a status (draft, sent, paid) and can be linked to the transaction that paid it.
 
 **Interfaces:** every action is one function in core with one permission check, reached in three ways ([structure.md](structure.md) §7 and §8):
 - **Command line and scripts:** a JSON API, and a CLI that anyone can run on their own computer, limited to what their positions allow.
 - **Board, leads and members:** server-rendered pages (Django templates, optionally htmx); no JavaScript build step.
-- **Operators:** Django admin, as a back office. Its permissions can't be limited to one division, so a division's board uses the pages or the CLI.
+- **Operators:** Django admin, as a back office. Its permissions can't be limited to one association or team, so the board of an association inside another uses the pages or the CLI.
 - **Public:** `pages` or the association's own site with widgets.
 - **Language:** Swedish and English.
 
