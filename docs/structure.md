@@ -1,6 +1,6 @@
 # Structure: associations, people, and doing everything from a command line
 
-*Design, agreed 2026-11-13, with the default dictionary still to choose. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
+*Design, agreed 2026-11-13. Not built yet: the next feature work builds it, before `members` and `events`. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
 
 Everything here is the same for every installation. An association's own structure is data in core's database, not code or config.
 
@@ -79,11 +79,11 @@ The keys never change and are never shown. What people see comes from the dictio
 
 Every installation has its own **dictionary:** the word shown for each role key, unit kind and tie, in Swedish and English, singular and plural.
 
-- **The kit ships a default,** and an installation can replace any word in it: `sk words set lead "Officer" --sv "Ansvarig"`.
-- **A unit can override words for itself and the units below it,** such as a robotics team calling its lead "Captain". The nearest override up the tree wins.
+- **The kit ships plain words:** Chair, Vice chair, Treasurer, Secretary, Board member, Lead, Participant, Member, Association and Team. An installation can replace any of them: `sk words set treasurer "Head of Treasury" --sv "Kassör"`.
+- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while its divisions keep Chair: `sk words set chair "President" --unit kthis`.
 - **It changes words only.** What a role can do comes from its key, so renaming `lead` to "Officer" changes nobody's access.
 - **Custom titles** are still free text on a single position, such as "Head of PR", shown beside the word for its role.
-- **The kinds of unit have words too:** the root, an association inside another, a project team and a service team. KTHIS could call them Federation, Society, Project and Committee.
+- **The kinds of unit have words too,** such as Society for an association, or Committee for a team.
 
 ### Proposing a new unit
 
