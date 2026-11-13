@@ -1,6 +1,6 @@
 # Sällskap — a self-hosted, modular platform for student associations
 
-*Specification v0.3 · 2026-11-03 · KTH Industrial Society (KTHIS) · working title*
+*Specification v0.4 · 2026-11-13 · KTH Industrial Society (KTHIS) · working title*
 
 > *Sällskap*: Swedish for "society", a group of people who choose to do something together.
 
@@ -48,7 +48,7 @@ KTHIS builds it and is its first installation. Any other association should be a
 | Developer | Git, build runner |
 | Operator (IT, 1–2 people) | Server, backups, updates, module config |
 
-Roles are Django groups. An association can rename them or add its own. Every module maps access to groups (§8).
+Roles come from the structure in [structure.md](structure.md): an association, its divisions and its teams, and each person's memberships and positions in them. A board role in a division gives board access to that division and everything under it, not the whole installation. Operator is the one role given by hand. Someone signed up for an event or following an association needs no account. Every module maps access to roles (§8).
 
 ## 5. Principles
 
@@ -242,8 +242,9 @@ An installation has one **primary domain** and any number of **site domains**.
 
 ## 8. Identity and access
 
-- **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect).
+- **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect). People who only sign up for events or subscribe have no account ([structure.md](structure.md) §2).
 - **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. A tool that can't do this, such as Vaultwarden, can be limited to certain groups in core instead. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
+- **Groups are worked out from the structure:** apart from Operator, nobody is put in a group by hand. Each person's current memberships and positions become keys such as `robotics:member` or `website:lead`, beside the built-in ones. See [structure.md](structure.md) §5.
 - **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access within seconds, in every tool whose module has a connector, and at their next login in the rest. Whether a tool's API can do this counts when choosing one.
 - **How core reaches tools:** a change to someone's access is saved along with a note that the tools need telling. A worker in its own container, with no ports, picks that up within seconds, retries if a tool is down, and the admin page says if it's stuck. It's the only process with the tools' admin tokens, so core's web process, which faces the internet, never has them. Each module's `connector.py` does the talking, using only the standard library. It also goes over everyone once a day and when it starts, which covers a tool restored from a backup.
 - **When someone leaves:** what can be done for them is done at once, and anything only a person can do becomes a follow-up on the admin page that stays open until someone marks it done, such as changing shared passwords.
@@ -261,9 +262,10 @@ All feature apps are always installed and switched on or off in the admin with *
 
 | Feature | Contents | Requires |
 |---|---|---|
-| `core` (always on) | Accounts, login, groups, association settings, audit log | — |
+| `core` (always on) | Accounts, login, people, associations and teams, positions, subscriptions, association settings, audit log, API | — |
 | `members` | Join form, member register, membership years, export | — |
-| `events` | Events, capacity, sign-ups, attendee lists | — |
+| `events` | Events, capacity, sign-ups with only an email, attendee lists | — |
+| `mailings` | Newsletters and event announcements to subscribers, and member notices | — |
 | `fees` | Membership fee per year, paid/unpaid, reminders | members |
 | `governance` | Board composition per year, meetings, minutes, statutes, annual meeting | — |
 | `treasury` | Transactions, receipts (file upload), budget, recurring costs, invoices, requisitions | — |
@@ -277,9 +279,10 @@ All feature apps are always installed and switched on or off in the admin with *
 - Numbers are assigned automatically and run in sequence, and an issued document can't be edited. A mistake is corrected with a new document, so the records stay reliable for bookkeeping.
 - Each one has a status (draft, sent, paid) and can be linked to the transaction that paid it.
 
-**Interfaces:**
-- **Board:** Django admin, with permissions limited by group.
-- **Members:** server-rendered pages (Django templates, optionally htmx); no JavaScript build step.
+**Interfaces:** every action is one function in core with one permission check, reached in three ways ([structure.md](structure.md) §7 and §8):
+- **Command line and scripts:** a JSON API, and a CLI that anyone can run on their own computer, limited to what their positions allow.
+- **Board, leads and members:** server-rendered pages (Django templates, optionally htmx); no JavaScript build step.
+- **Operators:** Django admin, as a back office. Its permissions can't be limited to one division, so a division's board uses the pages or the CLI.
 - **Public:** `pages` or the association's own site with widgets.
 - **Language:** Swedish and English.
 
@@ -341,6 +344,8 @@ An association should never have to ask its provider how the server works. The k
 
 The same status is shown on a page in the admin.
 
+`kit` is for operators, as root on the server. Managing the association itself, such as members, teams and events, is done with the member CLI from anyone's own computer ([structure.md](structure.md) §8).
+
 ### 10.4 Backups
 
 Three layers, in [docs/restore.md](restore.md). Nothing in them depends on the hosting provider, so an association on any provider gets the same safety net and the same restore.
@@ -361,7 +366,8 @@ A **test restore every semester** is part of the handover checklist, onto a thro
 
 - A hosted provider holds the mailboxes and handles app mail (verification, password reset, notices) over SMTP.
 - DNS records are set up correctly and checked by `kit status`: SPF, DKIM, DMARC.
-- The app sends as little mail as possible. There are no bulk newsletters from the app in v1; announcements go in the portal.
+- Apart from `mailings`, the app sends as little mail as possible.
+- `mailings` sends only to people who confirmed a subscription, or to members on member business, always with a one-click unsubscribe ([structure.md](structure.md) §6). Whether the provider's limits allow that volume is open.
 - Many providers block outgoing port 25, so the kit always sends through the configured provider, usually on port 587 (§10.2).
 
 ## 12. Security and privacy (GDPR)
@@ -370,7 +376,8 @@ A **test restore every semester** is part of the handover checklist, onto a thro
   - a privacy policy
   - a data processing agreement (for the hosting provider)
   - retention rules (e.g. delete lapsed members after N years)
-- Members can export and delete their data from the member portal.
+- Members can export and delete their data from the member portal. Someone without an account, such as an event sign-up or a subscriber, does the same from the link in their emails.
+- Data on a non-member is kept only while there's a reason with an expiry, such as an upcoming event. A person with nothing left is deleted ([structure.md](structure.md) §3).
 - Access: 1–2 operators have root on the server, which is also how they get into tools if core is down. Developers and incubator teams deploy only through Git, never with a shell on the server.
 - Databases are never exposed to the internet; everything goes through Caddy.
 - Backups are encrypted. Keys are kept in the password vault and one offline copy.
@@ -424,7 +431,7 @@ Moving to another server or provider is `kit restore` onto a fresh installation 
 
 ## 16. Open questions
 
-1. **Name.** "Sällskap" is a working title.
+1. **Name.** "Sällskap" is a working title. The commands are named with it: `kit` and the member CLI, which should become one command.
 2. **Chat:** Zulip (better UX; phone notifications need Zulip's relay service) or Matrix (fully FOSS, lighter, federated)?
 3. **Vaultwarden login through core:** answered at step 4 of the build: yes, without a fork. See `modules/vault/README.md` for its limits.
 4. **Payments:** membership fees via Swish, reconciled manually or through an integration? Out of scope for v1 unless decided otherwise.
