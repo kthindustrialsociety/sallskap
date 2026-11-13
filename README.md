@@ -23,6 +23,7 @@ kit init example.org
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
+| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, not built yet |
 | `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `docs/updating.md` | What `kit update` does |
