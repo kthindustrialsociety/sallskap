@@ -367,7 +367,7 @@ A **test restore every semester** is part of the handover checklist, onto a thro
 - A hosted provider holds the mailboxes and handles app mail (verification, password reset, notices) over SMTP.
 - DNS records are set up correctly and checked by `kit status`: SPF, DKIM, DMARC.
 - Apart from `mailings`, the app sends as little mail as possible.
-- `mailings` sends only to people who confirmed a subscription, or to members on member business, always with a one-click unsubscribe ([structure.md](structure.md) §6). Whether the provider's limits allow that volume is open.
+- `mailings` sends only to people who confirmed a subscription, or to members on member business, always with a one-click unsubscribe ([structure.md](structure.md) §6). It sends through a provider of its own, as a server provider's relay is usually for notifications only.
 - Many providers block outgoing port 25, so the kit always sends through the configured provider, usually on port 587 (§10.2).
 
 ## 12. Security and privacy (GDPR)

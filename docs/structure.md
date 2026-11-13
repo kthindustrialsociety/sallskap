@@ -132,7 +132,7 @@ Access is **worked out from current memberships and positions,** never set by ha
 
 - **Every subscription is confirmed by email** before anything is sent to it. Every mailing has a one-click unsubscribe, in the message and in its headers.
 - **Subscriptions live in core,** next to the person, not in `mailings`. That way unsubscribing, export and deletion cover every app at once.
-- **Sending goes through the hosted provider** (§11 of the spec), at a rate it allows.
+- **Mailings have their own sending settings,** separate from the app's own mail. A server provider's relay is usually for notifications only: Hostup's, for example, excludes marketing mailings and is capped at 15,000 emails a month for all of a customer's servers together (checked 2026-11-13). So `mailings` sends through a provider the association chooses for it, preferably one in the EU, at the rate that provider allows. Without one set up, `mailings` is switched off, and confirmation emails for single sign-ups still go out as app mail.
 
 ## 7. One set of actions, three ways in
 
@@ -166,6 +166,12 @@ sk mailing send robotics news --file spring.md
 - **It runs on your own computer** and talks to the API over HTTPS, like `gh` talks to GitHub. Nobody gets a shell on the server, as §12 of the spec requires.
 - **The server decides, never the CLI.** A changed CLI gets the same answer as an honest one: the action is refused. `sk --help` and `sk whoami` show only what you can do.
 - **Login is the device login** that `gh auth login` uses (OAuth 2.0 device authorization, RFC 8628), through core's login service. It's switched on for the CLI alone, and stays off for every tool. You approve it in the browser, with your password and 2FA.
+- **How core checks the CLI's tokens** (checked against django-allauth 65.21.1, which core runs, on 2026-11-13):
+  - allauth's login service supports the device login, and comes with a check for its own tokens on an API built with django-ninja. That's the API library to use.
+  - **Only the CLI's tokens may call the API.** The check only asks whether a token carries the right scope, so a tool's token, such as Forgejo's, would otherwise pass. The API needs its own scope, which only the CLI is allowed to ask for. Each token is also tied to `app.<domain>/api/`.
+  - **The device approval page needs core's own guard,** as the tools' login page has: someone whose role needs 2FA and who hasn't set it up yet is sent to set it up first.
+  - **The check doesn't look at whether the account is still active,** so the API does, on every call, along with the person's current ties.
+  - **Token lifetimes are one setting for the whole installation,** and refresh tokens never expire unless set. The API sets a limit on both, and shortens it for roles that need 2FA by checking when the person last approved a login.
 - **Tokens:**
   - They're kept in the operating system's keychain where there is one, and otherwise in a file only you can read.
   - They expire, and sooner for roles that need 2FA.
@@ -179,5 +185,4 @@ sk mailing send robotics news --file spring.md
 ## 9. Open questions
 
 1. **Associations inside a federation as separate legal entities.** This design assumes the root is the only data controller. A federation whose associations are each their own legal entity would need a controller for each. Suggested: leave it out until an installation needs it.
-2. **Sending in bulk.** Whether the hosted provider's limits and terms allow mailings at the expected volume, or whether mailings need a provider of their own.
-3. **Protecting the API with core's login tokens.** Whether django-allauth's login service can check its own tokens on core's API directly, as its documentation suggests. To check before building, as was done for Vaultwarden.
+2. **Which provider sends KTHIS's mailings,** and the volume to expect.
