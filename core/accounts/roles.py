@@ -17,9 +17,11 @@ class Role:
 
 # Passwords to change when someone leaves: Board usually holds them, and Operators see it happen.
 FOLLOW_UPS = ("accounts.view_followup", "accounts.change_followup")
+# The tree of associations and teams. Operators keep it, until authority comes with positions.
+UNITS = ("structure.view_unit", "structure.add_unit", "structure.change_unit", "structure.delete_unit")
 
 ROLES = (
-    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user", *FOLLOW_UPS)),
+    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user", "structure.view_unit", *FOLLOW_UPS)),
     Role("treasurer", "Treasurer", admin=True, requires_2fa=True),
     Role("events", "Events", admin=True),
     Role("developer", "Developer"),
@@ -38,6 +40,7 @@ ROLES = (
             "mfa.view_authenticator",
             "mfa.delete_authenticator",  # how someone who lost their phone starts over
             *FOLLOW_UPS,
+            *UNITS,
         ),
     ),
     Role("member", "Member"),

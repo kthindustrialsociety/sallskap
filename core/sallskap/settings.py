@@ -2,6 +2,7 @@
 from the environment, which `kit` writes to /etc/sallskap/core.env."""
 
 import base64
+import json
 import os
 from pathlib import Path
 
@@ -11,6 +12,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("SALLSKAP_DATA_DIR", "/srv/core"))
 
 APP_HOST = f"app.{os.environ['SALLSKAP_DOMAIN']}"
+# The association's name and key, which kit writes from the config. A file rather than
+# the environment, as a name can hold characters an env file would change.
+_root = DATA_DIR / "root.json"
+SALLSKAP_ROOT = json.loads(_root.read_text("utf-8")) if _root.exists() else None
 SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 DEBUG = False
 ALLOWED_HOSTS = [APP_HOST]
@@ -32,6 +37,7 @@ INSTALLED_APPS = [
     "allauth.account",
     "allauth.mfa",
     "allauth.idp.oidc",
+    "structure",
     "accounts",  # last: it assigns permissions, so every other app's must exist by then
 ]
 
