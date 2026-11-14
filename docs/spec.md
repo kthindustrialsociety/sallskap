@@ -165,7 +165,8 @@ type   = "bool"
 
 ```toml
 [association]
-name   = "Example Society"
+name   = "Example Society"     # the root unit's name; changing it renames the root
+key    = "example"             # the root unit's key: fixed once set (structure.md §1)
 domain = "example.org"         # primary domain: app., vault., git. and so on live here
 logo   = "logo.svg"
 colors = { primary = "#…", accent = "#…" }
