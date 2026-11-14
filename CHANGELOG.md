@@ -8,6 +8,33 @@ Newest first. Each release has three parts:
 
 A section is never edited once its release is tagged. A mistake is put right in the next release's section. See [docs/releasing.md](docs/releasing.md).
 
+## Unreleased
+
+### Before you update
+
+- **Add your association's name and key to the config,** under `[association]`, before you update. The update stops without them:
+
+  ```toml
+  [association]
+  name   = "Example Society"
+  key    = "example"
+  domain = "example.org"
+  ```
+
+  The key is short, lowercase letters, digits and single hyphens, such as your association's usual abbreviation. Tools will know your association by it, so **it can never change.** If you forgot, the update says so: add them, then run `kit update --finish`.
+
+### Tool versions
+
+- None changed.
+
+### Changes
+
+- feat: units, the tree of associations and teams (structure.md §1).
+  - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. Operators add teams, projects and associations inside it in the admin page, under Units. Board can see them.
+  - A unit's key is fixed once set and never reused. A project is archived by hand, which archives everything inside it.
+  - Nothing is visible to members yet, and nobody's access changes.
+  - `kit init` now asks for the association's name and key.
+
 ## 0.7.2 (2026-11-10)
 
 The update to 0.7.1 failed its last check on a fresh install. This fixes the check, and lets a failed update be finished without a rollback.

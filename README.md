@@ -15,7 +15,7 @@ curl -fsSLO https://github.com/kthindustrialsociety/sallskap/releases/latest/dow
 less install.sh            # it runs as root, so read it first
 bash install.sh --check    # changes nothing
 bash install.sh
-kit init example.org
+kit init example.org --name "Example Society" --key example
 ```
 
 ## Layout
@@ -23,7 +23,7 @@ kit init example.org
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
-| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, not built yet |
+| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units are in core |
 | `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `docs/updating.md` | What `kit update` does |
@@ -32,12 +32,12 @@ kit init example.org
 | `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
 | `kit/` | The `kit` CLI, in progress |
 | `systemd/` | The timer that takes a backup every night |
-| `core/` | Django: accounts, login and the admin page. Who sees what is set in `core/accounts/roles.py` |
+| `core/` | Django: accounts, login, the tree of associations and teams (`core/structure/`), and the admin page. Who sees what is set in `core/accounts/roles.py` |
 | `modules/website/` | Public sites and redirects |
 | `modules/git/` | Forgejo, with login through core |
 | `modules/vault/` | Vaultwarden, with login through core |
 | `modules/<name>/` | `chat`, `files` (planned) |
-| `tests/` | Tests for the kit, and `live_check.py` for a running server |
+| `tests/` | Tests for the kit, `live_check.py` for a running server, and `load_example.py` for a test server |
 
 ## Get people in
 
@@ -103,6 +103,13 @@ docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \
 ```
 
 `tests/live_check.py` checks a running server from the outside, and creates fake users, so don't run it on an installation with real members.
+
+Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams and projects, and **Example Federation**, with associations inside it. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page:
+
+```sh
+python3 tests/load_example.py society test.example.org               # the server's primary domain, to confirm
+python3 tests/load_example.py federation test.example.org --replace  # deletes every unit under the association first
+```
 
 ## License
 

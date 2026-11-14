@@ -70,11 +70,15 @@ It ends with `Done` and a count of warnings. Read any warnings: each one says wh
 
 **From here on, everything is done with `kit`,** the command the installer just added. Each job is a word after it: `kit init`, `kit admin`, `kit status`, and so on. `kit --help` lists them all, and `kit <command> --help` explains one. The guide never asks you to run Docker or edit files.
 
-## 3. Choose your domain
+## 3. Name your association and choose your domain
 
 ```sh
-kit init example.org
+kit init example.org --name "Example Society" --key example
 ```
+
+- **The name** is your association's, as people should see it. You can change it later in the config.
+- **The key** is a short name for it in lowercase letters, digits and hyphens, such as `example`. Tools know your association by it, so **it can never change.** Choose something you'll still be happy with in ten years, such as your association's usual abbreviation.
+- **The domain** is the one your association's services will live under, such as `app.example.org`.
 
 This creates the configuration and starts the login service, building it the first time, which takes a minute or two. It then lists the DNS records the server needs, with this server's address. The first time, each one shows as missing.
 

@@ -28,6 +28,7 @@ CONFIG = """\
 # keep this comment
 [association]
 name = "Example Society"
+key = "example"
 domain = "example.org"
 
 [mail]
@@ -75,7 +76,7 @@ class ParseConfig(unittest.TestCase):
         self.assertNotIn("www.example.org", kit.Site("example.org", www=False).redirects)
 
     def assert_refused(self, site_block: str, message: str):
-        text = '[association]\ndomain = "example.org"\n' + site_block
+        text = '[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n' + site_block
         with self.assertRaisesRegex(kit.KitError, message):
             kit.parse_config(text)
 
@@ -106,13 +107,31 @@ class ParseConfig(unittest.TestCase):
             self.assert_refused(f'[[website.sites]]\ndomain = "{bad}"\n', "valid lowercase")
 
     def test_refuses_a_mail_address_that_could_inject_config(self):
-        text = '[association]\ndomain = "a.org"\n[mail]\nfrom = "x@a.org\\n}"\n'
+        text = '[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[mail]\nfrom = "x@a.org\\n}"\n'
         with self.assertRaisesRegex(kit.KitError, "mail address"):
             kit.parse_config(text)
 
     def test_needs_a_primary_domain(self):
         with self.assertRaisesRegex(kit.KitError, "needs a domain"):
             kit.parse_config('[association]\nname = "x"\n')
+
+    def test_reads_the_associations_name_and_key(self):
+        config = kit.parse_config(CONFIG)
+        self.assertEqual((config.name, config.key), ("Example Society", "example"))
+
+    def test_name_and_key_can_be_missing_until_core_starts(self):
+        config = kit.parse_config('[association]\ndomain = "a.org"\n')
+        self.assertEqual((config.name, config.key), (None, None))
+
+    def test_refuses_a_bad_key(self):
+        for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', '"custom"', f'"{"x" * 41}"', "7"):
+            with self.subTest(key=key), self.assertRaisesRegex(kit.KitError, "isn't valid"):
+                kit.parse_config(f'[association]\nkey = {key}\ndomain = "a.org"\n')
+
+    def test_refuses_a_name_on_more_than_one_line(self):
+        for name in ('"two\\nlines"', '""', '"   "', f'"{"x" * 101}"', "7"):
+            with self.subTest(name=name), self.assertRaisesRegex(kit.KitError, "name must be"):
+                kit.parse_config(f'[association]\nname = {name}\ndomain = "a.org"\n')
 
     def test_reports_toml_errors_plainly(self):
         with self.assertRaisesRegex(kit.KitError, "syntax error"):
@@ -145,7 +164,7 @@ class RenderCaddyfile(unittest.TestCase):
 
     def test_spa_fallback_is_on_by_default_and_can_be_turned_off(self):
         self.assertIn("/index.html\n", self.text)
-        config = kit.parse_config('[association]\ndomain = "a.org"\n[[website.sites]]\ndomain = "a.org"\nspa = false\n')
+        config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[[website.sites]]\ndomain = "a.org"\nspa = false\n')
         self.assertNotIn("try_files", kit.render_caddyfile(config))
 
     def test_every_site_gets_the_defaults(self):
@@ -154,7 +173,7 @@ class RenderCaddyfile(unittest.TestCase):
         self.assertIn("encode zstd gzip", self.text)
 
     def test_renders_with_no_sites(self):
-        text = kit.render_caddyfile(kit.parse_config('[association]\ndomain = "a.org"\n'))
+        text = kit.render_caddyfile(kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n'))
         self.assertIn("(website_defaults)", text)
         self.assertNotIn("file_server", text.split("(website_defaults)")[0])
 
@@ -287,11 +306,18 @@ class Sites(unittest.TestCase):
 
     def test_init_creates_a_private_config_once(self):
         self.paths.config.unlink()
-        kit.init_config(self.paths, "example.org")
-        self.assertEqual(kit.load_config(self.paths).domain, "example.org")
+        kit.init_config(self.paths, "example.org", 'Example "Quoted" Sällskap', "example")
+        config = kit.load_config(self.paths)
+        self.assertEqual((config.domain, config.name, config.key), ("example.org", 'Example "Quoted" Sällskap', "example"))
         self.assertEqual(self.paths.config.stat().st_mode & 0o777, 0o600)
         with self.assertRaisesRegex(kit.KitError, "already exists"):
-            kit.init_config(self.paths, "example.org")
+            kit.init_config(self.paths, "example.org", "Example", "example")
+
+    def test_init_refuses_a_bad_key(self):
+        self.paths.config.unlink()
+        with self.assertRaisesRegex(kit.KitError, "isn't valid"):
+            kit.init_config(self.paths, "example.org", "Example", "Example Society")
+        self.assertFalse(self.paths.config.exists())
 
     def test_add_site_writes_config_and_folder(self):
         kit.add_site(self.paths, kit.Site("new.org", ("alias.org",)))
@@ -372,11 +398,43 @@ class Core(unittest.TestCase):
         kit.prepare_core(self.paths, self.config)
         key = re.search(r"DJANGO_SECRET_KEY=(.+)", self.paths.core_env.read_text()).group(1)
         signing_key = re.search(r"OIDC_SIGNING_KEY=(.+)", self.paths.core_env.read_text()).group(1)
-        kit.prepare_core(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        kit.prepare_core(self.paths, kit.parse_config('[association]\nname = "New"\nkey = "new"\ndomain = "new.org"\n'))
         text = self.paths.core_env.read_text()
         self.assertIn("SALLSKAP_DOMAIN=new.org\n", text)
         self.assertIn(f"DJANGO_SECRET_KEY={key}\n", text)
         self.assertIn(f"OIDC_SIGNING_KEY={signing_key}\n", text)
+
+    def test_core_gets_the_associations_name_and_key(self):
+        kit.prepare_core(self.paths, self.config)
+        root = self.paths.core_dir / "root.json"
+        self.assertEqual(json.loads(root.read_text()), {"name": "Example Society", "key": "example"})
+        self.assertEqual(root.stat().st_mode & 0o777, 0o644)  # core runs as its own user
+
+    def test_without_name_and_key_core_gets_neither(self):
+        old = kit.parse_config('[association]\ndomain = "example.org"\n')
+        kit.prepare_core(self.paths, old)  # the public sites need core's settings file, and carry on
+        self.assertFalse((self.paths.core_dir / "root.json").exists())
+        self.assertNotIn("SALLSKAP_ROOT_VERSION", self.paths.core_env.read_text())
+        with self.assertRaisesRegex(kit.KitError, "name and key under \\[association\\]"):
+            kit.require_name_and_key(self.paths, old)
+
+    def test_a_new_name_changes_cores_settings_so_it_starts_again(self):
+        kit.prepare_core(self.paths, self.config)
+        before = self.paths.core_env.read_text()
+        renamed = kit.parse_config(CONFIG.replace('name = "Example Society"', 'name = "Example Society, renamed"'))
+        kit.prepare_core(self.paths, renamed)
+        self.assertNotEqual(self.paths.core_env.read_text(), before)
+        self.assertEqual(json.loads((self.paths.core_dir / "root.json").read_text())["name"], "Example Society, renamed")
+
+    def test_a_changed_key_is_refused_and_core_keeps_the_old_one(self):
+        kit.prepare_core(self.paths, self.config)
+        before = self.paths.core_env.read_text()
+        changed = kit.parse_config(CONFIG.replace('key = "example"', 'key = "other"'))
+        with self.assertRaisesRegex(kit.KitError, "a key can't change"):
+            kit.require_name_and_key(self.paths, changed)
+        kit.prepare_core(self.paths, changed)
+        self.assertEqual(json.loads((self.paths.core_dir / "root.json").read_text())["key"], "example")
+        self.assertEqual(self.paths.core_env.read_text().split("SALLSKAP_ROOT_VERSION")[0], before.split("SALLSKAP_ROOT_VERSION")[0])
 
     def test_an_installation_from_before_the_login_service_gets_a_signing_key(self):
         self.paths.config_dir.mkdir()
@@ -417,7 +475,7 @@ class Docker(unittest.TestCase):
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         self.calls = []
         self.broken = ()  # services that fail to start
 
@@ -495,6 +553,12 @@ class Docker(unittest.TestCase):
         self.run_kit("apply")
         self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
 
+    def test_apply_without_name_and_key_starts_the_sites_and_not_core(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        code, _ = self.run_kit("apply")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.starts(), [["up", "-d", "caddy"]])
+
     def test_apply_only_rebuilds_when_asked(self):
         builds = lambda: [call for call in self.calls if call[-2:] == ["build", "core"]]  # noqa: E731
         self.run_kit("apply")
@@ -521,7 +585,7 @@ class Docker(unittest.TestCase):
 
     def test_init_shows_what_dns_is_needed(self):
         self.paths.config.unlink()
-        self.run_kit("init", "example.org")
+        self.run_kit("init", "example.org", "--name", "Example Society", "--key", "example")
         kit.status.assert_called_once()
 
     def test_admin_passes_on_only_what_was_asked_for(self):
@@ -584,7 +648,7 @@ class Modules(unittest.TestCase):
 
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('# keep this\n[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('# keep this\n[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         self.calls = []
         self.broken = ()
 
@@ -626,16 +690,16 @@ class Modules(unittest.TestCase):
         return [call for call in self.calls if any(part.endswith("demo/compose.yml") for part in call)]
 
     def test_config_lists_only_what_is_switched_on(self):
-        text = '[association]\ndomain = "a.org"\n[modules]\ndemo = true\nchat = false\n'
+        text = '[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[modules]\ndemo = true\nchat = false\n'
         self.assertEqual(kit.parse_config(text).modules, ("demo",))
 
     def test_config_refuses_a_module_that_does_not_exist(self):
         with self.assertRaisesRegex(kit.KitError, "no module called nope"):
-            kit.parse_config('[association]\ndomain = "a.org"\n[modules]\nnope = true\n')
+            kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[modules]\nnope = true\n')
 
     def test_config_refuses_something_other_than_true_or_false(self):
         with self.assertRaisesRegex(kit.KitError, "true or false"):
-            kit.parse_config('[association]\ndomain = "a.org"\n[modules]\ndemo = "yes"\n')
+            kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[modules]\ndemo = "yes"\n')
 
     def test_a_module_name_cannot_walk_out_of_the_modules_folder(self):
         code, out = self.run_kit("enable", "../../etc")
@@ -666,7 +730,7 @@ class Modules(unittest.TestCase):
 
     def test_a_module_hostname_is_reserved_even_when_it_is_off(self):
         with self.assertRaisesRegex(kit.KitError, "reserved"):
-            kit.parse_config('[association]\ndomain = "example.org"\n[[website.sites]]\ndomain = "demo.example.org"\n')
+            kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[[website.sites]]\ndomain = "demo.example.org"\n')
 
     def test_enable_starts_everything_in_order_then_runs_setup(self):
         code, _ = self.run_kit("enable", "demo")
@@ -802,7 +866,7 @@ class Modules(unittest.TestCase):
         self.assertNotIn("demo.example.org", self.paths.caddyfile.read_text())
 
     def test_disable_refuses_a_module_with_nothing_to_start(self):
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nwebsite = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\nwebsite = true\n')
         code, out = self.run_kit("disable", "website")
         self.assertEqual(code, 1)
         self.assertIn("nothing to start", out)
@@ -821,7 +885,7 @@ class GitSecrets(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git")
-        self.config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        self.config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
 
     def settings(self):
         return kit._read_env(self.paths.git_env)
@@ -859,7 +923,7 @@ class GitSecrets(unittest.TestCase):
         """A new key would make Forgejo's stored login secret and 2FA records unreadable."""
         kit.prepare_git(self.paths, self.config)
         before = self.settings()
-        kit.prepare_git(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        kit.prepare_git(self.paths, kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "new.org"\n'))
         after = self.settings()
         self.assertEqual(after["FORGEJO__server__DOMAIN"], "git.new.org")
         self.assertEqual(after["FORGEJO__security__SECRET_KEY"], before["FORGEJO__security__SECRET_KEY"])
@@ -890,7 +954,7 @@ class GitSetup(unittest.TestCase):
         patcher = mock.patch.object(kit.subprocess, "run", fake_run)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.config = kit.parse_config('[association]\ndomain = "kthis.example"\n')
+        self.config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "kthis.example"\n')
 
     def answer(self, command, body):
         line = " ".join(command)
@@ -1206,7 +1270,7 @@ class VaultSetup(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
-        self.config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        self.config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         self.calls = []
         self.tools = ""
         self.refuse = None
@@ -1350,13 +1414,13 @@ class VaultSetup(unittest.TestCase):
 
     def test_a_new_hostname_keeps_the_secret(self):
         kit.prepare_vault(self.paths, self.config)
-        kit.prepare_vault(self.paths, kit.parse_config('[association]\ndomain = "new.org"\n'))
+        kit.prepare_vault(self.paths, kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "new.org"\n'))
         self.assertEqual(self.settings()["DOMAIN"], "https://vault.new.org")
         self.assertEqual(self.settings()["SSO_CLIENT_SECRET"], "first-secret")
 
     def test_vaultwardens_address_is_a_service_so_no_site_can_take_it(self):
         with self.assertRaisesRegex(kit.KitError, "reserved"):
-            kit.parse_config('[association]\ndomain = "example.org"\n[[website.sites]]\ndomain = "vault.example.org"\n')
+            kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[[website.sites]]\ndomain = "vault.example.org"\n')
 
 
 class Status(unittest.TestCase):
@@ -1366,7 +1430,7 @@ class Status(unittest.TestCase):
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core")
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"203.0.113.1"
         for patcher in (
@@ -1458,7 +1522,7 @@ class Status(unittest.TestCase):
 
     def test_an_enabled_modules_hostname_is_checked(self):
         self.fake_module()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ndemo = true\n')
         code, out = self.run_status(set())
         self.assertEqual(code, 1)
         self.assertIn("Add this one: demo.example.org A 203.0.113.1", out)
@@ -1504,7 +1568,7 @@ class Backups(unittest.TestCase):
             backup_dir=base / "srv" / "backup",
         )
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ndemo = true\n')
         for folder in (self.paths.core_dir, self.paths.caddy_dir, self.paths.deploy_home, self.demo_data):
             folder.mkdir(parents=True)
 
@@ -1592,7 +1656,7 @@ class Backups(unittest.TestCase):
 
     def test_a_module_that_is_switched_off_still_gets_backed_up(self):
         """Disabling a module keeps its data, so a backup has to keep it too."""
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         self.assertEqual(self.config().modules, ())
         self.assertIn(self.demo_data, kit.backup_paths(self.paths, self.config()))
 
@@ -1797,7 +1861,7 @@ class Backups(unittest.TestCase):
 
     def test_a_target_is_set_up_once_and_then_copied_to(self):
         self.paths.config.write_text(
-            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{self.base / "away"}"\n[modules]\ndemo = true\n'
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{self.base / "away"}"\n[modules]\ndemo = true\n'
         )
         self.run_kit("backup")
         init_targets = [c for c in self.restic_calls("init") if str(self.base / "away") in c]
@@ -1812,7 +1876,7 @@ class Backups(unittest.TestCase):
     def test_a_target_is_read_as_a_restic_repository_and_nothing_else(self):
         for target in ("", 42, True):
             with self.subTest(target=target):
-                text = f'[association]\ndomain = "a.org"\n[backup]\ntarget = {json.dumps(target)}\n'
+                text = f'[association]\nname = "Example"\nkey = "example"\ndomain = "a.org"\n[backup]\ntarget = {json.dumps(target)}\n'
                 with self.assertRaisesRegex(kit.KitError, "must be a restic repository"):
                     kit.parse_config(text)
 
@@ -2095,7 +2159,7 @@ class Backups(unittest.TestCase):
         """restic puts back the numbers it saved, and this server's may differ."""
         self.run_kit("backup")
         self.paths.config.write_text(
-            '[association]\ndomain = "example.org"\n\n[[website.sites]]\ndomain = "example.org"\n'
+            '[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n\n[[website.sites]]\ndomain = "example.org"\n'
         )
         site = self.paths.site_dir("example.org")
         site.mkdir(parents=True)
@@ -2113,7 +2177,7 @@ class WorkerSettings(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
-        self.config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\nvault = true\nwebsite = true\n')
+        self.config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ngit = true\nvault = true\nwebsite = true\n')
 
     def settings(self):
         return kit._read_env(self.paths.sync_env)
@@ -2121,7 +2185,7 @@ class WorkerSettings(unittest.TestCase):
     def test_it_only_asks_modules_that_are_on_and_have_a_connector(self):
         kit._write_sync_env(self.paths, self.config)
         self.assertEqual(self.settings()["SYNC_MODULES"], "git,vault")
-        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n[modules]\nvault = true\n'))
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\nvault = true\n'))
         self.assertEqual(self.settings()["SYNC_MODULES"], "vault")
 
     def test_it_is_private(self):
@@ -2153,7 +2217,7 @@ class WorkerSettings(unittest.TestCase):
 
     def test_turning_a_module_off_stops_asking_it_and_keeps_its_token(self):
         kit._write_sync_env(self.paths, self.config, FORGEJO_ADMIN_TOKEN="the-token")
-        kit._write_sync_env(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n'))
+        kit._write_sync_env(self.paths, kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n'))
         self.assertEqual(self.settings()["SYNC_MODULES"], "")
         self.assertEqual(self.settings()["FORGEJO_ADMIN_TOKEN"], "the-token")
 
@@ -2179,7 +2243,7 @@ class Emergency(unittest.TestCase):
         base = Path(self._tmp.name)
         self.paths = kit.Paths(base / "etc", base / "srv", base / "home", base / "core", base / "git", base / "vault")
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\nvault = true\ngit = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\nvault = true\ngit = true\n')
         self.calls = []
         self.running = False
 
@@ -2300,7 +2364,7 @@ class Emergency(unittest.TestCase):
 
     def test_status_says_so_even_with_the_module_off(self):
         self.run_kit("emergency", "vault")
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         address = lambda *args, **kwargs: io.BytesIO(b"203.0.113.1")
         with mock.patch.object(kit, "_resolve_ipv4", return_value={"203.0.113.1"}), mock.patch.object(kit.urllib.request, "urlopen", address):
             _, out = self.run_kit("status")
@@ -2311,7 +2375,7 @@ class Emergency(unittest.TestCase):
             self.assertIsNone(kit._vault_emergency_address())
 
     def test_it_refuses_a_module_thats_off(self):
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         for args in (("emergency", "vault"), ("emergency", "git", "someone")):
             with self.subTest(args):
                 code, out = self.run_kit(*args)
@@ -2530,21 +2594,21 @@ class Packaging(unittest.TestCase):
             self.assertIn(setting, text)
 
     def test_the_git_module_is_routed_to_forgejo(self):
-        config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ngit = true\n')
         block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}")[0]
         self.assertIn("reverse_proxy forgejo:3000", block)
         self.assertIn("Strict-Transport-Security", block)
         self.assertIn("-Server", block)
 
     def test_opening_forgejo_goes_straight_to_the_login_service(self):
-        config = kit.parse_config('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ngit = true\n')
         block = kit.render_caddyfile(config).split("git.example.org {\n")[1].split("\n}\n")[0]
         self.assertIn("redir @sign_in /user/oauth2/example?{query} 302", block)
         self.assertNotIn("__SHORT_NAME__", block)
 
     def test_the_login_it_goes_to_is_the_one_setup_creates(self):
         """The address in Caddy and the login source's name have to be the same."""
-        config = kit.parse_config('[association]\ndomain = "example.org"\n')
+        config = kit.parse_config('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n')
         self.assertEqual(config.short_name, "example")
         self.assertIn("org = config.short_name", (ROOT / "kit" / "kit.py").read_text())
 

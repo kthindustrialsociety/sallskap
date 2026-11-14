@@ -54,7 +54,7 @@ class RealRestic(unittest.TestCase):
             backup_dir=base / "srv" / "backup",
         )
         self.paths.config_dir.mkdir(parents=True)
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ndemo = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ndemo = true\n')
         for folder in (self.paths.core_dir, self.paths.caddy_dir, self.paths.deploy_home, self.demo_data):
             folder.mkdir(parents=True)
         (self.paths.core_dir / "db.sqlite3").write_text(SECRET)
@@ -236,7 +236,7 @@ class RealRestic(unittest.TestCase):
         thing here: sftp: and s3: differ only in how restic reaches them."""
         target = self.base / "off-server"
         self.paths.config.write_text(
-            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
         )
         code, out = self.run_kit("backup")
         self.assertEqual(code, 0, out)
@@ -256,7 +256,7 @@ class RealRestic(unittest.TestCase):
         them. A folder stands in for sftp: here; restic reaches both the same way."""
         target = self.base / "off-server"
         self.paths.config.write_text(
-            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
         )
         self.run_kit("backup")
         password = kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
@@ -283,7 +283,7 @@ class RealRestic(unittest.TestCase):
     def test_a_second_run_copies_only_what_the_target_lacks(self):
         target = self.base / "off-server"
         self.paths.config.write_text(
-            f'[association]\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
         )
         self.run_kit("backup")
         _, out = self.run_kit("backup")

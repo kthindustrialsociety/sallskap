@@ -343,7 +343,7 @@ start_core() {
   step "Starting Sällskap"
   if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     say "  The server is ready. Next, set your primary domain, as in step 3 of docs/installing.md:"
-    say "    kit init example.org"
+    say "    kit init example.org --name \"Example Society\" --key example"
     return
   fi
   kit apply --build
