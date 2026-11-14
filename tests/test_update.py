@@ -59,7 +59,7 @@ class UpdateBase(unittest.TestCase):
             backup_dir=self.base / "srv" / "backup",
         )
         self.paths.config_dir.mkdir()
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        self.paths.config.write_text('[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[modules]\ngit = true\n')
         self.paths.backup_env.write_text("RESTIC_PASSWORD=secret\n")
         (self.paths.repo).mkdir(parents=True)
         (self.paths.repo / "config").write_text("")

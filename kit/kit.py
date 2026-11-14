@@ -48,6 +48,16 @@ HOSTNAME = re.compile(
 
 
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[a-z0-9.-]+")
+# The association's key: the same rule as KEY in core/structure/models.py. It's the
+# root unit's, so it ends up in every tool, and it can't change once set.
+UNIT_KEY = re.compile(r"[a-z]([a-z0-9-]{0,38}[a-z0-9])?")
+RESERVED_KEYS = {"custom"}
+NEEDS_NAME_AND_KEY = (
+    "The config file needs the association's name and key under [association], such as\n\n"
+    '  name = "Example Society"\n  key  = "example"\n\n'
+    "The key is short, lowercase, and fixed for good: tools know the association by it. "
+    "Add both to {config}, then run this again."
+)
 
 
 class KitError(Exception):
@@ -132,6 +142,8 @@ class Config:
     sites: tuple[Site, ...] = field(default_factory=tuple)
     modules: tuple[str, ...] = ()
     backup_target: str | None = None
+    name: str | None = None  # needed before core starts: see require_name_and_key
+    key: str | None = None
 
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
@@ -187,6 +199,7 @@ def parse_config(text: str) -> Config:
     if primary is None:
         raise KitError("The config file needs a domain under [association].")
     primary = _check_hostname(primary, "Primary domain")
+    root_name, root_key = _check_name_and_key(raw["association"].get("name"), raw["association"].get("key"))
 
     sites = []
     for entry in raw.get("website", {}).get("sites", []):
@@ -223,6 +236,8 @@ def parse_config(text: str) -> Config:
         tuple(sites),
         tuple(n for n, enabled in modules.items() if enabled),
         target.strip() if isinstance(target, str) else None,
+        root_name,
+        root_key,
     )
 
     seen = set()
@@ -234,6 +249,26 @@ def parse_config(text: str) -> Config:
             raise KitError(f"{name} is reserved for a service.")
         seen.add(name)
     return config
+
+
+def _check_name_and_key(name, key) -> tuple[str | None, str | None]:
+    if name is not None:
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100 or any(ord(c) < 32 for c in name):
+            raise KitError("Under [association], name must be the association's name, on one line, at most 100 characters.")
+        name = name.strip()
+    if key is not None:
+        if not isinstance(key, str) or not UNIT_KEY.fullmatch(key) or "--" in key or key in RESERVED_KEYS:
+            raise KitError(
+                f"Under [association], the key {key!r} isn't valid. Use lowercase letters, digits and single hyphens, "
+                "starting with a letter and ending with a letter or digit, at most 40 characters, such as \"example\"."
+            )
+    return name, key
+
+
+def require_name_and_key(paths: Paths, config: Config) -> None:
+    """Older configs have neither, and core can't start without them."""
+    if not config.name or not config.key:
+        raise KitError(NEEDS_NAME_AND_KEY.format(config=paths.config))
 
 
 def load_config(paths: Paths) -> Config:
@@ -299,11 +334,12 @@ def set_module(text: str, name: str, enabled: bool) -> str:
     return "".join(lines)
 
 
-def init_config(paths: Paths, domain: str) -> None:
+def init_config(paths: Paths, domain: str, name: str, key: str) -> None:
     """Create the first config. The setup wizard will do this through a browser."""
     if paths.config.exists():
         raise KitError(f"{paths.config} already exists.")
-    text = f'[association]\ndomain = "{_check_hostname(domain, "Primary domain")}"\n'
+    name, key = _check_name_and_key(name, key)
+    text = f'[association]\nname   = {json.dumps(name, ensure_ascii=False)}\nkey    = "{key}"\ndomain = "{_check_hostname(domain, "Primary domain")}"\n'
     parse_config(text)
     _write_atomic(paths.config, text, 0o600)
 
@@ -408,6 +444,7 @@ def prepare_core(paths: Paths, config: Config) -> None:
     """Give core its folder and settings. The secrets are made once and then kept:
     a new secret key would log everyone out and cancel every password link, and
     a new signing key would make every tool stop trusting the login service."""
+    require_name_and_key(paths, config)
     current = _read_env(paths.core_env)
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
     signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
@@ -418,6 +455,11 @@ def prepare_core(paths: Paths, config: Config) -> None:
     paths.core_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.core_dir, CORE_UID, CORE_UID)
+    # Core creates the association's root unit from these, and keeps its name in step.
+    root = json.dumps({"name": config.name, "key": config.key}, ensure_ascii=False) + "\n"
+    root_file = paths.core_dir / "root.json"
+    if not root_file.exists() or root_file.read_text("utf-8") != root:
+        _write_atomic(root_file, root, 0o644)
     _write_sync_env(paths, config)
 
 
@@ -1886,8 +1928,8 @@ def finish_update(paths: Paths) -> int:
     if not state or state.get("result") not in (None, "failed"):
         raise KitError("There's no update waiting to be finished.")
     print("Starting the new version. Core updates its database as it starts.")
-    config = load_config(paths)
     try:
+        config = load_config(paths)  # here, so a config the new version refuses can be fixed and finished
         apply(paths)
         problems = after_update_problems(paths, config)
     except KitError as error:
@@ -2294,7 +2336,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kit", description="Operate a Sällskap installation.")
     parser.add_argument("--version", action=_ShowVersion, help="show which release this is")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init", help="create the first config").add_argument("domain", help="the primary domain")
+    init = commands.add_parser("init", help="create the first config")
+    init.add_argument("domain", help="the primary domain")
+    init.add_argument("--name", required=True, help='the association\'s name, such as "Example Society"')
+    init.add_argument("--key", required=True, help="a short, lowercase key for it, such as example. Tools know it by this, and it can't change later")
     apply_command = commands.add_parser("apply", help="start the containers and switch to the current web server config")
     apply_command.add_argument("--build", action="store_true", help="rebuild core first, after its code has changed")
     admin = commands.add_parser("admin", help="create the first admin, or restore someone's Operator access")
@@ -2391,7 +2436,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["COMPOSE_IGNORE_ORPHANS"] = "true"
     try:
         if args.command == "init":
-            init_config(paths, args.domain)
+            init_config(paths, args.domain, args.name, args.key)
             apply(paths)
             print(f"Created {paths.config}.\n")
             status(paths)
