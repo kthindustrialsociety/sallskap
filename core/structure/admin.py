@@ -1,6 +1,7 @@
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
+from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
@@ -11,6 +12,12 @@ class UnitForm(forms.ModelForm):
     class Meta:
         model = Unit
         fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        parent = self.fields.get("parent")
+        if parent is not None and self.instance.parent_id:  # which may be archived, with this unit
+            parent.queryset = Unit.objects.filter(models.Q(archived_at__isnull=True) | models.Q(pk=self.instance.parent_id))
 
     def clean(self):
         cleaned = super().clean()
@@ -94,7 +101,7 @@ class UnitAdmin(admin.ModelAdmin):
 
     def _each(self, request, queryset, method, done_message):
         done = 0
-        for unit in queryset:
+        for unit in queryset.order_by("path"):  # from the top, so a team comes back after the one above it
             try:
                 getattr(unit, method)()
                 done += 1

@@ -10,6 +10,7 @@ import base64
 import contextlib
 import fcntl
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -266,9 +267,23 @@ def _check_name_and_key(name, key) -> tuple[str | None, str | None]:
 
 
 def require_name_and_key(paths: Paths, config: Config) -> None:
-    """Older configs have neither, and core can't start without them."""
+    """Before core starts. Older configs have neither, and a key can't change, as tools
+    know the association by it. Core refuses a changed key too, but only as it starts."""
     if not config.name or not config.key:
         raise KitError(NEEDS_NAME_AND_KEY.format(config=paths.config))
+    given = _root_given_to_core(paths)
+    if given and given.get("key") != config.key:
+        raise KitError(
+            f"The config says key = {config.key!r} under [association], but the association's key is {given.get('key')!r}, "
+            f"and a key can't change: tools know the association by it. Put key = {given.get('key')!r} back in {paths.config}."
+        )
+
+
+def _root_given_to_core(paths: Paths) -> dict | None:
+    try:
+        return json.loads((paths.core_dir / "root.json").read_text("utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def load_config(paths: Paths) -> Config:
@@ -443,22 +458,31 @@ def _read_env(path: Path) -> dict[str, str]:
 def prepare_core(paths: Paths, config: Config) -> None:
     """Give core its folder and settings. The secrets are made once and then kept:
     a new secret key would log everyone out and cancel every password link, and
-    a new signing key would make every tool stop trusting the login service."""
-    require_name_and_key(paths, config)
+    a new signing key would make every tool stop trusting the login service.
+
+    Core creates the association's root unit from the config's name and key, which it
+    reads from root.json as it starts. They're left out until the config has both and
+    the key is unchanged: apply refuses to start core before then (require_name_and_key),
+    while the public sites carry on."""
     current = _read_env(paths.core_env)
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
     signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
     text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\nOIDC_SIGNING_KEY={signing_key}\n"
+    root = None
+    with contextlib.suppress(KitError):
+        require_name_and_key(paths, config)
+        root = json.dumps({"name": config.name, "key": config.key}, ensure_ascii=False) + "\n"
+        # Core only reads root.json as it starts. With this in its settings, a new name
+        # changes them, so Compose starts core again, and the name follows at once.
+        text += f"SALLSKAP_ROOT_VERSION={hashlib.sha256(root.encode()).hexdigest()[:16]}\n"
     if not paths.core_env.exists() or paths.core_env.read_text("utf-8") != text:
         _write_atomic(paths.core_env, text, 0o600)
 
     paths.core_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.geteuid() == 0:
         os.chown(paths.core_dir, CORE_UID, CORE_UID)
-    # Core creates the association's root unit from these, and keeps its name in step.
-    root = json.dumps({"name": config.name, "key": config.key}, ensure_ascii=False) + "\n"
     root_file = paths.core_dir / "root.json"
-    if not root_file.exists() or root_file.read_text("utf-8") != root:
+    if root and (not root_file.exists() or root_file.read_text("utf-8") != root):
         _write_atomic(root_file, root, 0o644)
     _write_sync_env(paths, config)
 
@@ -523,6 +547,7 @@ def apply(paths: Paths, build: bool = False) -> None:
     still have to hear about changes."""
     print("Starting the web server.")
     apply_web(paths)
+    require_name_and_key(paths, load_config(paths))
     if build or not _have_image(core_image()):
         print("Building the login service. The first time, this takes a minute or two.")
         subprocess.run(_compose("build", "core"), check=True)

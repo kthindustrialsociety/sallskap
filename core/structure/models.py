@@ -7,7 +7,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.validators import RegexValidator
 from django.db import models, transaction
-from django.db.models.signals import m2m_changed, pre_delete
+from django.db.models.signals import m2m_changed
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -174,8 +174,24 @@ class Unit(models.Model):
             elif parent is not None and parent.path.startswith(target.path):
                 problems.append(_("A service is run for another association, not its own or one it sits inside."))
 
+        if stored and parent is not None and stored.parent_id != parent.pk:
+            problems += self._problems_after_moving(stored, parent.path + self.key + "/")
+
         if problems:
             raise ValidationError(problems)
+
+    def _problems_after_moving(self, stored, new_path):
+        """Moving a unit moves everything under it, so a team in there can end up inside
+        the association it's run for, or one taking part in it."""
+        problems = []
+        moved = Unit.objects.filter(path__startswith=stored.path).filter(models.Q(run_for__isnull=False) | models.Q(taking_part__isnull=False)).distinct()
+        for team in moved.select_related("run_for").prefetch_related("taking_part"):
+            team_path = new_path + team.path[len(stored.path):]
+            targets = ([team.run_for] if team.run_for_id and team.pk != self.pk else []) + list(team.taking_part.all())
+            for target in targets:
+                if team_path.startswith(target.path):
+                    problems.append(_("After the move, %(team)s would sit inside %(target)s, which it's run for or which takes part in it.") % {"team": team, "target": target})
+        return problems
 
     @staticmethod
     def check_taking_part(team_kind, parent, associations):
@@ -241,11 +257,6 @@ class Unit(models.Model):
         return super().delete(*args, **kwargs)
 
 
-@receiver(pre_delete, sender=Unit)
-def _refuse_deleting(sender, instance, **kwargs):
-    instance.check_can_delete()  # also when Django deletes it as part of something else
-
-
 @receiver(m2m_changed, sender=Unit.taking_part.through)
 def _check_taking_part(sender, instance, action, reverse, pk_set, **kwargs):
     if action != "pre_add":
@@ -258,13 +269,18 @@ def _check_taking_part(sender, instance, action, reverse, pk_set, **kwargs):
         Unit.check_taking_part(instance.kind, instance.parent, added)
 
 
-def ensure_root(using="default", **kwargs):
+def ensure_root(using="default", apps=None, **kwargs):
     """Create the root from the config, which kit passes on in root.json, or keep its
     name in step. Runs after every migrate. Stops core from starting if the config's key
     differs from the root's, as a key never changes."""
     config = settings.SALLSKAP_ROOT
     if not config:
         return
+    if apps is not None:
+        try:
+            apps.get_model("structure", "Unit")
+        except LookupError:  # migrated back to before units existed
+            return
     name, key = config["name"], config["key"]
     try:
         validate_key(key)

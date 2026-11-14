@@ -169,6 +169,15 @@ class RootFromConfig(TestCase):
         with self.assertRaises(IntegrityError), transaction.atomic():
             Unit.objects.bulk_create([Unit(kind=TEAM, key="lonely", name="Lonely", path="/lonely/")])
 
+    @override_settings(SALLSKAP_ROOT={"name": "Example", "key": "example"})
+    def test_migrating_back_to_before_units_skips_the_root(self):
+        class Before:
+            def get_model(self, app, model):
+                raise LookupError(model)
+
+        ensure_root(apps=Before())
+        self.assertFalse(Unit.objects.exists())
+
     @override_settings(SALLSKAP_ROOT=None)
     def test_without_a_config_there_is_no_root(self):
         ensure_root()
@@ -376,6 +385,19 @@ class RunFor(Tree):
         with self.assertRaises(ValidationError):
             association("physics", self.root, run_for=self.chemistry)
 
+    def test_moving_cannot_put_a_service_inside_the_association_it_is_run_for(self):
+        team("chemistry-website", self.robotics, run_for=self.chemistry)
+        self.robotics.parent = self.chemistry
+        with self.assertRaises(ValidationError):
+            self.robotics.save()
+
+    def test_moving_cannot_put_a_team_inside_an_association_taking_part(self):
+        self.development.taking_part.add(self.chemistry)
+        operations = team("operations", self.chemistry)
+        self.development.parent = operations
+        with self.assertRaises(ValidationError):
+            self.development.save()
+
     def test_ending_the_arrangement(self):
         website = team("chemistry-website", self.robotics, run_for=self.chemistry)
         website.run_for = None
@@ -504,6 +526,28 @@ class AdminPage(TestCase):
         self.client.post(changelist, {"action": "unarchive", "_selected_action": [project.pk]})
         project.refresh_from_db()
         self.assertFalse(project.archived)
+
+    def test_a_team_inside_an_archived_one_can_still_be_edited(self):
+        self.enter("operator")
+        project = team("hackathon", self.root, end_date=date(2027, 4, 1))
+        catering = team("catering", project)
+        project.archive()
+        url = reverse("admin:structure_unit_change", args=[catering.pk])
+        response = self.client.post(url, self.form(key="catering", name="Food", parent=project.pk))
+        self.assertEqual(response.status_code, 302)
+        catering.refresh_from_db()
+        self.assertEqual(catering.name, "Food")
+
+    def test_bringing_back_a_team_and_the_one_above_it_together(self):
+        self.enter("operator")
+        zeta = team("zeta", self.root)
+        alpha = team("alpha", zeta)
+        zeta.archive()
+        changelist = reverse("admin:structure_unit_changelist")
+        self.client.post(changelist + "?o=2", {"action": "unarchive", "_selected_action": [alpha.pk, zeta.pk]})
+        alpha.refresh_from_db()
+        zeta.refresh_from_db()
+        self.assertFalse(alpha.archived or zeta.archived)
 
     def test_the_list_is_a_tree(self):
         self.enter("operator")

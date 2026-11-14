@@ -410,10 +410,31 @@ class Core(unittest.TestCase):
         self.assertEqual(json.loads(root.read_text()), {"name": "Example Society", "key": "example"})
         self.assertEqual(root.stat().st_mode & 0o777, 0o644)  # core runs as its own user
 
-    def test_a_config_without_name_and_key_stops_before_anything_is_written(self):
+    def test_without_name_and_key_core_gets_neither(self):
+        old = kit.parse_config('[association]\ndomain = "example.org"\n')
+        kit.prepare_core(self.paths, old)  # the public sites need core's settings file, and carry on
+        self.assertFalse((self.paths.core_dir / "root.json").exists())
+        self.assertNotIn("SALLSKAP_ROOT_VERSION", self.paths.core_env.read_text())
         with self.assertRaisesRegex(kit.KitError, "name and key under \\[association\\]"):
-            kit.prepare_core(self.paths, kit.parse_config('[association]\ndomain = "example.org"\n'))
-        self.assertFalse(self.paths.core_env.exists())
+            kit.require_name_and_key(self.paths, old)
+
+    def test_a_new_name_changes_cores_settings_so_it_starts_again(self):
+        kit.prepare_core(self.paths, self.config)
+        before = self.paths.core_env.read_text()
+        renamed = kit.parse_config(CONFIG.replace('name = "Example Society"', 'name = "Example Society, renamed"'))
+        kit.prepare_core(self.paths, renamed)
+        self.assertNotEqual(self.paths.core_env.read_text(), before)
+        self.assertEqual(json.loads((self.paths.core_dir / "root.json").read_text())["name"], "Example Society, renamed")
+
+    def test_a_changed_key_is_refused_and_core_keeps_the_old_one(self):
+        kit.prepare_core(self.paths, self.config)
+        before = self.paths.core_env.read_text()
+        changed = kit.parse_config(CONFIG.replace('key = "example"', 'key = "other"'))
+        with self.assertRaisesRegex(kit.KitError, "a key can't change"):
+            kit.require_name_and_key(self.paths, changed)
+        kit.prepare_core(self.paths, changed)
+        self.assertEqual(json.loads((self.paths.core_dir / "root.json").read_text())["key"], "example")
+        self.assertEqual(self.paths.core_env.read_text().split("SALLSKAP_ROOT_VERSION")[0], before.split("SALLSKAP_ROOT_VERSION")[0])
 
     def test_an_installation_from_before_the_login_service_gets_a_signing_key(self):
         self.paths.config_dir.mkdir()
@@ -531,6 +552,12 @@ class Docker(unittest.TestCase):
     def test_apply_starts_caddy_then_waits_for_core(self):
         self.run_kit("apply")
         self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
+
+    def test_apply_without_name_and_key_starts_the_sites_and_not_core(self):
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
+        code, _ = self.run_kit("apply")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.starts(), [["up", "-d", "caddy"]])
 
     def test_apply_only_rebuilds_when_asked(self):
         builds = lambda: [call for call in self.calls if call[-2:] == ["build", "core"]]  # noqa: E731
