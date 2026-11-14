@@ -19,13 +19,17 @@ Example Federation              association, the root
          └─ Drone race 2027     team, a project
 ```
 
-- **The root is the installation's association,** and the legal entity. Most installations have no other associations: a root with teams under it.
+- **The root is the installation's association,** and the legal entity. Most installations have no other associations: a root with teams under it. It's created from `name` and `key` under `[association]` in the config, follows the config's name, and can't be moved, archived or deleted.
 - **A federation is an association with associations under it.** There's no separate kind. KTHIS, for example, is the root, with its societies under it.
 - **Any depth is allowed.** Pages are designed for the usual two or three levels.
-- **Projects and services are both teams.** A project has an end date and a service doesn't. When a project ends, it's archived: everyone's access through it ends, and its history is kept.
+- **Projects and services are both teams.** A project has an end date and a service doesn't. When a project is over, someone archives it by hand, as projects rarely end exactly on their date: everyone's access through it ends, and its history is kept. Archiving a team archives everything under it. Taking a team out of the archive brings back that team alone, and only if the unit above it isn't archived.
 - **Teams can contain teams,** to any depth. That's how an association splits into departments, such as Operations and Development, which have teams of their own, which have projects.
 - **Each unit has a fixed key,** such as `robotics`, unique in the installation, plus a name, a description, and its own logo and colours if it wants them. Renaming a unit never changes its key, so it never changes anyone's access.
-- **A team can involve other associations.** It has one owning unit, which appoints its lead, and a list of associations taking part.
+  - A key is lowercase letters, digits and single hyphens, starts with a letter, ends with a letter or digit, and is at most 40 characters, so every tool can use it as a name.
+  - It can't be changed once set, and it's never reused, even after its unit is archived. `custom` is reserved, as tools already see groups made by hand as `custom:<name>`.
+- **Nothing is created or moved under an archived unit,** an association sits only under an association, and a unit can't end up under itself.
+- **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3), current or ended. Otherwise it's archived.
+- **A team can involve other associations.** The unit it sits under owns it and appoints its lead. It also has a list of the other associations taking part.
 - **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's head (§4) can end the arrangement.
 
 ## 2. People
