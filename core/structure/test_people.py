@@ -119,6 +119,16 @@ class Accounts(Tree):
         addresses = dict(user.person.emails.values_list("address", "verified_at"))
         self.assertEqual(set(addresses), {"ada@example.org", "ada@example.net"})
         self.assertIsNotNone(addresses["ada@example.net"])
+        self.assertIsNone(addresses["ada@example.org"])  # kept, but no longer vouched for
+
+    def test_an_old_login_address_can_go_to_someone_else(self):
+        # Such as a role's shared address, passed on to the next holder.
+        first = User.objects.create_user("chair@example.org")
+        first.email = "first@example.org"
+        first.save()
+        second = User.objects.create_user("chair@example.org")
+        self.assertNotEqual(second.person, first.person)
+        self.assertIsNotNone(second.person.emails.get(address="chair@example.org").verified_at)
 
     def test_a_login_address_another_account_holds_is_refused(self):
         other = User.objects.create_user("bo@example.org")

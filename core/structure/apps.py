@@ -17,6 +17,7 @@ def _account_saving(sender, instance, raw=False, update_fields=None, **kwargs):
     if problem:
         raise ValidationError(problem)
     stored = sender.objects.filter(pk=instance.pk).values("email", "name").first() if instance.pk else None
+    instance._old_address = stored["email"] if stored else None
     instance._relink = (
         stored is None
         or stored["email"] != instance.email
@@ -30,7 +31,7 @@ def _account_saved(sender, instance, raw=False, **kwargs):
         from .models import link_account
 
         instance._relink = False
-        link_account(instance)
+        link_account(instance, old_address=getattr(instance, "_old_address", None))
 
 
 def _account_deleting(sender, instance, **kwargs):

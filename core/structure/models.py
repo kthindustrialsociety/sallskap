@@ -528,11 +528,13 @@ def account_address_problem(user):
 
 
 @transaction.atomic
-def link_account(user):
+def link_account(user, old_address=None):
     """Gives an account its person, and its login address verified there. An account
     for an address a person without one already holds verified joins that person. Runs
     after an account is saved with a new address or name: see apps.py, which also
-    checks account_address_problem before the account is written."""
+    checks account_address_problem before the account is written. An old login address
+    stays on the person, unverified: it was only vouched for as the login address, and
+    it can go to someone else, such as a role's shared address."""
     person = Person.objects.filter(user=user).first()
     holder = EmailAddress.objects.filter(address=user.email, verified_at__isnull=False).select_related("person").first()
     if person is None:
@@ -549,6 +551,8 @@ def link_account(user):
         Person.objects.filter(pk=person.pk).update(name=user.name)
     if holder is not None and holder.person_id != person.pk:
         person = Person.merge(person, holder.person)
+    if old_address and old_address != user.email:
+        person.emails.filter(address=old_address).update(verified_at=None)
     address, _created = EmailAddress.objects.get_or_create(person=person, address=user.email)
     if address.verified_at is None:
         address.verified_at = timezone.now()
