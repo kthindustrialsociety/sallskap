@@ -64,10 +64,12 @@ def main(argv=None):
     if result.returncode:
         sys.exit(f"Nothing was loaded: {result.stderr.strip() or result.stdout.strip()}")
     loaded = json.loads(result.stdout.strip().splitlines()[-1])
-    if loaded["grants"]:
-        print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association, {loaded['people']} people and {loaded['grants']} grants. See them in the admin page, under Units, People and Grants.")
-    else:
-        print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association and {loaded['people']} people. See them in the admin page, under Units and People.")
+    parts = [f"{loaded['units']} units under the association", f"{loaded['people']} people"]
+    pages = ["Units", "People"]
+    if loaded["grants"]:  # none in Example Society, where grants stay out of sight
+        parts.append(f"{loaded['grants']} grants")
+        pages.append("Grants")
+    print(f"Loaded Example {args.example.title()}: {', '.join(parts[:-1])} and {parts[-1]}. See them in the admin page, under {', '.join(pages[:-1])} and {pages[-1]}.")
 
 
 if __name__ == "__main__":

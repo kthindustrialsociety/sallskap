@@ -745,13 +745,20 @@ class Position(Tie):
         names = ", ".join(str(association) for association in needed)
         return _("Only a member can be %(role)s here: %(person)s isn't a member of %(names)s on %(day)s.") % {"role": self.get_role_display(), "person": self.person, "names": names, "day": on}
 
+    @classmethod
+    def role_problem(cls, role, unit):
+        """Why this role can't sit in this unit, or None: for positions and grants alike."""
+        if role in cls.BOARD_ROLES and unit.kind != Unit.Kind.ASSOCIATION:
+            return _("A board role sits in an association. %(unit)s is a team.") % {"unit": unit}
+        if role in cls.TEAM_ROLES and unit.kind != Unit.Kind.TEAM:
+            return _("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": unit}
+        return None
+
     def problems(self):
         problems = super().problems()
         unit = self.unit
-        if self.role in self.BOARD_ROLES and unit.kind != Unit.Kind.ASSOCIATION:
-            problems.append(_("A board role sits in an association. %(unit)s is a team.") % {"unit": unit})
-        if self.role in self.TEAM_ROLES and unit.kind != Unit.Kind.TEAM:
-            problems.append(_("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": unit})
+        if problem := self.role_problem(self.role, unit):
+            problems.append(problem)
         stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
         if stored is None and unit.archived:
             problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
@@ -880,19 +887,20 @@ class Grant(Tie):
         return ("held_in_id", "unit_id", "given_by_id")
 
     def problems(self):
-        from .authority import can
+        from .authority import ONLY_IN, can
 
         problems = super().problems()
         held_in = self.held_in
-        if self.role in Position.BOARD_ROLES and held_in.kind != Unit.Kind.ASSOCIATION:
-            problems.append(_("A board role sits in an association. %(unit)s is a team.") % {"unit": held_in})
-        if self.role in Position.TEAM_ROLES and held_in.kind != Unit.Kind.TEAM:
-            problems.append(_("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": held_in})
+        if problem := Position.role_problem(self.role, held_in):
+            problems.append(problem)
         stored = Grant.objects.filter(pk=self.pk).first() if self.pk else None
         if stored is None:
             for unit in {held_in, self.unit}:
                 if unit.archived:
                     problems.append(_("%(unit)s is archived, so nothing new is given in it.") % {"unit": unit})
+            covered = Unit.objects.filter(path__startswith=self.unit.path) if self.include_below else Unit.objects.filter(pk=self.unit_id)
+            if self.permission in ONLY_IN and not covered.filter(ONLY_IN[self.permission]).exists():
+                problems.append(_("%(permission)s means nothing in any unit this grant covers, so it would give nothing. Memberships, for one, are only of associations.") % {"permission": self.get_permission_display()})
         if not problems and self.start and (stored is None or stored.start != self.start):
             if not can(self.given_by, Permission.GIVE_GRANTS, self.unit, on=self.start):
                 problems.append(_("%(person)s couldn't give grants in %(unit)s on %(day)s: only a chair or vice chair with authority there can.") % {"person": self.given_by, "unit": self.unit, "day": self.start})

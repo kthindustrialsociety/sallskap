@@ -10,7 +10,7 @@ from operator import or_
 
 from django.db.models import Q
 
-from .models import GRANTABLE, Grant, Permission, Position, Unit, _today
+from .models import GRANTABLE, Grant, Permission, Position, Tie, Unit, _today
 
 P = Permission
 R = Position.Role
@@ -48,9 +48,10 @@ ONLY_IN = {
 
 
 def _reach(person, permission, on):
-    """(scope, unit) for each current position or grant giving the person this permission.
-    A position in an archived unit gives nothing, and nor does a grant to it."""
-    positions = list(Position.objects.current(on).filter(person=person, unit__archived_at__isnull=True).select_related("unit"))
+    """(scope, unit) for each position or grant giving the person this permission on that
+    day. A position in a unit archived by then gives nothing, and nor does a grant to it."""
+    not_archived = Q(unit__archived_at__isnull=True) | Q(unit__archived_at__date__gt=on)
+    positions = list(Position.objects.current(on).filter(not_archived, person=person).select_related("unit"))
     for position in positions:
         for given, scope in ROLES[position.role]:
             if given == permission:
@@ -76,7 +77,9 @@ def _units(scope, unit):
 
 def units_where(person, permission, on=None):
     """Every unit where the person has this permission on that day, today if not given:
-    for lists, such as the members someone can see, which can't ask can() unit by unit."""
+    for lists, such as the members someone can see, which can't ask can() unit by unit.
+    Archived units are included, as their history is still seen: what can be added to one
+    is the models' rule, which refuses anything new there."""
     permission = Permission(permission)  # a mistyped key is a bug, not a no
     if person is None or person.pk is None:
         return Unit.objects.none()
@@ -96,5 +99,5 @@ def requires_2fa(user):
     later, until it ends. User.requires_2fa adds the groups that need it."""
     if user.pk is None:
         return False
-    not_ended = Q(end__isnull=True) | Q(end__gt=_today())
-    return Position.objects.filter(not_ended, person__user=user, role__in=Position.BOARD_ROLES).exists()
+    board_roles = Position.objects.filter(person__user=user, role__in=Position.BOARD_ROLES)
+    return Tie.overlapping(board_roles, _today(), None).exists()  # not ended by today

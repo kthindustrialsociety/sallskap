@@ -235,9 +235,6 @@ def _where(units, root, key):
 def _add_people(people, units, root):
     User = get_user_model()
 
-    def where(key):
-        return _where(units, root, key)
-
     for who in people:
         if who.account:
             person = User.objects.create_user(who.email, name=who.name).person
@@ -245,11 +242,11 @@ def _add_people(people, units, root):
             person = Person.objects.create(name=who.name)
             EmailAddress.objects.create(person=person, address=who.email, verified_at=timezone.now())
         for tie in who.memberships:
-            Membership.objects.create(person=person, association=where(tie.unit), kind=tie.what, start=tie.start, end=tie.end)
+            Membership.objects.create(person=person, association=_where(units, root, tie.unit), kind=tie.what, start=tie.start, end=tie.end)
         for tie in who.positions:
-            Position.objects.create(person=person, unit=where(tie.unit), role=tie.what, title=tie.title, start=tie.start, end=tie.end)
+            Position.objects.create(person=person, unit=_where(units, root, tie.unit), role=tie.what, title=tie.title, start=tie.start, end=tie.end)
         for tie in who.reasons:
-            Reason.objects.create(person=person, unit=where(tie.unit), kind=tie.what, legal_basis=tie.basis, source=tie.source, start=tie.start, expires=tie.end)
+            Reason.objects.create(person=person, unit=_where(units, root, tie.unit), kind=tie.what, legal_basis=tie.basis, source=tie.source, start=tie.start, expires=tie.end)
 
 
 @transaction.atomic

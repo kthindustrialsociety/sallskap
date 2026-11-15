@@ -310,6 +310,7 @@ class WhatCounts(Federation):
         self.assertTrue(can(lead, P.MANAGE_EVENTS, self.u["hack"]))
         self.u["hack"].archive()
         self.assertFalse(can(lead, P.MANAGE_EVENTS, self.u["hack"]))
+        self.assertTrue(can(lead, P.MANAGE_EVENTS, self.u["hack"], on=TODAY - timedelta(days=1)))  # before it was archived
         self.assertTrue(can(self.people["chair@root"], P.MANAGE_UNITS, self.u["hack"]))  # its head above can bring it back
 
     def test_a_custom_title_gives_nothing_beyond_its_role(self):
@@ -433,6 +434,15 @@ class Grants(Federation):
         g.start = date(2026, 2, 1)
         with self.assertRaises(ValidationError):
             g.save()
+
+    def test_a_grant_that_would_give_nothing_is_refused(self):
+        # Memberships are only of associations, and a team holds only teams.
+        for over, below in (("ops", False), ("dev", True)):
+            with self.subTest(over), self.assertRaises(ValidationError):
+                grant(P.MANAGE_MEMBERSHIPS, Role.LEAD, self.u["ops"], self.u[over], self.chair, include_below=below)
+        grant(P.MANAGE_MEMBERSHIPS, Role.LEAD, self.u["ops"], self.u["rob"], self.chair)
+        grant(P.MANAGE_MEMBERSHIPS, Role.LEAD, self.u["web"], self.u["root"], self.chair, include_below=True)
+        self.assertEqual(Grant.objects.count(), 2)
 
     def test_the_role_fits_the_unit(self):
         with self.assertRaises(ValidationError):
