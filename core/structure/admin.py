@@ -5,7 +5,7 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
-from .models import EmailAddress, Membership, Person, Position, Reason, Unit
+from .models import EmailAddress, Membership, Person, Position, Reason, Unit, normalize_address, path_and_above
 
 
 class UnitForm(forms.ModelForm):
@@ -28,7 +28,21 @@ class UnitForm(forms.ModelForm):
                 Unit.check_taking_part(kind, parent, cleaned.get("taking_part") or [])
             except ValidationError as error:
                 self.add_error("taking_part", error)
+            self._check_leads(cleaned.get("taking_part"))
         return cleaned
+
+    def _check_leads(self, taking_part):
+        """A lead who is a member only of an association taken off the list would be left
+        a non-member: structure.md §3."""
+        if not self.instance.pk or taking_part is None:
+            return
+        removed = set(self.instance.taking_part.all()) - set(taking_part)
+        if not removed:
+            return
+        owner = self.instance.association()
+        for position in Position.objects.current().filter(unit=self.instance, role=Position.Role.LEAD).select_related("person"):
+            if not any(position.person.is_member(a) for a in [owner, *taking_part]):
+                self.add_error("taking_part", _("%(person)s leads this team as a member of an association taken off the list. Hand over the lead first.") % {"person": position.person})
 
 
 class ArchivedFilter(admin.SimpleListFilter):
@@ -132,6 +146,10 @@ class AddressForm(forms.ModelForm):
         if self.instance.pk:  # an address is fixed: add the new one and remove the old
             self.fields["address"].disabled = True
 
+    def clean_address(self):
+        # As it's stored, so two rows that differ only in case are caught as the same.
+        return normalize_address(self.cleaned_data["address"])
+
 
 class AddressFormSet(forms.BaseInlineFormSet):
     def clean(self):
@@ -184,7 +202,7 @@ class PersonAdmin(admin.ModelAdmin):
     """Everyone the association holds data about. Who else may see whom comes with
     authority (structure.md §2 and §4)."""
 
-    list_display = ("__str__", "addresses", "user", "member_of_list")
+    list_display = ("shown_name", "addresses", "user", "member_of_list")
     list_select_related = ("user",)
     search_fields = ("name", "emails__address")
     fields = ("name", "user", "created_at")
@@ -193,7 +211,12 @@ class PersonAdmin(admin.ModelAdmin):
     actions = ("merge",)
 
     def get_queryset(self, request):
-        return super().get_queryset(request).prefetch_related("emails")
+        current = Membership.objects.current().select_related("association")
+        return super().get_queryset(request).prefetch_related("emails", models.Prefetch("memberships", current, to_attr="current_memberships"))
+
+    def get_changelist_instance(self, request):
+        self._units = {unit.path: unit for unit in Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)}  # one query for the list
+        return super().get_changelist_instance(request)
 
     def get_inlines(self, request, obj):
         return self.inlines if obj else (AddressInline,)  # a new person has no ties yet
@@ -208,13 +231,19 @@ class PersonAdmin(admin.ModelAdmin):
             return False
         return super().has_delete_permission(request, obj)
 
+    @admin.display(description=_("name"), ordering="name")
+    def shown_name(self, obj):
+        return obj.name or next((e.address for e in obj.emails.all()), "") or str(obj)
+
     @admin.display(description=_("email addresses"))
     def addresses(self, obj):
         return ", ".join(e.address + ("" if e.verified_at else " (?)") for e in obj.emails.all())
 
     @admin.display(description=_("member of"))
     def member_of_list(self, obj):
-        return ", ".join(str(unit) for unit in obj.member_of())
+        """Counting upwards, as Person.member_of does, from what the list already loaded."""
+        paths = sorted({path for m in obj.current_memberships for path in path_and_above(m.association.path)})
+        return ", ".join(str(self._units[path]) for path in paths if path in self._units)
 
     @admin.action(description=_("Merge the two selected into one person"), permissions=["change"])
     def merge(self, request, queryset):
@@ -289,6 +318,11 @@ class MembershipAdmin(TieAdmin):
     fields = ("person", "association", "kind", "start", "end")
     fixed_on_change = ("person", "association")
     list_select_related = ("person", "association")
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "association":
+            kwargs["queryset"] = Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 @admin.register(Position)

@@ -684,3 +684,90 @@ class AdminPage(Tree):
         user = User.objects.create_user("member@example.org")
         self.client.force_login(user)
         self.assertNotEqual(self.client.get(reverse("admin:structure_person_changelist")).status_code, 200)
+
+
+# ---- What the code review found -------------------------------------------------------
+
+
+class AfterReview(Tree):
+    def test_a_unit_people_are_tied_to_keeps_its_kind(self):
+        member(person(), self.robotics)
+        self.robotics.kind = TEAM
+        with self.assertRaises(ValidationError):
+            self.robotics.save()
+
+    def test_a_move_cannot_leave_a_lead_without_membership(self):
+        p = person()
+        member(p, self.robotics)
+        position(p, self.uavs, Role.LEAD)
+        self.uavs.parent = self.website  # owned by the root, which p is a member of through Robotics
+        self.uavs.save()
+        lab = unit(TEAM, "lab", self.chemistry)
+        self.uavs.parent = lab  # owned by Chemistry, which p isn't a member of
+        with self.assertRaises(ValidationError):
+            self.uavs.save()
+        self.uavs.refresh_from_db()
+        self.assertEqual(self.uavs.parent, self.website)
+
+    def test_an_ended_chair_cannot_be_stretched_over_the_next(self):
+        old, new = person("Old"), person("New")
+        member(old, self.robotics)
+        member(new, self.robotics)
+        before = position(old, self.robotics, Role.CHAIR, start=date(2025, 7, 1), end=date(2026, 7, 1))
+        position(new, self.robotics, Role.CHAIR, start=date(2026, 7, 1))
+        before.end = date(2027, 1, 1)
+        with self.assertRaises(ValidationError):
+            before.save()
+
+    def test_a_changed_start_is_checked_against_membership(self):
+        p = person()
+        member(p, self.robotics, start=date(2025, 9, 1))
+        lead = position(p, self.uavs, Role.LEAD, start=date(2025, 10, 1))
+        lead.start = date(2024, 1, 1)
+        with self.assertRaises(ValidationError):
+            lead.save()
+
+    def test_a_refused_login_address_leaves_no_account(self):
+        other = User.objects.create_user("bo@example.org")
+        EmailAddress.objects.create(person=other.person, address="old@example.org", verified_at=timezone.now())
+        with self.assertRaises(ValidationError), transaction.atomic():
+            User.objects.create_user("old@example.org")
+        self.assertFalse(User.objects.filter(email="old@example.org").exists())
+
+    def test_a_rename_and_a_merge_in_one_save_keep_the_new_name(self):
+        user = User.objects.create_user("ada@example.org", name="Old")
+        person("", "p@example.org", verified=True)
+        user.name = "New"
+        user.email = "p@example.org"
+        user.save()
+        user.refresh_from_db()
+        self.assertEqual((user.name, user.person.name), ("New", "New"))
+        self.assertEqual(Person.objects.count(), 1)
+
+
+class AdminAfterReview(Tree):
+    client_class = CaddyClient
+    enter = AdminPage.enter
+
+    def test_two_new_addresses_differing_in_case_are_a_form_error(self):
+        self.enter("operator")
+        response = self.client.post(reverse("admin:structure_person_add"), {
+            "name": "Bo", "emails-TOTAL_FORMS": "2", "emails-INITIAL_FORMS": "0",
+            "emails-0-address": "Bo@example.org", "emails-1-address": "bo@example.org",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Person.objects.filter(name="Bo").exists())
+
+    def test_an_association_a_lead_rests_on_stays_taking_part(self):
+        self.enter("operator")
+        hackathon = unit(TEAM, "hackathon", self.robotics)
+        hackathon.taking_part.add(self.chemistry)
+        p = person()
+        member(p, self.chemistry)
+        position(p, hackathon, Role.LEAD)
+        response = self.client.post(reverse("admin:structure_unit_change", args=[hackathon.pk]), {
+            "kind": TEAM, "name": "Hackathon", "description": "", "parent": self.robotics.pk,
+            "primary_colour": "", "accent_colour": "", "end_date": "", "run_for": "",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(hackathon.taking_part.filter(pk=self.chemistry.pk).exists())

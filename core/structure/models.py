@@ -34,6 +34,12 @@ def validate_key(key):
 colour = RegexValidator(r"^#[0-9a-fA-F]{6}$", _("Write a colour as # and six hex digits, such as #1a5fb4."))
 
 
+def path_and_above(path):
+    """A unit's path and those of every unit above it: /a/b/ gives /a/ and /a/b/."""
+    keys = path.strip("/").split("/")
+    return ["/" + "/".join(keys[: i + 1]) + "/" for i in range(len(keys))]
+
+
 class UnitQuerySet(models.QuerySet):
     def root(self):
         return self.get(parent=None)
@@ -114,9 +120,7 @@ class Unit(models.Model):
 
     def ancestors(self):
         """From the root down to the unit above this one."""
-        keys = self.path.strip("/").split("/")[:-1]
-        paths = ["/" + "/".join(keys[: i + 1]) + "/" for i in range(len(keys))]
-        return Unit.objects.filter(path__in=paths).order_by("path")
+        return Unit.objects.filter(path__in=path_and_above(self.path)[:-1]).order_by("path")
 
     def descendants(self):
         return Unit.objects.filter(path__startswith=self.path).exclude(pk=self.pk)
@@ -160,6 +164,9 @@ class Unit(models.Model):
                 problems.append(_("A unit can't sit inside itself or a unit under it."))
             if parent.archived and not self.archived:
                 problems.append(_("%(parent)s is archived, so nothing can be added or moved into it, or taken out of the archive under it.") % {"parent": parent})
+
+        if stored and stored.kind != self.kind and stored.deletion_problem_from_ties():
+            problems.append(_("People are or were tied to %(unit)s, so it can't change between association and team.") % {"unit": stored})
 
         if self.kind == Kind.ASSOCIATION:
             if self.end_date or self.archived_at:
@@ -225,6 +232,9 @@ class Unit(models.Model):
                 for unit in below:
                     unit.path = self.path + unit.path[len(before):]
                 Unit.objects.bulk_update(below, ["path"])
+                problems = self.membership_problems()
+                if problems:  # rolls the move back
+                    raise ValidationError(problems)
 
     # ---- Archiving and deleting --------------------------------------------------
 
@@ -252,9 +262,19 @@ class Unit(models.Model):
             return _("%(unit)s has units inside it.") % {"unit": self}
         if self.run_by.exists() or self.teams_taking_part.exists():
             return _("Teams are run for %(unit)s, or involve it.") % {"unit": self}
+        return self.deletion_problem_from_ties()
+
+    def deletion_problem_from_ties(self):
         if self.memberships.exists() or self.positions.exists() or self.reasons.exists():
             return _("People are or were tied to %(unit)s, and that record is kept.") % {"unit": self}
         return None
+
+    def membership_problems(self, below=True):
+        """For the current board roles and leads here, and with `below` in every unit
+        under it: any whose holder isn't the member the role needs, as after a move."""
+        units = Unit.objects.filter(path__startswith=self.path) if below else Unit.objects.filter(pk=self.pk)
+        held = Position.objects.current().filter(unit__in=units, role__in=Position.NEEDS_MEMBERSHIP).select_related("person", "unit")
+        return [problem for position in held if (problem := position.membership_problem(on=_today()))]
 
     def check_can_delete(self):
         problem = self.deletion_problem()
@@ -381,8 +401,7 @@ class Person(models.Model):
         tree each time, never stored, so a moved unit can't leave it wrong."""
         paths = set()
         for path in self.memberships.current(on).values_list("association__path", flat=True):
-            keys = path.strip("/").split("/")
-            paths.update("/" + "/".join(keys[: i + 1]) + "/" for i in range(len(keys)))
+            paths.update(path_and_above(path))
         return Unit.objects.filter(path__in=paths).order_by("path")
 
     # ---- Merging -------------------------------------------------------------------
@@ -512,10 +531,8 @@ def account_address_problem(user):
 def link_account(user):
     """Gives an account its person, and its login address verified there. An account
     for an address a person without one already holds verified joins that person. Runs
-    after every save of an account: see apps.py."""
-    problem = account_address_problem(user)
-    if problem:
-        raise ValidationError(problem)
+    after an account is saved with a new address or name: see apps.py, which also
+    checks account_address_problem before the account is written."""
     person = Person.objects.filter(user=user).first()
     holder = EmailAddress.objects.filter(address=user.email, verified_at__isnull=False).select_related("person").first()
     if person is None:
@@ -528,6 +545,7 @@ def link_account(user):
             person = Person(name=user.name, user=user)
             person.save()
     elif person.name != user.name:
+        person.name = user.name
         Person.objects.filter(pk=person.pk).update(name=user.name)
     if holder is not None and holder.person_id != person.pk:
         person = Person.merge(person, holder.person)
@@ -627,7 +645,7 @@ class Membership(Tie):
         HONORARY = "honorary", _("honorary")
 
     person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.PROTECT, related_name="memberships")
-    association = models.ForeignKey(Unit, verbose_name=_("association"), on_delete=models.PROTECT, related_name="memberships", limit_choices_to={"kind": Unit.Kind.ASSOCIATION})
+    association = models.ForeignKey(Unit, verbose_name=_("association"), on_delete=models.PROTECT, related_name="memberships")
     kind = models.CharField(_("kind"), max_length=20, choices=Kind.choices, default=Kind.ORDINARY)
 
     unit_field = "association"
@@ -723,23 +741,25 @@ class Position(Tie):
             problems.append(_("A board role sits in an association. %(unit)s is a team.") % {"unit": unit})
         if self.role in self.TEAM_ROLES and unit.kind != Unit.Kind.TEAM:
             problems.append(_("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": unit})
-        if self.pk is None:
-            if unit.archived:
-                problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
-            if not problems and self.start:
-                problem = self.membership_problem(on=self.start)
-                if problem:
-                    problems.append(problem)
+        stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None and unit.archived:
+            problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
+        if not problems and self.start and (stored is None or stored.start != self.start):
+            problem = self.membership_problem(on=self.start)
+            if problem:
+                problems.append(problem)
         if self.role == self.Role.CHAIR and self.start:
-            later = Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__gte=self.start).exclude(pk=self.pk)
-            if self.pk is None and later.exists():
-                problems.append(_("%(unit)s already has a chair from %(day)s.") % {"unit": unit, "day": later.order_by("start").first().start})
+            others = Tie.overlapping(Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR).exclude(pk=self.pk), self.start, self.end)
+            if stored is None:  # a new chair ends an open one that started before
+                others = others.exclude(start__lt=self.start, end__isnull=True)
+            if others.exists():
+                problems.append(_("%(unit)s has one chair at a time, and %(other)s is chair then.") % {"unit": unit, "other": others.first().person})
         return problems
 
     def before_save(self):
         # Appointing the next chair ends the last one's position on the day the new one starts.
         if self.role == self.Role.CHAIR and self.pk is None:
-            for chair in Tie.overlapping(Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR), self.start, None):
+            for chair in Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True):
                 chair.end_on(self.start)
 
 

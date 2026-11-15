@@ -50,7 +50,7 @@ class Migration(migrations.Migration):
                 ('start', models.DateField(default=structure.models._today, verbose_name='start')),
                 ('end', models.DateField(blank=True, help_text='The first day it no longer holds. Empty while it lasts.', null=True, verbose_name='end')),
                 ('kind', models.CharField(choices=[('ordinary', 'ordinary'), ('honorary', 'honorary')], default='ordinary', max_length=20, verbose_name='kind')),
-                ('association', models.ForeignKey(limit_choices_to={'kind': 'association'}, on_delete=django.db.models.deletion.PROTECT, related_name='memberships', to='structure.unit', verbose_name='association')),
+                ('association', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='memberships', to='structure.unit', verbose_name='association')),
                 ('person', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='memberships', to='structure.person', verbose_name='person')),
             ],
             options={
