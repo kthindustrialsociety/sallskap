@@ -259,6 +259,23 @@ class TwoFactorRule(Service):
                 self.client.force_login(user)
                 self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
 
+    def test_a_board_role_anywhere_cannot_reach_a_tool_without_it(self):
+        """structure.md §4: from positions, as well as from the groups."""
+        from structure.models import Membership, Position, Unit
+
+        root = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="example", name="Example")
+        inside = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="robotics", name="Robotics", parent=root)
+        team = Unit.objects.create(kind=Unit.Kind.TEAM, key="website", name="Website", parent=inside)
+        treasurer, _ = make_user("treasurer@example.org", ["member"])
+        lead, _ = make_user("lead@example.org", ["member"])
+        for user, where, role in ((treasurer, inside, "treasurer"), (lead, team, "lead")):
+            Membership.objects.create(person=user.person, association=inside)
+            Position.objects.create(person=user.person, unit=where, role=role)
+        self.client.force_login(treasurer)
+        self.assertRedirects(self.client.get(self.authorize_url()), reverse("mfa_index"), fetch_redirect_response=False)
+        self.client.force_login(lead)
+        self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
+
     def test_joining_a_group_applies_the_rule_at_the_next_login(self):
         user, _ = make_user(groups=["member"])
         self.client.force_login(user)
