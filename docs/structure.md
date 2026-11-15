@@ -28,7 +28,7 @@ Example Federation              association, the root
   - A key is lowercase letters, digits and single hyphens, starts with a letter, ends with a letter or digit, and is at most 40 characters, so every tool can use it as a name.
   - It can't be changed once set, and it's never reused, even after its unit is archived. `custom` is reserved, as tools already see groups made by hand as `custom:<name>`.
 - **Nothing is created or moved under an archived unit,** an association sits only under an association, and a unit can't end up under itself.
-- **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3), current or ended. Otherwise it's archived.
+- **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3) or grants (§4), current or ended. Otherwise it's archived.
 - **A team can involve other associations.** The unit it sits under owns it and appoints its lead. It also has a list of the other associations taking part.
 - **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's head (§4) can end the arrangement.
 
@@ -74,20 +74,46 @@ A position's **role** is one of a fixed set of keys that the kit understands. Ea
 | Role key | Typically held in | Can | Where |
 |---|---|---|---|
 | `chair`, `vice_chair` | association | Appoint and end positions. Create, change and archive units. Give grants (below). Everything the board can | The association and everything inside it, associations inside it included |
-| `treasurer` | association | Fees and treasury, and everything a `board_member` can | The association and its teams only |
-| `secretary` | association | Documents and minutes, and everything a `board_member` can | The association and its teams only |
-| `board_member` | association | Manage memberships, events, mailings and documents, and see members | The association and its teams only |
-| `lead` | team | Manage the team's participants, events and mailings. Appoint the leads of the teams under it, and approve proposals there | The team and the teams under it |
+| `treasurer` | association | Fees and treasury, and everything a `board_member` can | The association and its teams at any depth, stopping at the associations inside it |
+| `secretary` | association | Documents and minutes, and everything a `board_member` can | The association and its teams at any depth, stopping at the associations inside it |
+| `board_member` | association | Manage memberships, events, mailings and documents, and see members | The association and its teams at any depth, stopping at the associations inside it |
+| `lead` | team | Manage the team's participants, events and mailings, change the team, and create teams inside it. Appoint the leads of the teams under it, and approve proposals there | The team and the teams under it |
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
 The keys never change and are never shown. What people see comes from the dictionary below.
 
 - **Authority is scoped.** You can manage a unit if a position you hold covers it, as the table says, or a grant does. Only the chair and vice chair reach into the associations inside theirs. Every other board role stops at its association's edge. So the root's treasurer has no say in Robotics, unless a chair gives them one.
+- **Only what's current counts:** a position or grant (below) that has started and not yet ended, held in a unit that isn't archived. A board elected in spring has no say until its positions start.
 - **The head of a unit** is the `chair` or `vice_chair` of an association, or the `lead` of a team. Heads appoint the heads of the units directly under them and approve what's proposed there. So Development's lead appoints the lead of UAVs, and UAVs' lead approves a new project inside it. Anyone with authority higher up can do the same.
-- **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server.
-- **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members.
-- **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators.
+  - A chair or vice chair appoints every role in their association and everything inside it, their own association's next chair included, and can end any of those positions.
+  - A lead appoints the leads and participants of the teams under theirs, and their own team's participants. A co-lead of their own team is appointed by the head above, like the lead.
+- **Moving, archiving and deleting a unit are decided one level up,** by whoever has authority over the unit above it, as for appointing its head. So a lead changes their own team and creates projects inside it, and the head above archives it. Creating a unit is decided by whoever has authority over the unit it goes into, which is how a lead approves a proposal there.
+- **Associations taking part in a team, or served by it, get no say over it,** except that the head of the association it's run for can end that arrangement (§1).
+- **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator with a command on the server, which the audit log records.
+- **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members: it never passes the check below.
+- **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators. It's required from the day the position is recorded, even if it starts later, so a newly elected board sets it up before taking office.
+
+### Permissions
+
+Every action asks one question: **can this person do this, in this unit, today?** The answer comes from a fixed list of permissions, worked out from the person's current positions and the grants to them. Each one is checked on the unit the action is about.
+
+| Permission | What it covers | Can be granted |
+|---|---|---|
+| `see_members` | See an association's members, or a team's participants | Yes |
+| `manage_memberships` | Add, change and end memberships, in an association | Yes |
+| `manage_events` | Events and their sign-ups | Yes |
+| `send_mailings` | Mailings | Yes |
+| `manage_documents` | Documents and minutes | Yes |
+| `manage_finances` | Fees and treasury | Yes |
+| `manage_participants` | Add and end participants, in a team | No |
+| `appoint` | Start and end positions of any role, heads included | No |
+| `manage_units` | Change this unit, and create, move, archive, bring back and delete the units inside it | No |
+| `give_grants` | Give and end grants covering this unit | No |
+| `end_service` | End a team's "run for" arrangement (§1) | No |
+
+- **Chairs and vice chairs** have all of them. **Treasurers** have the six that can be granted, and **secretaries and board members** the same without fees and treasury, as minutes are documents. **Leads** have `see_members`, `manage_participants`, `manage_events`, `send_mailings` and `manage_units` in their team and the teams under it, and `appoint` in the teams under it only. **Participants** have none.
+- **Seeing an association's members** means its own register. Robotics' members count as members of the root, but the root's board needs a grant to see them, as in the example below.
 
 ### Grants
 
@@ -96,10 +122,11 @@ A `chair` or `vice_chair` can **give a role a specific permission** anywhere the
 - KTHIS's board members a view of every society's members, for the annual meeting;
 - Robotics' Operations lead the right to send Robotics' mailings.
 
-- **The permissions are a fixed list:** see members, manage memberships, manage events, send mailings, manage documents, and fees and treasury. Appointing people and giving grants can't be given away, so authority over people stays with chairs, vice chairs and heads.
-- **A grant goes to a role in a unit, not to a person,** such as "KTHIS's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too.
+- **Only the six permissions marked above can be granted:** see members, manage memberships, manage events, send mailings, manage documents, and fees and treasury. Appointing people, managing units and giving grants can't be given away, so authority over people stays with chairs, vice chairs and heads.
+- **A grant goes to a role in a unit, not to a person,** such as "KTHIS's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too. A role with several holders gives it to each of them, and a role nobody holds gives it to nobody until someone does. The role can be held anywhere: only the unit the grant covers has to be within the giver's authority.
 - **It covers one unit,** or that unit and everything under it.
-- **It's dated like a tie,** records who gave it, and lasts until a chair or vice chair ends it. It doesn't end when the person who gave it leaves.
+- **It's dated like a tie,** records who gave it, and lasts until a chair or vice chair ends it. It doesn't end when the person who gave it leaves. Whoever could give it can end it.
+- **What it gives, to whom and where are fixed once given:** end it and give a new one. It's never deleted, so the record of who could do what is kept. The person who gave it must have been able to on the day it starts, and nothing new is given in an archived unit.
 
 ### Seats that come with another position
 
