@@ -1,5 +1,6 @@
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import Group, PermissionsMixin
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Lower
 from django.utils import timezone
@@ -58,6 +59,11 @@ class User(AbstractBaseUser, PermissionsMixin):
     def clean(self):
         super().clean()
         self.email = normalize_email(self.email)
+        from structure.models import account_address_problem  # every account has a person: structure.md §2
+
+        problem = account_address_problem(self)
+        if problem:
+            raise ValidationError({"email": problem})
 
     def save(self, *args, **kwargs):
         self.email = normalize_email(self.email)
