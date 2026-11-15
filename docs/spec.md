@@ -251,7 +251,7 @@ An installation has one **primary domain** and any number of **site domains**.
 - **When someone leaves:** what can be done for them is done at once, and anything only a person can do becomes a follow-up on the admin page that stays open until someone marks it done, such as changing shared passwords.
 - **If core is down:** each module's README says how to get in. Nothing opens a way around 2FA at a public address: an emergency way in needs SSH on the server.
 - **Sessions:** short lifetimes for sensitive modules (vault: 8–24 h).
-- **Two-factor authentication:** required for the board, treasurer and operator groups; optional for members.
+- **Two-factor authentication:** required for anyone holding a board role anywhere in the tree, and for operators ([structure.md](structure.md) §4); optional for everyone else.
 - **Passwords:** hashed with Argon2 (Django supports it). Login attempts are rate-limited.
 - **Known exceptions:**
   - Git pushes use personal access tokens created after logging in.
