@@ -1,6 +1,6 @@
 # Structure: associations, people, and doing everything from a command line
 
-*Working design, first agreed 2026-11-13, and expected to change as it's built and used. Being built, before `members` and `events`: units (§1) are in core, and the rest follows. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
+*Working design, first agreed 2026-11-13, and expected to change as it's built and used. Being built, before `members` and `events`: units (§1), people (§2) and memberships, positions and reasons (§3) are in core, and the rest follows. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
 
 Everything here is the same for every installation. An association's own structure is data in core's database, not code or config.
 
@@ -38,7 +38,7 @@ One `Person` row for **everyone the association holds data about:** members, boa
 
 - **Kept to a minimum:** a name and email addresses, and nothing else. There's no language setting: pages follow the browser's language, and mail goes out in the installation's. What an association asks of its members goes in member fields, on the membership (§3).
 - **Emails are in their own table,** each marked verified or not. A verified address belongs to one person only. The same address can be on several people unverified, which is how a sign-up with a member's address gets its own row instead of joining theirs.
-- **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. The account's login address is always one of its person's verified addresses. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change. Their addresses are marked verified, as they were typed in by an operator and already used to log in. An operator's typo becomes a verified address too, so check addresses when adding an account.
+- **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. The account's login address is always one of its person's verified addresses. When it changes, the old one stays on the person unverified, so it can go to someone else, such as a role's shared address. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change. Their addresses are marked verified, as they were typed in by an operator and already used to log in. An operator's typo becomes a verified address too, so check addresses when adding an account.
 - **Two rows are merged only on a verified email,** or by hand. An unverified email never joins someone to an existing person. When an address is verified and another person already holds it verified, the two become one: addresses, ties and reasons move over, and the emptied row is deleted. Two people who both have an account are never merged, as one of their `sub`s would vanish. If only one has an account, that's the person kept.
 - **There's no general contact list.** People are seen through what ties them to a unit, so a chair sees their own members and the people signed up for their own events. One privacy role can search everyone, to answer GDPR requests.
 - **Visitors aren't people in this model.** Page statistics come from the web server's logs, counted, and never linked to anyone.

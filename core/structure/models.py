@@ -7,6 +7,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.validators import RegexValidator
 from django.db import models, transaction
+from django.db.models.functions import Lower
 from django.db.models.signals import m2m_changed
 from django.dispatch import receiver
 from django.utils import timezone
@@ -31,6 +32,12 @@ def validate_key(key):
 
 
 colour = RegexValidator(r"^#[0-9a-fA-F]{6}$", _("Write a colour as # and six hex digits, such as #1a5fb4."))
+
+
+def path_and_above(path):
+    """A unit's path and those of every unit above it: /a/b/ gives /a/ and /a/b/."""
+    keys = path.strip("/").split("/")
+    return ["/" + "/".join(keys[: i + 1]) + "/" for i in range(len(keys))]
 
 
 class UnitQuerySet(models.QuerySet):
@@ -113,12 +120,16 @@ class Unit(models.Model):
 
     def ancestors(self):
         """From the root down to the unit above this one."""
-        keys = self.path.strip("/").split("/")[:-1]
-        paths = ["/" + "/".join(keys[: i + 1]) + "/" for i in range(len(keys))]
-        return Unit.objects.filter(path__in=paths).order_by("path")
+        return Unit.objects.filter(path__in=path_and_above(self.path)[:-1]).order_by("path")
 
     def descendants(self):
         return Unit.objects.filter(path__startswith=self.path).exclude(pk=self.pk)
+
+    def association(self):
+        """The association this unit is, or else the one it sits in, which owns it."""
+        if self.kind == Unit.Kind.ASSOCIATION:
+            return self
+        return self.ancestors().filter(kind=Unit.Kind.ASSOCIATION).last()
 
     # ---- Rules -------------------------------------------------------------------
 
@@ -153,6 +164,9 @@ class Unit(models.Model):
                 problems.append(_("A unit can't sit inside itself or a unit under it."))
             if parent.archived and not self.archived:
                 problems.append(_("%(parent)s is archived, so nothing can be added or moved into it, or taken out of the archive under it.") % {"parent": parent})
+
+        if stored and stored.kind != self.kind and stored.deletion_problem_from_ties():
+            problems.append(_("People are or were tied to %(unit)s, so it can't change between association and team.") % {"unit": stored})
 
         if self.kind == Kind.ASSOCIATION:
             if self.end_date or self.archived_at:
@@ -218,6 +232,9 @@ class Unit(models.Model):
                 for unit in below:
                     unit.path = self.path + unit.path[len(before):]
                 Unit.objects.bulk_update(below, ["path"])
+                problems = self.membership_problems()
+                if problems:  # rolls the move back
+                    raise ValidationError(problems)
 
     # ---- Archiving and deleting --------------------------------------------------
 
@@ -245,7 +262,19 @@ class Unit(models.Model):
             return _("%(unit)s has units inside it.") % {"unit": self}
         if self.run_by.exists() or self.teams_taking_part.exists():
             return _("Teams are run for %(unit)s, or involve it.") % {"unit": self}
+        return self.deletion_problem_from_ties()
+
+    def deletion_problem_from_ties(self):
+        if self.memberships.exists() or self.positions.exists() or self.reasons.exists():
+            return _("People are or were tied to %(unit)s, and that record is kept.") % {"unit": self}
         return None
+
+    def membership_problems(self, below=True):
+        """For the current board roles and leads here, and with `below` in every unit
+        under it: any whose holder isn't the member the role needs, as after a move."""
+        units = Unit.objects.filter(path__startswith=self.path) if below else Unit.objects.filter(pk=self.pk)
+        held = Position.objects.current().filter(unit__in=units, role__in=Position.NEEDS_MEMBERSHIP).select_related("person", "unit")
+        return [problem for position in held if (problem := position.membership_problem(on=_today()))]
 
     def check_can_delete(self):
         problem = self.deletion_problem()
@@ -300,3 +329,479 @@ def ensure_root(using="default", apps=None, **kwargs):
     elif root.name != name:
         root.name = name
         root.save(using=using)
+
+
+# ---- People and ties: structure.md §2 and §3 ----------------------------------------
+
+
+def _today():
+    return timezone.localdate()
+
+
+def _erase(queryset):
+    """Removes rows that are otherwise never deleted: a duplicate left by a merge, or a
+    made-up installation being replaced. Nothing else may call this."""
+    return models.QuerySet.delete(queryset)
+
+
+class Person(models.Model):
+    """Everyone the association holds data about. Kept to a minimum: a name and email
+    addresses. Everything else is a tie to a unit."""
+
+    name = models.CharField(_("name"), max_length=150, blank=True)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, verbose_name=_("account"), null=True, blank=True, on_delete=models.SET_NULL, related_name="person",
+        help_text=_("Optional. People who only sign up for events or subscribe never need one."),
+    )
+    created_at = models.DateTimeField(_("added"), default=timezone.now, editable=False)
+
+    class Meta:
+        verbose_name = _("person")
+        verbose_name_plural = _("people")
+        ordering = ["name", "pk"]
+
+    def __str__(self):
+        if self.name:
+            return self.name
+        address = self.emails.order_by("verified_at").first() if self.pk else None
+        return address.address if address else _("Person %(id)s") % {"id": self.pk}
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        user = self.user
+        if user is not None and user.name != self.name:  # the tools read the account's name
+            user.name = self.name
+            user.save(update_fields=["name"])
+
+    def deletion_problem(self):
+        if self.user_id:
+            return _("%(person)s has an account.") % {"person": self}
+        if self.memberships.exists() or self.positions.exists() or self.reasons.exists():
+            return _("%(person)s is or was tied to a unit, and that record is kept.") % {"person": self}
+        return None
+
+    def delete(self, *args, **kwargs):
+        problem = self.deletion_problem()
+        if problem:
+            raise ValidationError(problem)
+        return super().delete(*args, **kwargs)
+
+    # ---- What they're a member of ----------------------------------------------------
+
+    def is_member(self, association, on=None, excluding=None):
+        """A member of `association` on that day, directly or through an association
+        inside it: membership counts upwards."""
+        memberships = self.memberships.current(on).filter(association__path__startswith=association.path)
+        if excluding is not None:
+            memberships = memberships.exclude(pk=excluding)
+        return memberships.exists()
+
+    def member_of(self, on=None):
+        """Every association they're a member of, counting upwards. Worked out from the
+        tree each time, never stored, so a moved unit can't leave it wrong."""
+        paths = set()
+        for path in self.memberships.current(on).values_list("association__path", flat=True):
+            paths.update(path_and_above(path))
+        return Unit.objects.filter(path__in=paths).order_by("path")
+
+    # ---- Merging -------------------------------------------------------------------
+
+    @staticmethod
+    @transaction.atomic
+    def merge(first, second):
+        """Makes two rows one person, and returns the one kept: the one with an account,
+        or else `first`. Two people with accounts are never merged, as one of their subs
+        would vanish."""
+        if first.pk == second.pk:
+            return first
+        if first.user_id and second.user_id:
+            raise ValidationError(_("%(a)s and %(b)s both have an account, so they can't be merged.") % {"a": first, "b": second})
+        kept, gone = (second, first) if second.user_id else (first, second)
+
+        for email in gone.emails.all():
+            twin = kept.emails.filter(address=email.address).first()
+            if twin is None:
+                EmailAddress.objects.filter(pk=email.pk).update(person=kept)
+                continue
+            verified_at = twin.verified_at or email.verified_at
+            EmailAddress.objects.filter(pk=email.pk).delete()  # before the twin, as a verified address is unique
+            EmailAddress.objects.filter(pk=twin.pk).update(verified_at=verified_at)
+
+        for membership in gone.memberships.all():
+            twins = list(Membership.overlapping(kept.memberships.filter(association=membership.association_id), membership.start, membership.end))
+            if twins:
+                rows = [membership, *twins]
+                membership.start = min(row.start for row in rows)
+                membership.end = None if any(row.end is None for row in rows) else max(row.end for row in rows)
+                _erase(Membership.objects.filter(pk__in=[row.pk for row in twins]))
+            Membership.objects.filter(pk=membership.pk).update(person=kept, start=membership.start, end=membership.end)
+        Position.objects.filter(person=gone).update(person=kept)
+        Reason.objects.filter(person=gone).update(person=kept)
+
+        if gone.user_id:
+            user = gone.user
+            Person.objects.filter(pk=gone.pk).update(user=None)
+            kept.user = user
+            kept.name = user.name or kept.name
+        kept.name = kept.name or gone.name
+        kept.save()
+        _erase(Person.objects.filter(pk=gone.pk))
+        return kept
+
+
+def normalize_address(address):
+    return (address or "").strip().lower()
+
+
+class EmailAddress(models.Model):
+    """A person's address. Verified means the person has shown it's theirs, or an
+    operator typed it in for an account. A verified address belongs to one person."""
+
+    person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.CASCADE, related_name="emails")
+    address = models.EmailField(_("email address"))
+    verified_at = models.DateTimeField(_("verified"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("email address")
+        verbose_name_plural = _("email addresses")
+        ordering = ["address"]
+        constraints = [
+            models.UniqueConstraint(fields=["person", "address"], name="one_of_each_address"),
+            models.UniqueConstraint(fields=["address"], condition=models.Q(verified_at__isnull=False), name="verified_address_is_one_persons"),
+            models.CheckConstraint(condition=models.Q(address=Lower("address")), name="address_is_lowercase"),
+        ]
+
+    def __str__(self):
+        return self.address
+
+    def clean(self):
+        self.address = normalize_address(self.address)
+        super().clean()
+        self.check_rules()
+
+    def check_rules(self):
+        stored = EmailAddress.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored and (stored.address != self.address or stored.person_id != self.person_id):
+            raise ValidationError(_("An address can't be changed: add the new one and remove the old."))
+        if self.verified_at and EmailAddress.objects.filter(address=self.address, verified_at__isnull=False).exclude(pk=self.pk).exists():
+            raise ValidationError(_("%(address)s is already someone's verified address.") % {"address": self.address})
+
+    def save(self, *args, **kwargs):
+        self.address = normalize_address(self.address)
+        self.check_rules()
+        super().save(*args, **kwargs)
+
+    def is_login_address(self):
+        user = self.person.user if self.person_id else None
+        return user is not None and user.email == self.address
+
+    def delete(self, *args, **kwargs):
+        if self.is_login_address():
+            raise ValidationError(_("%(address)s is how they log in. Change the account's address first.") % {"address": self.address})
+        return super().delete(*args, **kwargs)
+
+    @transaction.atomic
+    def verify(self):
+        """Marks it verified. If someone else already holds it verified, the two become
+        one person, as structure.md §2 says. Returns the person it ends up on."""
+        holder = EmailAddress.objects.filter(address=self.address, verified_at__isnull=False).exclude(person=self.person_id).first()
+        person = self.person
+        if holder is not None:
+            person = Person.merge(holder.person, person)
+        address = person.emails.get(address=self.address)
+        if address.verified_at is None:
+            address.verified_at = timezone.now()
+            address.save()
+        return person
+
+
+def account_address_problem(user):
+    """Why an account can't have this login address, or None. It's someone else's
+    verified address, and they have an account of their own."""
+    address = normalize_address(user.email)
+    holder = EmailAddress.objects.filter(address=address, verified_at__isnull=False).select_related("person__user").first()
+    other = holder.person.user if holder else None
+    # Another account's own login address is left to the check that addresses are unique.
+    if other is not None and other.pk != user.pk and other.email != address:
+        return _("%(address)s is a verified address of someone with another account.") % {"address": address}
+    return None
+
+
+@transaction.atomic
+def link_account(user, old_address=None):
+    """Gives an account its person, and its login address verified there. An account
+    for an address a person without one already holds verified joins that person. Runs
+    after an account is saved with a new address or name: see apps.py, which also
+    checks account_address_problem before the account is written. An old login address
+    stays on the person, unverified: it was only vouched for as the login address, and
+    it can go to someone else, such as a role's shared address."""
+    person = Person.objects.filter(user=user).first()
+    holder = EmailAddress.objects.filter(address=user.email, verified_at__isnull=False).select_related("person").first()
+    if person is None:
+        if holder is not None:  # someone already known: the account joins them
+            person = holder.person
+            person.user = user
+            person.name = user.name or person.name
+            person.save()
+        else:
+            person = Person(name=user.name, user=user)
+            person.save()
+    elif person.name != user.name:
+        person.name = user.name
+        Person.objects.filter(pk=person.pk).update(name=user.name)
+    if holder is not None and holder.person_id != person.pk:
+        person = Person.merge(person, holder.person)
+    if old_address and old_address != user.email:
+        person.emails.filter(address=old_address).update(verified_at=None)
+    address, _created = EmailAddress.objects.get_or_create(person=person, address=user.email)
+    if address.verified_at is None:
+        address.verified_at = timezone.now()
+        address.save()
+
+
+class TieQuerySet(models.QuerySet):
+    start_field, end_field = "start", "end"
+
+    def current(self, on=None):
+        on = on or _today()
+        return self.filter(**{f"{self.start_field}__lte": on}).filter(
+            models.Q(**{f"{self.end_field}__isnull": True}) | models.Q(**{f"{self.end_field}__gt": on})
+        )
+
+    def delete(self):
+        raise ValidationError(_("Ties are never deleted, so the record is kept. End it instead."))
+
+
+class ReasonQuerySet(TieQuerySet):
+    end_field = "expires"
+
+
+class Tie(models.Model):
+    """What connects a person to a unit. Ending one sets its end and never deletes it.
+    The end is the first day it no longer holds, so a tie ended today stops today."""
+
+    start = models.DateField(_("start"), default=_today)
+    end = models.DateField(_("end"), null=True, blank=True, help_text=_("The first day it no longer holds. Empty while it lasts."))
+
+    objects = TieQuerySet.as_manager()
+    end_field = "end"
+    unit_field = None  # set by each kind of tie
+
+    class Meta:
+        abstract = True
+
+    def is_current(self, on=None):
+        on = on or _today()
+        end = getattr(self, self.end_field)
+        return self.start <= on and (end is None or end > on)
+
+    def end_on(self, day=None):
+        setattr(self, self.end_field, day or _today())
+        self.save()
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("Ties are never deleted, so the record is kept. End it instead."))
+
+    @staticmethod
+    def overlapping(queryset, start, end):
+        if end is not None:
+            queryset = queryset.filter(start__lt=end)
+        return queryset.filter(models.Q(end__isnull=True) | models.Q(end__gt=start))
+
+    def clean(self):
+        super().clean()
+        if self.person_id and getattr(self, f"{self.unit_field}_id"):  # a form shows a missing one by itself
+            self.check_rules()
+
+    def check_rules(self):
+        problems = self.problems()
+        if problems:
+            raise ValidationError(problems)
+
+    def problems(self):
+        problems = []
+        end = getattr(self, self.end_field)
+        if end is not None and self.start and end < self.start:
+            problems.append(_("It can't end before it starts."))
+        stored = type(self).objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is not None:
+            fixed = ("person_id", f"{self.unit_field}_id", *self.fixed_fields)
+            if any(getattr(stored, name) != getattr(self, name) for name in fixed):
+                problems.append(_("Who it's for, where, and which role can't change once set: end it and add a new one."))
+        return problems
+
+    fixed_fields = ()
+
+    def save(self, *args, **kwargs):
+        self.clean_fields()
+        with transaction.atomic():
+            self.check_rules()
+            self.before_save()
+            super().save(*args, **kwargs)
+
+    def before_save(self):
+        pass
+
+
+class Membership(Tie):
+    class Kind(models.TextChoices):
+        ORDINARY = "ordinary", _("ordinary")
+        HONORARY = "honorary", _("honorary")
+
+    person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.PROTECT, related_name="memberships")
+    association = models.ForeignKey(Unit, verbose_name=_("association"), on_delete=models.PROTECT, related_name="memberships")
+    kind = models.CharField(_("kind"), max_length=20, choices=Kind.choices, default=Kind.ORDINARY)
+
+    unit_field = "association"
+
+    class Meta:
+        verbose_name = _("membership")
+        verbose_name_plural = _("memberships")
+        ordering = ["-start", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(end__isnull=True) | models.Q(end__gte=models.F("start")), name="membership_ends_after_start"),
+            models.UniqueConstraint(fields=["person", "association"], condition=models.Q(end__isnull=True), name="one_open_membership"),
+        ]
+
+    def __str__(self):
+        return f"{self.person}: {self.association}"
+
+    def problems(self):
+        problems = super().problems()
+        if self.association.kind != Unit.Kind.ASSOCIATION:
+            problems.append(_("%(unit)s is a team. Membership is only of associations: in teams, people hold positions.") % {"unit": self.association})
+        if self.start and Tie.overlapping(Membership.objects.filter(person=self.person_id, association=self.association_id).exclude(pk=self.pk), self.start, self.end).exists():
+            problems.append(_("%(person)s is already a member of %(unit)s at that time.") % {"person": self.person, "unit": self.association})
+        if self.pk and self.end is not None:
+            problems += self._positions_resting_on_it()
+        return problems
+
+    def _positions_resting_on_it(self):
+        """A membership can't end while a board role or lead rests on it."""
+        problems = []
+        held = Position.objects.filter(person=self.person_id, role__in=Position.NEEDS_MEMBERSHIP).filter(models.Q(end__isnull=True) | models.Q(end__gt=self.end))
+        for position in held.select_related("unit"):
+            if position.membership_problem(on=max(self.end, position.start), excluding=self.pk):
+                problems.append(_("%(person)s is %(role)s of %(unit)s, which needs this membership. End or hand over that position first.") % {"person": self.person, "role": position.get_role_display(), "unit": position.unit})
+        return problems
+
+
+class Position(Tie):
+    class Role(models.TextChoices):
+        # The keys never change. What people see comes from the dictionary (A7).
+        CHAIR = "chair", _("chair")
+        VICE_CHAIR = "vice_chair", _("vice chair")
+        TREASURER = "treasurer", _("treasurer")
+        SECRETARY = "secretary", _("secretary")
+        BOARD_MEMBER = "board_member", _("board member")
+        LEAD = "lead", _("lead")
+        PARTICIPANT = "participant", _("participant")
+
+    BOARD_ROLES = (Role.CHAIR, Role.VICE_CHAIR, Role.TREASURER, Role.SECRETARY, Role.BOARD_MEMBER)
+    TEAM_ROLES = (Role.LEAD, Role.PARTICIPANT)
+    NEEDS_MEMBERSHIP = (*BOARD_ROLES, Role.LEAD)
+
+    person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.PROTECT, related_name="positions")
+    unit = models.ForeignKey(Unit, verbose_name=_("unit"), on_delete=models.PROTECT, related_name="positions")
+    role = models.CharField(_("role"), max_length=20, choices=Role.choices)
+    title = models.CharField(_("title"), max_length=100, blank=True, help_text=_("Shown beside the role, such as Head of PR. It gives nothing beyond the role."))
+    appointed_by = models.CharField(_("appointed by"), max_length=200, blank=True, help_text=_("Such as Annual meeting 2026, or the board."))
+    minutes = models.CharField(_("minutes"), max_length=500, blank=True, help_text=_("Where the decision is recorded."))
+
+    unit_field = "unit"
+    fixed_fields = ("role",)
+
+    class Meta:
+        verbose_name = _("position")
+        verbose_name_plural = _("positions")
+        ordering = ["-start", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(end__isnull=True) | models.Q(end__gte=models.F("start")), name="position_ends_after_start"),
+            models.UniqueConstraint(fields=["unit"], condition=models.Q(role="chair", end__isnull=True), name="one_open_chair"),
+        ]
+
+    def __str__(self):
+        return f"{self.person}: {self.get_role_display()}, {self.unit}"
+
+    def membership_problem(self, on, excluding=None):
+        """Why this person can't hold this role here on that day, as a non-member, or None.
+        A board role needs a membership of the association, and a lead one of the
+        association owning the team or of one taking part in it."""
+        if self.role in self.BOARD_ROLES:
+            needed = [self.unit]
+        elif self.role == self.Role.LEAD:
+            needed = [self.unit.association(), *self.unit.taking_part.all()]
+        else:
+            return None
+        if any(self.person.is_member(association, on=on, excluding=excluding) for association in needed):
+            return None
+        names = ", ".join(str(association) for association in needed)
+        return _("Only a member can be %(role)s here: %(person)s isn't a member of %(names)s on %(day)s.") % {"role": self.get_role_display(), "person": self.person, "names": names, "day": on}
+
+    def problems(self):
+        problems = super().problems()
+        unit = self.unit
+        if self.role in self.BOARD_ROLES and unit.kind != Unit.Kind.ASSOCIATION:
+            problems.append(_("A board role sits in an association. %(unit)s is a team.") % {"unit": unit})
+        if self.role in self.TEAM_ROLES and unit.kind != Unit.Kind.TEAM:
+            problems.append(_("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": unit})
+        stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None and unit.archived:
+            problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
+        if not problems and self.start and (stored is None or stored.start != self.start):
+            problem = self.membership_problem(on=self.start)
+            if problem:
+                problems.append(problem)
+        if self.role == self.Role.CHAIR and self.start:
+            others = Tie.overlapping(Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR).exclude(pk=self.pk), self.start, self.end)
+            if stored is None:  # a new chair ends an open one that started before
+                others = others.exclude(start__lt=self.start, end__isnull=True)
+            if others.exists():
+                problems.append(_("%(unit)s has one chair at a time, and %(other)s is chair then.") % {"unit": unit, "other": others.first().person})
+        return problems
+
+    def before_save(self):
+        # Appointing the next chair ends the last one's position on the day the new one starts.
+        if self.role == self.Role.CHAIR and self.pk is None:
+            for chair in Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True):
+                chair.end_on(self.start)
+
+
+class Reason(Tie):
+    """Why data is held on someone with no other tie. It always expires."""
+
+    class Kind(models.TextChoices):
+        APPLICANT = "applicant", _("applicant")
+        ALUMNUS = "alumnus", _("alumnus")
+        PARTNER_CONTACT = "partner_contact", _("partner contact")
+        CONTACT_FORM = "contact_form", _("contact-form sender")
+
+    class Basis(models.TextChoices):  # GDPR art. 6
+        CONSENT = "consent", _("consent")
+        CONTRACT = "contract", _("contract")
+        LEGITIMATE_INTEREST = "legitimate_interest", _("legitimate interest")
+        LEGAL_OBLIGATION = "legal_obligation", _("legal obligation")
+
+    end = None
+    person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.PROTECT, related_name="reasons")
+    kind = models.CharField(_("kind"), max_length=20, choices=Kind.choices)
+    unit = models.ForeignKey(Unit, verbose_name=_("unit"), on_delete=models.PROTECT, related_name="reasons")
+    source = models.CharField(_("source"), max_length=200, blank=True, help_text=_("Where it came from, such as the contact form or the alumni offer."))
+    legal_basis = models.CharField(_("legal basis"), max_length=20, choices=Basis.choices)
+    expires = models.DateField(_("expires"), help_text=_("The first day it no longer holds. Ending it sets this to today."))
+
+    objects = ReasonQuerySet.as_manager()
+    end_field = "expires"
+    unit_field = "unit"
+    fixed_fields = ("kind",)
+
+    class Meta:
+        verbose_name = _("reason")
+        verbose_name_plural = _("reasons")
+        ordering = ["-start", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(expires__gte=models.F("start")), name="reason_expires_after_start"),
+        ]
+
+    def __str__(self):
+        return f"{self.person}: {self.get_kind_display()}, {self.unit}"

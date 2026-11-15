@@ -19,9 +19,19 @@ class Role:
 FOLLOW_UPS = ("accounts.view_followup", "accounts.change_followup")
 # The tree of associations and teams. Operators keep it, until authority comes with positions.
 UNITS = ("structure.view_unit", "structure.add_unit", "structure.change_unit", "structure.delete_unit")
+# People and their ties. Operators keep them too, until authority and actions (A3, A6).
+# Ties are never deleted, so nobody gets that permission for them.
+TIES = ("membership", "position", "reason")
+SEE_PEOPLE = ("structure.view_person", "structure.view_emailaddress", *(f"structure.view_{tie}" for tie in TIES))
+PEOPLE = (
+    *SEE_PEOPLE,
+    "structure.add_person", "structure.change_person", "structure.delete_person",
+    "structure.add_emailaddress", "structure.change_emailaddress", "structure.delete_emailaddress",
+    *(f"structure.{verb}_{tie}" for tie in TIES for verb in ("add", "change")),
+)
 
 ROLES = (
-    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user", "structure.view_unit", *FOLLOW_UPS)),
+    Role("board", "Board", admin=True, requires_2fa=True, permissions=("accounts.view_user", "structure.view_unit", *SEE_PEOPLE, *FOLLOW_UPS)),
     Role("treasurer", "Treasurer", admin=True, requires_2fa=True),
     Role("events", "Events", admin=True),
     Role("developer", "Developer"),
@@ -41,6 +51,7 @@ ROLES = (
             "mfa.delete_authenticator",  # how someone who lost their phone starts over
             *FOLLOW_UPS,
             *UNITS,
+            *PEOPLE,
         ),
     ),
     Role("member", "Member"),

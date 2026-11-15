@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Loads one of the two made-up installations onto a test server, under its own
-association, which keeps its name and key. Run on the server as root. Never on an
-installation with real members: with --replace, it deletes everything under the root.
+association, which keeps its name and key, with made-up people and accounts. Run on
+the server as root. Never on an installation with real members: with --replace, it
+deletes everything under the root, and every tie to it.
 
     python3 tests/load_example.py society test.example.org
     python3 tests/load_example.py federation test.example.org --replace
@@ -27,14 +28,14 @@ EXAMPLES = ("society", "federation")
 LOAD = """
 import json, sys
 from django.core.exceptions import ValidationError
-from structure.examples import build
+from structure.examples import EXAMPLES, build
 from structure.models import Unit
 try:
     units = build({name}, Unit.objects.root(), replace={replace})
 except (ValidationError, Unit.DoesNotExist) as error:
     print(" ".join(getattr(error, "messages", [str(error)])), file=sys.stderr)
     sys.exit(1)
-print(json.dumps(sorted(units)))
+print(json.dumps({{"units": len(units), "people": len(EXAMPLES[{name}].people)}}))
 """
 
 
@@ -50,7 +51,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Load a made-up installation onto a test server.")
     parser.add_argument("example", choices=EXAMPLES)
     parser.add_argument("domain", help="this server's primary domain, to confirm it's the right one")
-    parser.add_argument("--replace", action="store_true", help="first delete every unit under the association")
+    parser.add_argument("--replace", action="store_true", help="first delete every unit under the association, and the made-up people")
     args = parser.parse_args(argv)
 
     check_domain(args.domain, CONFIG.read_text("utf-8"))
@@ -62,8 +63,8 @@ def main(argv=None):
     )
     if result.returncode:
         sys.exit(f"Nothing was loaded: {result.stderr.strip() or result.stdout.strip()}")
-    keys = json.loads(result.stdout.strip().splitlines()[-1])
-    print(f"Loaded Example {args.example.title()}: {len(keys)} units under the association. See them in the admin page, under Units.")
+    loaded = json.loads(result.stdout.strip().splitlines()[-1])
+    print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association and {loaded['people']} people. See them in the admin page, under Units and People.")
 
 
 if __name__ == "__main__":
