@@ -19,9 +19,9 @@ class Role:
 FOLLOW_UPS = ("accounts.view_followup", "accounts.change_followup")
 # The tree of associations and teams. Operators keep it, until authority comes with positions.
 UNITS = ("structure.view_unit", "structure.add_unit", "structure.change_unit", "structure.delete_unit")
-# People and their ties. Operators keep them too, until authority and actions (A3, A6).
-# Ties are never deleted, so nobody gets that permission for them.
-TIES = ("membership", "position", "reason")
+# People, their ties, and grants. Operators keep them too, until actions check authority
+# (A6). Ties and grants are never deleted, so nobody gets that permission for them.
+TIES = ("membership", "position", "reason", "grant")
 SEE_PEOPLE = ("structure.view_person", "structure.view_emailaddress", *(f"structure.view_{tie}" for tie in TIES))
 PEOPLE = (
     *SEE_PEOPLE,

@@ -480,7 +480,7 @@ class Grants(Federation):
 
     def test_merging_moves_the_grants_someone_gave(self):
         without = someone("Chair", member_of=self.u["chem"])
-        holds(without, self.u["chem"], Role.CHAIR)
+        holds(without, self.u["chem"], Role.VICE_CHAIR)
         g = grant(P.SEE_MEMBERS, Role.TREASURER, self.u["root"], self.u["chem"], without)
         with_account = User.objects.create_user("chair@example.org", name="Chair").person
         kept = Person.merge(without, with_account)

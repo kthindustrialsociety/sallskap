@@ -35,7 +35,7 @@ try:
 except (ValidationError, Unit.DoesNotExist) as error:
     print(" ".join(getattr(error, "messages", [str(error)])), file=sys.stderr)
     sys.exit(1)
-print(json.dumps({{"units": len(units), "people": len(EXAMPLES[{name}].people)}}))
+print(json.dumps({{"units": len(units), "people": len(EXAMPLES[{name}].people), "grants": len(EXAMPLES[{name}].grants)}}))
 """
 
 
@@ -64,7 +64,10 @@ def main(argv=None):
     if result.returncode:
         sys.exit(f"Nothing was loaded: {result.stderr.strip() or result.stdout.strip()}")
     loaded = json.loads(result.stdout.strip().splitlines()[-1])
-    print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association and {loaded['people']} people. See them in the admin page, under Units and People.")
+    if loaded["grants"]:
+        print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association, {loaded['people']} people and {loaded['grants']} grants. See them in the admin page, under Units, People and Grants.")
+    else:
+        print(f"Loaded Example {args.example.title()}: {loaded['units']} units under the association and {loaded['people']} people. See them in the admin page, under Units and People.")
 
 
 if __name__ == "__main__":

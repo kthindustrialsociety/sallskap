@@ -267,6 +267,8 @@ class Unit(models.Model):
     def deletion_problem_from_ties(self):
         if self.memberships.exists() or self.positions.exists() or self.reasons.exists():
             return _("People are or were tied to %(unit)s, and that record is kept.") % {"unit": self}
+        if self.grants.exists() or self.grants_to_roles.exists():
+            return _("A grant covers %(unit)s, or goes to a role in it, now or before, and that record is kept.") % {"unit": self}
         return None
 
     def membership_problems(self, below=True):
@@ -376,7 +378,7 @@ class Person(models.Model):
     def deletion_problem(self):
         if self.user_id:
             return _("%(person)s has an account.") % {"person": self}
-        if self.memberships.exists() or self.positions.exists() or self.reasons.exists():
+        if self.memberships.exists() or self.positions.exists() or self.reasons.exists() or self.grants_given.exists():
             return _("%(person)s is or was tied to a unit, and that record is kept.") % {"person": self}
         return None
 
@@ -437,6 +439,7 @@ class Person(models.Model):
             Membership.objects.filter(pk=membership.pk).update(person=kept, start=membership.start, end=membership.end)
         Position.objects.filter(person=gone).update(person=kept)
         Reason.objects.filter(person=gone).update(person=kept)
+        Grant.objects.filter(given_by=gone).update(given_by=kept)
 
         if gone.user_id:
             user = gone.user
@@ -608,9 +611,13 @@ class Tie(models.Model):
             queryset = queryset.filter(start__lt=end)
         return queryset.filter(models.Q(end__isnull=True) | models.Q(end__gt=start))
 
+    def identity(self):
+        """Who it's for and where: fixed once set, and needed before the rules can be checked."""
+        return ("person_id", f"{self.unit_field}_id")
+
     def clean(self):
         super().clean()
-        if self.person_id and getattr(self, f"{self.unit_field}_id"):  # a form shows a missing one by itself
+        if all(getattr(self, name) for name in self.identity()):  # a form shows a missing one by itself
             self.check_rules()
 
     def check_rules(self):
@@ -625,7 +632,7 @@ class Tie(models.Model):
             problems.append(_("It can't end before it starts."))
         stored = type(self).objects.filter(pk=self.pk).first() if self.pk else None
         if stored is not None:
-            fixed = ("person_id", f"{self.unit_field}_id", *self.fixed_fields)
+            fixed = (*self.identity(), *self.fixed_fields)
             if any(getattr(stored, name) != getattr(self, name) for name in fixed):
                 problems.append(_("Who it's for, where, and which role can't change once set: end it and add a new one."))
         return problems
@@ -805,3 +812,88 @@ class Reason(Tie):
 
     def __str__(self):
         return f"{self.person}: {self.get_kind_display()}, {self.unit}"
+
+
+# ---- Authority: structure.md §4 --------------------------------------------------------
+
+
+class Permission(models.TextChoices):
+    """What can() is asked about: see authority.py. The keys never change."""
+
+    SEE_MEMBERS = "see_members", _("see members")
+    MANAGE_MEMBERSHIPS = "manage_memberships", _("manage memberships")
+    MANAGE_EVENTS = "manage_events", _("manage events")
+    SEND_MAILINGS = "send_mailings", _("send mailings")
+    MANAGE_DOCUMENTS = "manage_documents", _("manage documents")
+    MANAGE_FINANCES = "manage_finances", _("fees and treasury")
+    # These can't be given away, so authority over people and units stays with heads.
+    MANAGE_PARTICIPANTS = "manage_participants", _("manage participants")
+    APPOINT = "appoint", _("appoint")
+    MANAGE_UNITS = "manage_units", _("manage units")
+    GIVE_GRANTS = "give_grants", _("give grants")
+    END_SERVICE = "end_service", _("end a service")
+
+
+GRANTABLE = (
+    Permission.SEE_MEMBERS, Permission.MANAGE_MEMBERSHIPS, Permission.MANAGE_EVENTS,
+    Permission.SEND_MAILINGS, Permission.MANAGE_DOCUMENTS, Permission.MANAGE_FINANCES,
+)
+
+
+class Grant(Tie):
+    """One permission given to a role in a unit, such as the root's treasurer, over one
+    unit or it and everything inside it. Whoever holds the role has it, so it passes to
+    the next holder. Dated like a tie, ended and never deleted."""
+
+    permission = models.CharField(_("permission"), max_length=30, choices=[(p.value, p.label) for p in GRANTABLE])
+    role = models.CharField(_("to the role"), max_length=20, choices=Position.Role.choices)
+    held_in = models.ForeignKey(
+        Unit, verbose_name=_("held in"), on_delete=models.PROTECT, related_name="grants_to_roles",
+        help_text=_("Where the role is held, such as the association whose treasurer it's for."),
+    )
+    unit = models.ForeignKey(Unit, verbose_name=_("covers"), on_delete=models.PROTECT, related_name="grants")
+    include_below = models.BooleanField(_("and everything inside it"), default=False)
+    given_by = models.ForeignKey(
+        Person, verbose_name=_("given by"), on_delete=models.PROTECT, related_name="grants_given",
+        help_text=_("A chair or vice chair with authority over the unit it covers, on the day it starts."),
+    )
+
+    fixed_fields = ("permission", "role", "include_below")
+
+    class Meta:
+        verbose_name = _("grant")
+        verbose_name_plural = _("grants")
+        ordering = ["-start", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(end__isnull=True) | models.Q(end__gte=models.F("start")), name="grant_ends_after_start"),
+            models.CheckConstraint(condition=models.Q(permission__in=[p.value for p in GRANTABLE]), name="grant_only_what_can_be_given"),
+        ]
+
+    def __str__(self):
+        where = _("%(unit)s and everything inside it") if self.include_below else "%(unit)s"
+        return _("%(role)s of %(held_in)s: %(permission)s in %(where)s") % {
+            "role": self.get_role_display(), "held_in": self.held_in, "permission": self.get_permission_display(),
+            "where": where % {"unit": self.unit},
+        }
+
+    def identity(self):
+        return ("held_in_id", "unit_id", "given_by_id")
+
+    def problems(self):
+        from .authority import can
+
+        problems = super().problems()
+        held_in = self.held_in
+        if self.role in Position.BOARD_ROLES and held_in.kind != Unit.Kind.ASSOCIATION:
+            problems.append(_("A board role sits in an association. %(unit)s is a team.") % {"unit": held_in})
+        if self.role in Position.TEAM_ROLES and held_in.kind != Unit.Kind.TEAM:
+            problems.append(_("A lead or participant sits in a team. %(unit)s is an association.") % {"unit": held_in})
+        stored = Grant.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None:
+            for unit in {held_in, self.unit}:
+                if unit.archived:
+                    problems.append(_("%(unit)s is archived, so nothing new is given in it.") % {"unit": unit})
+        if not problems and self.start and (stored is None or stored.start != self.start):
+            if not can(self.given_by, Permission.GIVE_GRANTS, self.unit, on=self.start):
+                problems.append(_("%(person)s couldn't give grants in %(unit)s on %(day)s: only a chair or vice chair with authority there can.") % {"person": self.given_by, "unit": self.unit, "day": self.start})
+        return problems

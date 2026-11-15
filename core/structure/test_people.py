@@ -17,7 +17,7 @@ from accounts import sync
 from accounts.tests import CaddyClient, make_user
 
 from . import examples
-from .models import EmailAddress, Membership, Person, Position, Reason, Unit
+from .models import EmailAddress, Grant, Membership, Person, Position, Reason, Unit
 
 ASSOCIATION, TEAM = Unit.Kind.ASSOCIATION, Unit.Kind.TEAM
 Role = Position.Role
@@ -576,7 +576,7 @@ class Examples(TestCase):
         for name in examples.EXAMPLES:
             with self.subTest(name=name), transaction.atomic():
                 self.build(name)
-                for model in (Person, EmailAddress, Membership, Position, Reason):
+                for model in (Person, EmailAddress, Membership, Position, Reason, Grant):
                     for row in model.objects.all():
                         row.full_clean()
                 transaction.set_rollback(True)

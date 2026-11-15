@@ -5,7 +5,7 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
-from .models import EmailAddress, Membership, Person, Position, Reason, Unit, normalize_address, path_and_above
+from .models import EmailAddress, Grant, Membership, Person, Position, Reason, Unit, normalize_address, path_and_above
 
 
 class UnitForm(forms.ModelForm):
@@ -346,3 +346,21 @@ class ReasonAdmin(TieAdmin):
     fields = ("person", "kind", "unit", "source", "legal_basis", "start", "expires")
     fixed_on_change = ("person", "unit", "kind")
     list_select_related = ("person", "unit")
+
+
+@admin.register(Grant)
+class GrantAdmin(TieAdmin):
+    """A permission given to a role in a unit (structure.md §4). Ended, never deleted."""
+
+    list_display = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "current")
+    list_filter = (CurrentFilter, "permission", "role")
+    fields = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "given_by")
+    fixed_on_change = ("permission", "role", "held_in", "unit", "include_below", "given_by")
+    list_select_related = ("held_in", "unit")
+    search_fields = ("held_in__name", "unit__name", "given_by__name")
+    autocomplete_fields = ("given_by",)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name in ("held_in", "unit"):
+            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
