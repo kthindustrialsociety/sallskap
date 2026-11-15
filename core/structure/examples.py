@@ -1,6 +1,6 @@
 """The two made-up installations, for core's tests, the test server and later the
-public demo. They grow with each segment: units and people now, then grants, seat
-rules and words. Nothing calls this on a real installation. The test server loads
+public demo. They grow with each segment: units, people and grants now, then seat rules
+and words. Nothing calls this on a real installation. The test server loads
 one with tests/load_example.py.
 
 Reserved names only (RFC 2606), so nothing can be mistaken for a real association."""
@@ -13,7 +13,7 @@ from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
-from .models import EmailAddress, Membership, Person, Position, Reason, Unit, _erase
+from .models import EmailAddress, Grant, Membership, Permission, Person, Position, Reason, Unit, _erase
 
 TEAM, ASSOCIATION = Unit.Kind.TEAM, Unit.Kind.ASSOCIATION
 
@@ -68,11 +68,25 @@ class Who:
 
 
 @dataclass(frozen=True)
+class Given:
+    """A grant: a permission to a role held in a unit, over a unit, given by someone."""
+
+    permission: str
+    role: str
+    held_in: str  # a key, or ROOT
+    unit: str  # a key, or ROOT
+    start: date
+    by: str  # the giver's address
+    include_below: bool = False
+
+
+@dataclass(frozen=True)
 class Example:
     root_key: str  # used when the tests make the root. On a server, it comes from the config
     root_name: str
     units: tuple[Spec, ...]
     people: tuple[Who, ...] = ()
+    grants: tuple[Given, ...] = ()  # none in Example Society: they're optional
 
 
 R = Position.Role
@@ -151,6 +165,7 @@ FEDERATION = Example(
         Who("Tor Example", "tor@example.org", memberships=(member("robotics", date(2022, 9, 1)),), positions=(holds(ROOT, R.VICE_CHAIR, date(2026, 7, 1)),)),
         Who("Selma Example", "selma@example.org", memberships=(member(ROOT, date(2024, 9, 1)),), positions=(holds(ROOT, R.TREASURER, date(2026, 7, 1)),)),
         Who("Rikard Example", "rikard@example.org", memberships=(member("chemistry", date(2023, 9, 1)),), positions=(holds(ROOT, R.SECRETARY, date(2026, 7, 1)),)),
+        Who("Ylva Example", "ylva@example.org", memberships=(member("chemistry", date(2023, 9, 1)),), positions=(holds(ROOT, R.BOARD_MEMBER, date(2026, 7, 1)),)),
         # Robotics, and one person with positions in both associations.
         Who("Quinn Example", "quinn@example.org", memberships=(member("robotics", date(2023, 9, 1)),), positions=(holds("robotics", R.CHAIR, date(2026, 5, 1)),)),
         Who("Pia Example", "pia@example.org", memberships=(member("robotics", date(2023, 9, 1)),), positions=(holds("robotics", R.VICE_CHAIR, date(2026, 5, 1)),)),
@@ -158,7 +173,9 @@ FEDERATION = Example(
             holds("robotics", R.TREASURER, date(2026, 5, 1)),
             holds("chemistry", R.BOARD_MEMBER, date(2026, 4, 1)),
         )),
-        Who("Otto Example", "otto@example.org", memberships=(member("robotics", date(2024, 9, 1)),), positions=(holds("operations", R.LEAD, date(2025, 9, 1)),)),
+        # Operations changed lead, and the grant to its lead passed on (below).
+        Who("Otto Example", "otto@example.org", memberships=(member("robotics", date(2024, 9, 1)),), positions=(holds("operations", R.LEAD, date(2025, 9, 1), date(2026, 10, 1)),)),
+        Who("Zara Example", "zara@example.org", memberships=(member("robotics", date(2024, 9, 1)),), positions=(holds("operations", R.LEAD, date(2026, 10, 1)),)),
         Who("Nils Example", "nils@example.org", memberships=(member("robotics", date(2023, 9, 1)),), positions=(holds("uavs", R.LEAD, date(2025, 1, 10)),)),
         Who("Mira Example", "mira@example.org", memberships=(member("robotics", date(2024, 9, 1)),), positions=(
             holds("drone-race-2027", R.LEAD, date(2026, 9, 1)),
@@ -176,6 +193,12 @@ FEDERATION = Example(
         # The advisory board: an alumnus, who is no longer a member, and someone from outside.
         Who("Greta Example", "greta@example.org", memberships=(member("robotics", date(2015, 9, 1), date(2020, 7, 1)),), positions=(holds("advisory-board", R.PARTICIPANT, date(2024, 1, 1), title="Advisor"),), reasons=(alumnus("robotics", date(2020, 7, 1), date(2030, 7, 1)),)),
         Who("Folke Advisor", "folke@example.net", positions=(holds("advisory-board", R.PARTICIPANT, date(2024, 1, 1), title="Advisor"),)),
+    ),
+    (
+        # structure.md §4's three. The first outlived Viktor, the chair who gave it.
+        Given(Permission.MANAGE_FINANCES, R.TREASURER, ROOT, ROOT, date(2025, 9, 1), "viktor@example.org", include_below=True),
+        Given(Permission.SEE_MEMBERS, R.BOARD_MEMBER, ROOT, ROOT, date(2026, 7, 1), "una@example.org", include_below=True),
+        Given(Permission.SEND_MAILINGS, R.LEAD, "operations", "robotics", date(2026, 5, 15), "quinn@example.org"),
     ),
 )
 
@@ -198,17 +221,19 @@ def _remove(root, below):
     deleted like this, so it's only for a test server."""
     addresses = example_addresses()
     people = Person.objects.filter(emails__address__in=addresses)
+    _erase(Grant.objects.filter(models.Q(unit__in=below) | models.Q(held_in__in=below) | models.Q(given_by__in=people)))
     for model, unit in ((Membership, "association"), (Position, "unit"), (Reason, "unit")):
         _erase(model.objects.filter(models.Q(**{f"{unit}__in": below}) | models.Q(person__in=people)))
     get_user_model().objects.filter(email__in=addresses).delete()
     _erase(Person.objects.filter(pk__in=list(people.values_list("pk", flat=True))))
 
 
+def _where(units, root, key):
+    return root if key == ROOT else units[key]
+
+
 def _add_people(people, units, root):
     User = get_user_model()
-
-    def where(key):
-        return root if key == ROOT else units[key]
 
     for who in people:
         if who.account:
@@ -217,11 +242,11 @@ def _add_people(people, units, root):
             person = Person.objects.create(name=who.name)
             EmailAddress.objects.create(person=person, address=who.email, verified_at=timezone.now())
         for tie in who.memberships:
-            Membership.objects.create(person=person, association=where(tie.unit), kind=tie.what, start=tie.start, end=tie.end)
+            Membership.objects.create(person=person, association=_where(units, root, tie.unit), kind=tie.what, start=tie.start, end=tie.end)
         for tie in who.positions:
-            Position.objects.create(person=person, unit=where(tie.unit), role=tie.what, title=tie.title, start=tie.start, end=tie.end)
+            Position.objects.create(person=person, unit=_where(units, root, tie.unit), role=tie.what, title=tie.title, start=tie.start, end=tie.end)
         for tie in who.reasons:
-            Reason.objects.create(person=person, unit=where(tie.unit), kind=tie.what, legal_basis=tie.basis, source=tie.source, start=tie.start, expires=tie.end)
+            Reason.objects.create(person=person, unit=_where(units, root, tie.unit), kind=tie.what, legal_basis=tie.basis, source=tie.source, start=tie.start, expires=tie.end)
 
 
 @transaction.atomic
@@ -258,7 +283,12 @@ def build(name, root, replace=False):
         if spec.taking_part:
             unit.taking_part.add(*(units[key] for key in spec.taking_part))
     _add_people(example.people, units, root)
-    for spec in _all(example.units):  # last, as nobody is added to an archived team
+    for given in example.grants:
+        Grant.objects.create(
+            permission=given.permission, role=given.role, held_in=_where(units, root, given.held_in), unit=_where(units, root, given.unit),
+            include_below=given.include_below, start=given.start, given_by=Person.objects.get(emails__address=given.by),
+        )
+    for spec in _all(example.units):  # last, as nothing new goes into an archived team
         if spec.archived:
             units[spec.key].archive()
     return units

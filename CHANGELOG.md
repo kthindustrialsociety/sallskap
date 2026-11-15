@@ -40,6 +40,10 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - Only members hold board roles or lead teams, and membership of an association counts for every association above it.
   - When an account's address is changed, the old one stays on its person, unverified, so it can be given to someone else, such as a role's shared address.
   - Nobody's access changes yet: the groups stay as they are until access is worked out from positions.
+- feat: authority, and grants (structure.md §4).
+  - One check decides what each role can do, and in which units, from current positions and grants. Nothing but grants uses it yet: the admin page's changes, the member pages and the CLI move to it later.
+  - Operators give and end grants in the admin page, under Grants, and Board can see them. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
+  - **Two-factor authentication is required for anyone with a board role in any association,** from the day the position is recorded, as well as for the Board, Treasurer and Operator groups as before. Someone given a board role is asked to set it up before the admin page or any tool lets them in.
 
 ## 0.7.2 (2026-11-10)
 

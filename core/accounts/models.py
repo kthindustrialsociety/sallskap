@@ -102,7 +102,11 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     @property
     def requires_2fa(self):
-        return self.is_superuser or self.has_role(*TWO_FACTOR_ROLES)
+        """The groups that need it, and a board role anywhere (structure.md §4). The Board
+        and Treasurer groups keep needing it until they're worked out from positions."""
+        from structure.authority import requires_2fa
+
+        return self.is_superuser or self.has_role(*TWO_FACTOR_ROLES) or requires_2fa(self)
 
     @property
     def needs_2fa_setup(self):

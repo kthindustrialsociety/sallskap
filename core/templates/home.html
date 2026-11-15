@@ -4,7 +4,7 @@
 {% block content %}
   <h1>{% blocktranslate with email=user.email %}Logged in as {{ email }}{% endblocktranslate %}</h1>
   {% if user.needs_2fa_setup %}
-    <p>{% translate "Your group requires two-factor authentication before you can use the admin page." %}</p>
+    <p>{% translate "Your role requires two-factor authentication before you can use the admin page or log in to the other tools." %}</p>
     <p><a href="{% url 'mfa_index' %}">{% translate "Set up two-factor authentication" %}</a></p>
   {% elif user.is_staff %}
     <p><a href="{% url 'admin:index' %}">{% translate "Go to the admin page" %}</a></p>
