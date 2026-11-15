@@ -34,6 +34,11 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - A unit's key is fixed once set and never reused. A project is archived by hand, which archives everything inside it.
   - Nothing is visible to members yet, and nobody's access changes.
   - `kit init` now asks for the association's name and key.
+- feat: people, and the ties between them and units (structure.md §2 and §3).
+  - Every account becomes a person, with its name and its address, marked verified. Accounts themselves don't change, so neither does anything the tools see.
+  - Operators add people, memberships, positions and reasons in the admin page, under People, and Board can see them. Ties are ended, never deleted, so the record of who held what is kept.
+  - Only members hold board roles or lead teams, and membership of an association counts for every association above it.
+  - Nobody's access changes yet: the groups stay as they are until access is worked out from positions.
 
 ## 0.7.2 (2026-11-10)
 

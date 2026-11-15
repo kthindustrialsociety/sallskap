@@ -23,7 +23,7 @@ kit init example.org --name "Example Society" --key example
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
-| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units are in core |
+| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units, people and their ties are in core |
 | `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `docs/updating.md` | What `kit update` does |
@@ -104,11 +104,11 @@ docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \
 
 `tests/live_check.py` checks a running server from the outside, and creates fake users, so don't run it on an installation with real members.
 
-Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams and projects, and **Example Federation**, with associations inside it. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page:
+Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams, projects and their people, and **Example Federation**, with associations inside it, people in several of them, and an advisory board. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page:
 
 ```sh
 python3 tests/load_example.py society test.example.org               # the server's primary domain, to confirm
-python3 tests/load_example.py federation test.example.org --replace  # deletes every unit under the association first
+python3 tests/load_example.py federation test.example.org --replace  # first deletes every unit under the association, and the made-up people
 ```
 
 ## License
