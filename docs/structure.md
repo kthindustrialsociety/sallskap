@@ -36,9 +36,10 @@ Example Federation              association, the root
 
 One `Person` row for **everyone the association holds data about:** members, board, people signed up for an event, subscribers, applicants, alumni and partner contacts.
 
-- **Kept to a minimum:** name, language and email addresses. Emails are in their own table, each marked verified or not.
-- **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change.
-- **Two rows are merged only on a verified email,** or by hand. An unverified email never joins someone to an existing person.
+- **Kept to a minimum:** a name and email addresses, and nothing else. There's no language setting: pages follow the browser's language, and mail goes out in the installation's. What an association asks of its members goes in member fields, on the membership (§3).
+- **Emails are in their own table,** each marked verified or not. A verified address belongs to one person only. The same address can be on several people unverified, which is how a sign-up with a member's address gets its own row instead of joining theirs.
+- **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. The account's login address is always one of its person's verified addresses. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change. Their addresses are marked verified, as they were typed in by an operator and already used to log in. An operator's typo becomes a verified address too, so check addresses when adding an account.
+- **Two rows are merged only on a verified email,** or by hand. An unverified email never joins someone to an existing person. When an address is verified and another person already holds it verified, the two become one: addresses, ties and reasons move over, and the emptied row is deleted. Two people who both have an account are never merged, as one of their `sub`s would vanish. If only one has an account, that's the person kept.
 - **There's no general contact list.** People are seen through what ties them to a unit, so a chair sees their own members and the people signed up for their own events. One privacy role can search everyone, to answer GDPR requests.
 - **Visitors aren't people in this model.** Page statistics come from the web server's logs, counted, and never linked to anyone.
 
@@ -48,17 +49,22 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 
 | Tie | Fields | Meaning |
 |---|---|---|
-| `Membership` | person, association, kind (ordinary, honorary), start, end | A member of that association, **and of every association above it** |
-| `Position` | person, unit, role, title, start, end, appointed by, minutes, seat rule | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms. A position that comes from a seat rule (§4) records which one |
+| `Membership` | person, association, kind (ordinary, honorary), start, end, member fields | A member of that association, **and of every association above it** |
+| `Position` | person, unit, role, title, start, end, appointed by, minutes, seat rule | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms. A position that comes from a seat rule (§4) records which one. "Appointed by" and "minutes" are free text, such as "Annual meeting 2026" and where its minutes are |
 | `Registration` | person, event, ticket, status, checked in | Signed up for an event (§6) |
 | `Subscription` | person, unit, topic (events, news), include units below, confirmed, ended | Follows a unit's events or news (§6) |
-| `Reason` | person, kind, unit, source, legal basis, expires | Why data is held on someone with no other tie: applicant, alumnus, partner contact, contact-form sender |
+| `Reason` | person, kind, unit, source, legal basis, start, expires | Why data is held on someone with no other tie: applicant, alumnus, partner contact, contact-form sender. The legal basis is consent, contract, legitimate interest or legal obligation (GDPR art. 6). It always expires, and ending it sets that date to today |
 
-- **Membership is only of associations, and is inherited upwards.** A member of Robotics is a member of the root, for example to vote at its annual meeting, so joining once is enough. Someone can also be a member of the root directly, outside every association inside it. In teams, people hold positions instead.
+- **Dates, not times.** A tie's end is the first day it no longer holds, so a tie ended today stops today. A start can be in the future, as a board is often elected before it takes office. A person has at most one current membership of each association.
+
+- **Membership is only of associations, and is inherited upwards.** A member of Robotics is a member of the root, for example to vote at its annual meeting, so joining once is enough. Someone can also be a member of the root directly, outside every association inside it. In teams, people hold positions instead. What someone is a member of is worked out from their memberships and the tree, never stored, so moving a unit or ending a membership can't leave it wrong.
+- **Member fields:** what an association asks of its members beyond name and email, such as a programme, a graduation year or "member of the student union (yes/no)". Each association defines its own, as data: a name, a type (yes/no, text, number, or one of a list), whether it's required, and why it's held. The answers sit on the membership, so only those who can see that association's members see them, and they go with the membership. Built with `members`.
 - **Apps add and end ties and reasons,** and delete their own data when its time is up.
 - **A person with no account, no current tie and no live reason is deleted** after a short grace period.
 - **The record of who was involved is kept.** When someone is deleted, their ended positions stay, board and team alike, with their name and nothing else: no email and no other ties. So every unit keeps a full list of who led it and who took part, and when. It's kept as the association's records, which the privacy policy says, and it's the one exception to deletion. Plain memberships, sign-ups and subscriptions are deleted.
-- **Non-members can take part in teams,** as a `participant`, such as a partner's employee or a student from elsewhere. Their position is their tie. They can never hold a board role or be a `lead`.
+- **Non-members can take part in teams,** as a `participant`, such as a partner's employee or a student from elsewhere. Their position is their tie. They can never hold a board role or be a `lead`: a board role in an association needs a membership of it, and a team's `lead` a membership of the association that owns the team or of one taking part in it, counting upwards in both cases. A membership can't end while it's what a board role or lead rests on: end or hand over the position first.
+- **Board roles sit in associations,** and `lead` and `participant` in teams. An association has one `chair` at a time, and appointing the next ends the last one's position on the day the new one starts. Every other role can have several holders, such as two vice chairs or co-leads.
+- **An advisory board is a team** whose advisors are participants, with "Advisor" as their title. They needn't be members, have no authority, and get the team's access in the tools.
 - **Alumni:** when a membership ends, the person is offered to stay as an alumnus, with their consent, as a `Reason` that's renewed every few years.
 
 ## 4. Roles and authority
