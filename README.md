@@ -23,7 +23,7 @@ kit init example.org --name "Example Society" --key example
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
-| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units, people and their ties are in core |
+| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units, people, their ties and authority are in core |
 | `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `docs/updating.md` | What `kit update` does |
@@ -32,7 +32,7 @@ kit init example.org --name "Example Society" --key example
 | `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
 | `kit/` | The `kit` CLI, in progress |
 | `systemd/` | The timer that takes a backup every night |
-| `core/` | Django: accounts, login, the tree of associations and teams (`core/structure/`), and the admin page. Who sees what is set in `core/accounts/roles.py` |
+| `core/` | Django: accounts, login, the tree of associations and teams (`core/structure/`), and the admin page. Who sees what in the admin page is set in `core/accounts/roles.py`, and who can do what in the tree in `core/structure/authority.py` |
 | `modules/website/` | Public sites and redirects |
 | `modules/git/` | Forgejo, with login through core |
 | `modules/vault/` | Vaultwarden, with login through core |
