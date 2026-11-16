@@ -718,7 +718,7 @@ def check_login_service(host, secrets_by_name):
     claims = verified_claims(host, tool, tokens["id_token"])
     check("The signature checks out against the published key", "refused" not in claims, str(claims))
     check("It says who it is", claims.get("email") == email_of("fake-tool-member"), str(claims.get("email")))
-    member_keys = [f"{root_key()}:member", "member"]
+    member_keys = sorted([f"{root_key()}:member", "member"])
     check("It passes on the person's keys", claims.get("groups") == member_keys, str(claims.get("groups")))
     check("...the same ones the worker sends", claims.get("groups") == keys_of(email_of("fake-tool-member")), str(claims.get("groups")))
     check("It includes the tool's nonce", claims.get("nonce") == "nonce-from-the-tool")
@@ -2340,11 +2340,13 @@ TOTP.activate(get_user_model().objects.get(email={email!r}), generate_totp_secre
     check("Their account still works, for public repos", forgejo_api(host, token, "GET", "/user")[0] == 200)
     check("A colleague on the team isn't affected", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-after"))
 
+    # An ordinary member holds no team, whatever a made-up installation loaded beside this
+    # gives the board, such as a seat on an extended board.
     mover, token = git_person(host, "fake-sync-moved", secrets_by_name)
     moved_repo = "fake-sync-moved-repo"
-    check("A team's lead who's about to join the board instead creates a repo", make_repo(host, token, moved_repo))
-    give(email_of("fake-sync-moved"), ["board"])
-    check("On joining the board, they can read it", can_clone(host, "fake-sync-moved", token, moved_repo))
+    check("A team's lead creates a repo, and opens it to members", make_repo(host, token, moved_repo) and give_repo(host, token, "members", moved_repo) == 204)
+    give(email_of("fake-sync-moved"), ["member"])
+    check("Once just a member, they can read it", can_clone(host, "fake-sync-moved", token, moved_repo))
     check("...but no longer write to it", not can_push(host, "fake-sync-moved", token, moved_repo, "after"))
     check("...as they aren't a collaborator", "fake-sync-moved" not in collaborators(host, moved_repo), str(collaborators(host, moved_repo)))
 
@@ -2894,8 +2896,8 @@ def archive_the_project():
 
 def owners_of(host, org):
     token = sync_env()["FORGEJO_ADMIN_TOKEN"]
-    teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams")[1] or []
-    owners = next((team for team in teams if team["name"] == "Owners"), None)
+    status, teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams")
+    owners = next((team for team in teams if team["name"] == "Owners"), None) if status == 200 else None
     return sorted(member["login"] for member in forgejo_api(host, token, "GET", f"/teams/{owners['id']}/members")[1]) if owners else []
 
 
