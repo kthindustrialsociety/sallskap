@@ -270,16 +270,20 @@ def process(row, connectors, down=None, units=None):
 
 
 def run_once(connectors, tick=lambda: None):
-    """The newest first, so someone just removed doesn't wait behind a look at everyone,
-    or behind others being retried. `tick` says the worker is still alive, each time."""
-    due = AccessSync.objects.filter(Q(retry_at__isnull=True) | Q(retry_at__lte=timezone.now()), pending=True)
-    rows = list(due.select_related("user").order_by("-requested_at")[:BATCH])
-    down = {}
-    units = tree() if rows else ()
-    for row in rows:
-        process(row, connectors, down, units)
+    """The newest first, each time, so someone just removed doesn't wait behind a look at
+    everyone, or behind others being retried, even one already under way. Each is told
+    once per run, and with the tree as it is then. `tick` says the worker is still alive,
+    each time."""
+    down, done = {}, []
+    while len(done) < BATCH:
+        due = AccessSync.objects.filter(Q(retry_at__isnull=True) | Q(retry_at__lte=timezone.now()), pending=True).exclude(pk__in=done)
+        row = due.select_related("user").order_by("-requested_at").first()
+        if row is None:
+            break
+        done.append(row.pk)
+        process(row, connectors, down)
         tick()
-    return len(rows)
+    return len(done)
 
 
 def stuck():

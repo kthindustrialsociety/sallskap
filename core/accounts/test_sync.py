@@ -307,6 +307,23 @@ class Working(Base):
         sync.run_once([self.connector])
         self.assertEqual(self.connector.seen[0].sub, sync.sub_of(other))
 
+    def test_a_change_during_a_look_at_everyone_goes_next(self):
+        """Not after the rest of the people already picked up."""
+        others = [make_user(f"other{n}@example.org", ["member"])[0] for n in range(3)]
+        sync.request_for_everyone()
+        late = make_user("late@example.org")[0]
+        order = []
+
+        class Watching(FakeConnector):
+            def apply(self, person, note):
+                order.append(person.sub)
+                if len(order) == 1:
+                    sync.request_for(late)
+
+        sync.run_once([Watching()])
+        self.assertEqual(order[1], sync.sub_of(late))
+        self.assertEqual(len(order), len(others) + 2)
+
     def test_a_tool_not_answering_only_costs_one_try_each_time(self):
         """A hung tool times out for every person otherwise, which holds up the worker."""
         make_user("other@example.org", ["member"])
