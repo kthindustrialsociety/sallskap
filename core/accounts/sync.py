@@ -25,10 +25,8 @@ from allauth.idp.oidc.models import Client
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext as _
-from structure.access import for_tools
-from structure.models import Membership, Position
-from structure.models import Unit as Node
-from structure.models import path_and_above
+from structure import models as structure
+from structure.access import for_tools, keys
 
 from .login_service import may_use
 from .models import AccessSync, FollowUp, User
@@ -64,10 +62,10 @@ class Person:
 
 def tree():
     """Every unit, with the association each one is or belongs to: one query."""
-    rows = list(Node.objects.values_list("key", "name", "kind", "path", "parent_id"))
-    associations = {path: key for key, _name, kind, path, _parent in rows if kind == Node.Kind.ASSOCIATION}
+    rows = list(structure.Unit.objects.values_list("key", "name", "kind", "path", "parent_id"))
+    associations = {path: key for key, _name, kind, path, _parent in rows if kind == structure.Unit.Kind.ASSOCIATION}
     return tuple(
-        Unit(key, name, kind == Node.Kind.TEAM, next(associations[above] for above in reversed(path_and_above(path)) if above in associations), parent is None)
+        Unit(key, name, kind == structure.Unit.Kind.TEAM, next(associations[above] for above in reversed(structure.path_and_above(path)) if above in associations), parent is None)
         for key, name, kind, path, parent in rows
     )
 
@@ -79,17 +77,28 @@ def sub_of(user):
     return get_adapter().get_user_sub(None, user)
 
 
-def _ask(sub, user, label, wait=None):
-    now = timezone.now()
+def _ask(sub, user, label):
     AccessSync.objects.update_or_create(
         sub=sub,
-        defaults={"user": user, "label": label, "requested_at": now, "pending": True, "attempts": 0, "retry_at": now + wait if wait else None},
+        defaults={"user": user, "label": label, "requested_at": timezone.now(), "pending": True, "attempts": 0, "retry_at": None},
     )
 
 
 def request_for(user, wait=None):
-    """`wait` holds it back for a while, such as until a tool has made someone's account."""
-    _ask(sub_of(user), user, user.email, wait)
+    """`wait` asks for it to be done no sooner than that, such as once a tool has made
+    someone's account. If they're already waiting, they keep their place, and their
+    attempts if a tool is down: it's only moved to the later of the two times."""
+    sub = sub_of(user)
+    if wait is None:
+        return _ask(sub, user, user.email)
+    now = timezone.now()
+    row = AccessSync.objects.filter(sub=sub, pending=True).first()
+    if row is None:
+        AccessSync.objects.update_or_create(
+            sub=sub, defaults={"user": user, "label": user.email, "requested_at": now, "pending": True, "attempts": 0, "retry_at": now + wait}
+        )
+    else:
+        AccessSync.objects.filter(pk=row.pk).update(requested_at=now, retry_at=max(row.retry_at or now + wait, now + wait))
 
 
 def request_for_deleted(user):
@@ -117,7 +126,7 @@ def request_for_new_days(since, today):
     1 July, change keys all the same. So the worker asks about everyone whose ties started
     or ended after `since`, up to and including `today`, once the day has changed."""
     days = Q(start__gt=since, start__lte=today) | Q(end__gt=since, end__lte=today)
-    ties = Q(person__memberships__in=Membership.objects.filter(days)) | Q(person__positions__in=Position.objects.filter(days))
+    ties = Q(person__memberships__in=structure.Membership.objects.filter(days)) | Q(person__positions__in=structure.Position.objects.filter(days))
     for user in User.objects.filter(ties).distinct():
         request_for(user)
 
@@ -182,11 +191,12 @@ def label(row):
 
 def _person(row, tool, units=()):
     user = row.user
+    held = keys(user) if user else []
     return Person(
         sub=row.sub,
         email=label(row),
-        allowed=bool(user and user.is_active and may_use(user, tool)),
-        groups=tuple(for_tools(user)) if user else (),  # the same keys as the login response
+        allowed=bool(user and user.is_active and may_use(user, tool, held)),
+        groups=tuple(for_tools(user, held)) if user else (),  # the same keys as the login response
         units=units,
     )
 

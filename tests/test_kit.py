@@ -124,7 +124,7 @@ class ParseConfig(unittest.TestCase):
         self.assertEqual((config.name, config.key), (None, None))
 
     def test_refuses_a_bad_key(self):
-        for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', '"custom"', f'"{"x" * 41}"', "7"):
+        for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', f'"{"x" * 41}"', "7"):
             with self.subTest(key=key), self.assertRaisesRegex(kit.KitError, "isn't valid"):
                 kit.parse_config(f'[association]\nkey = {key}\ndomain = "a.org"\n')
 
@@ -2228,6 +2228,7 @@ class WorkerSettings(unittest.TestCase):
     def test_the_team_map_has_one_home(self):
         manifest = kit.module_manifest("git")
         self.assertEqual(manifest["teams"], {"operator": "Owners", "board": "board"})
+        self.assertEqual(manifest["owners"], ["chair", "vice_chair"])  # the connector reads the same
         self.assertEqual(manifest["admin_group"], "operator")
         for team in kit.FORGEJO_TEAMS:
             self.assertIn(team["name"], manifest["teams"].values())

@@ -40,9 +40,9 @@ Core tells Forgejo straight away, usually within a few seconds, with no new sign
 
 | In core | In Forgejo |
 |---|---|
-| A position or membership ends, or its team is archived | Off the teams it gave. They stay a collaborator on repos they created only while they hold a team in that organisation. Their account and tokens keep working, for public repos |
+| A position or membership ends, or its team is archived | Off the teams it gave. In core's organisations, they stay a collaborator on repos they created only while they hold a team in that organisation. Their account and tokens keep working, for public repos |
 | Removed from Operator | No longer a Forgejo admin or an owner of your association's organisation |
-| Account turned off, or deleted | Blocked, and off every team in core's organisations. Tokens stop working on the API and Git, and an open web page shows "Account is suspended" whatever it asks for |
+| Account turned off, or deleted | Blocked, off every team in core's organisations, and no longer a collaborator anywhere. Tokens stop working on the API and Git, and an open web page shows "Account is suspended" whatever it asks for |
 | A new position or membership, or the account turned back on | On its teams straight away. They don't get back as a collaborator, as the team is what gives them access. If the role requires 2FA, this waits until they've set it up |
 
 Forgejo makes someone a collaborator on a repo they create, and they keep admin rights on it while they hold a team in its organisation. Git shows someone who's blocked a confusing error, such as `could not determine hash algorithm`, rather than saying they're blocked.
@@ -68,10 +68,10 @@ git clone https://git.example.org/example/some-repo.git
 ## Known limits
 
 - **Signing out of Forgejo doesn't log you out of core.** Opening Forgejo a few minutes later signs you back in. To stay out, log out of core too.
-- **A collaborator added by hand only lasts while they hold a team in that organisation, or are an Operator.** Everyone else's collaborations get removed the next time core looks at them, at least once a day, as they can't be told apart from ones Forgejo made when someone created a repo. Give other people access with a team.
+- **In core's organisations, a collaborator added by hand only lasts while they hold a team in that organisation, or are an Operator.** Everyone else's collaborations there get removed the next time core looks at them, at least once a day, as they can't be told apart from ones Forgejo made when someone created a repo. Give other people access with a team. Organisations made by hand are left alone, unless someone leaves altogether.
 - **Webhooks and mirrors outlive whoever set them up.** Someone with admin rights on a repo could have set one up to send its contents elsewhere, and removing them doesn't remove that. Check a sensitive repo's settings when someone leaves on bad terms.
 - **Some addresses can't sign in.** An address whose part before the @ is a name Forgejo reserves, such as `admin@example.org`, gets an error page. So does one matching `sallskap-admin`, the account that owns the organisations, or an organisation's name, or a name Forgejo ends up treating as the same as someone else's. They can't get into anyone else's account, and they can use another address.
-- **An association can't get an organisation named after someone.** Organisations and people share names in Forgejo, so if someone's username is an association's key, or the key is a name Forgejo keeps for itself, such as `explore` or `api`, the organisation isn't made. The admin page says so on the page of each person who needs it. An Operator can free the name by renaming that account in Forgejo's site administration, as an association's key never changes.
+- **An association can't get an organisation named after someone.** Organisations and people share names in Forgejo, so if someone's username is an association's key, or the key is a name Forgejo keeps for itself, such as `explore` or `api`, the organisation isn't made. The admin page says so on the page of each person who needs it. An Operator can free the name by renaming that account in Forgejo's site administration, as an association's key never changes. An association inside yours whose key is the first part of your domain can't have one at all, as that's your association's organisation. The person's other teams are still set either way.
 - **Email and name changes aren't passed on.** Forgejo takes them from core when someone first signs in, and keeps them.
 - **One admin token is kept,** on `sallskap-admin`, in `/etc/sallskap/sync.env`. Only the worker that tells Forgejo about changes has it, and only root can read that file. Forgejo 15 can't delete a token with password login off, so replacing it would leave the old one working.
 - **No build runner yet,** so Actions is off.

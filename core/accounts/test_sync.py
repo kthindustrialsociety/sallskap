@@ -140,6 +140,17 @@ class Asking(Base):
         self.assertAlmostEqual((row.retry_at - timezone.now()).total_seconds(), 10, delta=2)
         self.assertEqual(sync.run_once([]), 0)
 
+    def test_a_wait_never_holds_back_or_resets_a_change_already_waiting(self):
+        """A sign-in asks with a wait. It mustn't undo a tool's backing off, or bring it forward."""
+        sync.request_for(self.user)
+        row = AccessSync.objects.get(user=self.user)
+        AccessSync.objects.filter(pk=row.pk).update(attempts=3, retry_at=timezone.now() + timedelta(minutes=2))
+        sync.request_for(self.user, wait=timedelta(seconds=10))
+        again = AccessSync.objects.get(pk=row.pk)
+        self.assertEqual(again.attempts, 3)
+        self.assertGreater(again.retry_at, timezone.now() + timedelta(minutes=1))
+        self.assertGreater(again.requested_at, row.requested_at)  # what's sent is worked out afresh
+
     def test_asking_for_everyone_includes_new_accounts_and_keeps_one_row_each(self):
         make_user("new@example.org")
         self.user.groups.clear()

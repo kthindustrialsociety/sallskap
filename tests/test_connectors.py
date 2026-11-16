@@ -307,11 +307,21 @@ class Forgejo(unittest.TestCase):
         self.apply(groups=["board", "test:member", "robotics:member"])
         self.assertEqual(self.forgejo.collaborators, set())
 
+    def test_collaborations_in_an_organisation_made_by_hand_are_left_alone(self):
+        self.forgejo.add_org("hand-made", "not core's")
+        self.forgejo.repos.append(("hand-made", "theirs"))
+        self.forgejo.collaborators = {("hand-made", "theirs")}
+        self.apply(groups=["test:member"])
+        self.assertEqual(self.forgejo.collaborators, {("hand-made", "theirs")})
+        self.apply(allowed=False)  # unless they've left altogether
+        self.assertEqual(self.forgejo.collaborators, set())
+
     def test_someone_on_a_team_there_stays_a_collaborator_there_only(self):
         self.apply(groups=["operations:participant", "test:member"])
         self.assertEqual(self.forgejo.collaborators, {("robotics", "for-operations")})
 
     def test_it_only_removes_them_as_a_collaborator_where_they_are_one(self):
+        self.made_org("robotics")
         self.apply(groups=["test:member"])
         removed = [path for method, path in self.forgejo.writes() if "collaborators" in path]
         self.assertEqual(removed, ["/repos/example/made-by-them/collaborators/someone", "/repos/robotics/for-operations/collaborators/someone"])
@@ -465,6 +475,19 @@ class Forgejo(unittest.TestCase):
         self.forgejo.add_account("8", "robotics")
         with self.assertRaisesRegex(RuntimeError, "won't make an organisation called robotics"):
             self.apply(groups=["robotics:member"])
+
+    def test_one_organisation_that_cant_be_had_doesnt_hold_up_the_rest(self):
+        self.forgejo.add_account("8", "chemistry")
+        with self.assertRaisesRegex(RuntimeError, "chemistry"):
+            self.apply(groups=["chemistry:member", "uavs:participant", "test:member"])
+        self.assertEqual(self.forgejo.teams_of(), {("robotics", "uavs"), ("example", "members")})
+
+    def test_an_association_named_like_the_installations_organisation_gets_none(self):
+        """Its key could be the domain's first part, when the root's key isn't."""
+        units = (*FEDERATION, unit("example", "example", team=False, name="Example inside"), unit("example-team", "example"))
+        with self.assertRaisesRegex(RuntimeError, "is the name of the installation's organisation"):
+            self.apply(groups=["example:chair", "example:member", "example-team:lead", "test:member"], units=units)
+        self.assertEqual(self.forgejo.teams_of(), {("example", "members")})  # the root's members' team, from test:member
 
     def test_the_installations_organisation_is_never_made_here(self):
         del self.forgejo.orgs["example"]

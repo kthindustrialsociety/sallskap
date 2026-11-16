@@ -8,6 +8,15 @@ def remove_groups(apps, schema_editor):
     membership or position: record those in the admin page."""
     Group = apps.get_model("auth", "Group")
     Group.objects.exclude(role__key="operator").delete()
+    # A tool limited to a group made by hand held custom:<name>, which a unit's key could
+    # now give, such as custom:lead for the leads of a team called custom. A list left
+    # empty lets nobody in, as it would have after the groups went.
+    ToolAccess = apps.get_model("accounts", "ToolAccess")
+    for access in ToolAccess.objects.all():
+        kept = [key for key in access.group_keys if not key.startswith("custom:")]
+        if kept != access.group_keys:
+            access.group_keys = kept
+            access.save(update_fields=["group_keys"])
 
 
 class Migration(migrations.Migration):

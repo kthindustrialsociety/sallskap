@@ -7,11 +7,11 @@ association and every association above it. Four keys are the same in every
 installation: `member`, `board` and `treasurer` from ties to the root, and `operator`
 from the Operator group, the one group there is."""
 
+from accounts.roles import OPERATOR
 from django.db.models import Q
 
 from .models import Person, Position, Unit, _today
 
-OPERATOR = "operator"
 # Keys from roles that need two-factor authentication: they wait until it's set up.
 TWO_FACTOR_KEYS = {"board", "treasurer", OPERATOR}
 
@@ -48,11 +48,12 @@ def needs_2fa(key):
     return key in TWO_FACTOR_KEYS or key.rpartition(":")[2] in Position.BOARD_ROLES
 
 
-def for_tools(user):
+def for_tools(user, held=None):
     """What the tools are told. Core won't let someone through to a tool until they've set
     up the 2FA a role requires, or every tool would be a way around the rule. Telling a
-    tool about that role directly would be one too, so those keys wait for it as well."""
-    found = keys(user)
+    tool about that role directly would be one too, so those keys wait for it as well.
+    `held` is keys(user), if it's already been worked out."""
+    found = keys(user) if held is None else held
     return [key for key in found if not needs_2fa(key)] if user.needs_2fa_setup else found
 
 

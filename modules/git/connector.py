@@ -32,7 +32,6 @@ MARK = "Kept in step with core."  # starts the description of everything core ma
 OWNERS = "Owners"
 MEMBERS = "members"
 LEAD = ".lead"  # unit keys have no dots, so this can't be another team's name
-HEADS = ("chair", "vice_chair")
 NO_LIMIT = 1_000_000  # repos an organisation may have: 0 would fall back on the limit for people
 UNITS = ["repo.code", "repo.issues", "repo.pulls", "repo.releases", "repo.wiki", "repo.projects"]
 
@@ -50,6 +49,7 @@ class Connector:
         manifest = tomllib.loads((Path(__file__).parent / "module.toml").read_text("utf-8"))
         self.teams = manifest["teams"]  # the same map Forgejo reads at sign-in
         self.admin_group = manifest["admin_group"]
+        self.owners = manifest["owners"]  # kit maps the root's at sign-in too
         # A unit with one of these keys gets <key>.team, as the name is already taken.
         self.taken = {OWNERS.lower(), MEMBERS, *(team.lower() for team in self.teams.values())}
 
@@ -102,15 +102,18 @@ class Connector:
             return  # they've never signed in, so there's nothing to change
         login = account["login"]
         keys = set(person.groups) if person.allowed else set()
+        units = {unit.key: unit for unit in person.units}
         # Blocking goes first, as it's what ends their tokens and open sessions.
         self._set_flags(account, blocked=not person.allowed, admin=self.admin_group in keys)
-        wanted = self._wanted(keys, {unit.key: unit for unit in person.units})
-        self._set_teams(login, wanted, {unit.key: unit for unit in person.units}, leaving=not person.allowed)
+        wanted, problems = self._wanted(keys, units)
+        problems += self._set_teams(login, wanted, units, leaving=not person.allowed)
         # Forgejo makes someone who creates a repo a collaborator, and leaving a team
         # doesn't change that. They stay one while they hold a team in its organisation.
         if self.admin_group not in keys:
             kept = {org for org, team in wanted if team.lower() not in self.taken}
-            self._remove_collaborations(account, login, kept)
+            self._remove_collaborations(account, login, kept, leaving=not person.allowed)
+        if problems:  # after everything else, so one organisation can't hold up the rest
+            raise RuntimeError("; ".join(problems))
 
     def _set_flags(self, account, blocked, admin):
         changes = {}
@@ -132,23 +135,28 @@ class Connector:
         return f"{unit.key}.team" if unit.key in self.taken else unit.key
 
     def _wanted(self, keys, units):
-        """(organisation, team) for each team their keys give them."""
+        """(organisation, team) for each team their keys give them, and why any can't be."""
         wanted = {(self.org, self.teams[key]) for key in keys if key in self.teams}
+        problems = set()
         for key in keys:
             unit_key, _, role = key.partition(":")
             unit = units.get(unit_key)
             if unit is None:
                 continue
-            org = self._org_of(units[unit.association])
+            association = units[unit.association]
+            org = self._org_of(association)
+            if org == self.org and not association.root:
+                problems.add(f"{association.name}'s key, {association.key}, is the name of the installation's organisation in Forgejo, so it can't have one of its own")
+                continue
             if role == "member":
                 wanted.add((org, MEMBERS))
-            elif role in HEADS and not unit.team:
+            elif role in self.owners and not unit.team:
                 wanted.add((org, OWNERS))
             elif role in ("lead", "participant") and unit.team:
                 wanted.add((org, self._team_of(unit)))
                 if role == "lead":
                     wanted.add((org, self._team_of(unit) + LEAD))
-        return wanted
+        return wanted, sorted(problems)
 
     def _our_org(self, org):
         """Whether core or kit made this organisation: the installation's, or one whose
@@ -163,20 +171,27 @@ class Connector:
         return (team.get("description") or "").startswith(MARK)
 
     def _set_teams(self, login, wanted, units, leaving):
-        """Leaving takes someone off every team in core's organisations, made by hand or not."""
+        """Leaving takes someone off every team in core's organisations, made by hand or not.
+        Returns why a team it should have joined them to couldn't be, if any couldn't."""
         current = {(team["organization"]["username"], team["name"]): team for team in self._pages("/user/teams", sudo=login)}
         for (org, name), team in current.items():
             if (org, name) not in wanted and self._our_org(team["organization"]) and (leaving or self._our_team(org, team)):
                 self._expect("DELETE", f"/teams/{team['id']}/members/{_quoted(login)}", 204)
-        teams = {}  # each organisation's, once
+        teams, problems = {}, []  # each organisation's teams, once
         for org, name in sorted(wanted - set(current)):
-            if org not in teams:
-                teams[org] = self._teams(org, units)
-            team = teams[org].get(name.lower()) or self._make_team(org, name, units)
-            teams[org][name.lower()] = team
-            if not self._our_team(org, team):
-                raise RuntimeError(f"Forgejo already has a team called {team['name']} in {org} that core didn't make, so core won't use it. Rename it there")
-            self._expect("PUT", f"/teams/{team['id']}/members/{_quoted(login)}", 204)
+            try:
+                if org not in teams:
+                    teams[org] = self._teams(org, units)
+                team = teams[org].get(name.lower()) or self._make_team(org, name, units)
+                teams[org][name.lower()] = team
+                if not self._our_team(org, team):
+                    raise RuntimeError(f"Forgejo already has a team called {team['name']} in {org} that core didn't make, so core won't use it. Rename it there")
+                self._expect("PUT", f"/teams/{team['id']}/members/{_quoted(login)}", 204)
+            except RuntimeError as problem:
+                teams.setdefault(org, {})
+                if str(problem) not in problems:
+                    problems.append(str(problem))
+        return problems
 
     def _teams(self, org, units):
         """An organisation's teams, by name. It's made first if it isn't there."""
@@ -215,14 +230,22 @@ class Connector:
         }
         return self._expect("POST", f"/orgs/{_quoted(org)}/teams", 201, body=body)
 
-    def _remove_collaborations(self, account, login, kept):
+    def _remove_collaborations(self, account, login, kept, leaving):
         """Every repo they can reach comes up here, including through a team, so each one
         is checked first. Repos in their own name stay theirs, and so do their
-        collaborations in an organisation where they still hold a team."""
+        collaborations in an organisation where they still hold a team. Elsewhere, only
+        core's organisations are changed, unless they've left altogether."""
+        ours = {}
         for repo in self._pages(f"/repos/search?uid={account['id']}"):
             owner = repo["owner"]["login"]
             if owner == account["login"] or owner in kept:
                 continue
+            if not leaving:
+                if owner not in ours:
+                    status, found = self._call("GET", f"/orgs/{_quoted(owner)}")
+                    ours[owner] = status == 200 and self._our_org(found)
+                if not ours[owner]:
+                    continue
             path = f"/repos/{_quoted(owner)}/{_quoted(repo['name'])}/collaborators/{_quoted(login)}"
             status, _ = self._call("GET", path)
             if status == 204:

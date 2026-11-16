@@ -11,6 +11,7 @@ oidc        = true
 # sign-in, through kit/kit.py, and connector.py acts on it straight away when someone's
 # keys change. connector.py maps the rest of the tree: see the README.
 admin_group = "operator"
+owners      = ["chair", "vice_chair"]  # of an association: owners of its organisation, the root's included
 
 [teams]
 operator  = "Owners"

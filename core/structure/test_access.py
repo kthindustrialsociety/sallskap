@@ -416,6 +416,8 @@ class Groups(TestCase):
         operator = User.objects.create_user("op@example.org")
         operator.groups.add(Group.objects.get(role__key="operator"))
         someone = User.objects.create_user("someone@example.org")
+        tool = make_tool()
+        ToolAccess.objects.create(tool=tool, group_keys=["board", "custom:Photography", "operator"])
         for line in GROUPS.strip().splitlines():
             name, _ = line.split()
             if name != "Operator":
@@ -431,6 +433,8 @@ class Groups(TestCase):
         self.assertFalse(someone.groups.exists())
         self.assertEqual(keys(operator), ["operator"])
         self.assertEqual(keys(someone), [])
+        # A unit called custom could give custom:<role> keys, so the old group's key goes from tools' lists.
+        self.assertEqual(ToolAccess.objects.get(tool=tool).group_keys, ["board", "operator"])
 
     def test_a_renamed_operator_group_is_kept(self):
         Group.objects.filter(role__key="operator").update(name="Drift")

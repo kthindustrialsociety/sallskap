@@ -33,9 +33,10 @@ ACCESS_TOKEN_SECONDS = 10 * 60  # most tools only need it just after someone log
 AFTER_SIGN_IN = timedelta(seconds=10)
 
 
-def may_use(user, tool):
+def may_use(user, tool, held=None):
+    """`held` is keys(user), if it's already been worked out."""
     access = ToolAccess.objects.filter(tool=tool).first()
-    return access is None or bool(set(access.group_keys) & set(keys(user)))
+    return access is None or bool(set(access.group_keys) & set(keys(user) if held is None else held))
 
 
 def access_token_seconds(request):
@@ -57,7 +58,8 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
     def get_claims(self, purpose, user, client, scopes, email=None, **kwargs):
         # Every token and every question about one comes through here, so someone who
         # has lost a tool's keys since logging in gets no further either.
-        if not may_use(user, client):
+        held = keys(user)
+        if not may_use(user, client, held):
             raise InvalidTokenError()
         claims = {"sub": self.get_user_sub(client, user)}
         if "email" in scopes:
@@ -68,7 +70,7 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
         if "profile" in scopes:
             claims.update(name=user.get_full_name(), preferred_username=user.tool_username())
         if "groups" in scopes:
-            claims["groups"] = for_tools(user)  # the same keys the worker sends
+            claims["groups"] = for_tools(user, held)  # the same keys the worker sends
             if purpose == "id_token" and any(":" in key for key in claims["groups"]):
                 from .sync import request_for
 
