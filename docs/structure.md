@@ -26,7 +26,7 @@ Example Federation              association, the root
 - **Teams can contain teams,** to any depth. That's how an association splits into departments, such as Operations and Development, which have teams of their own, which have projects.
 - **Each unit has a fixed key,** such as `robotics`, unique in the installation, plus a name, a description, and its own logo and colours if it wants them. Renaming a unit never changes its key, so it never changes anyone's access.
   - A key is lowercase letters, digits and single hyphens, starts with a letter, ends with a letter or digit, and is at most 40 characters, so every tool can use it as a name.
-  - It can't be changed once set, and it's never reused, even after its unit is archived. `custom` is reserved, as tools already see groups made by hand as `custom:<name>`.
+  - It can't be changed once set, and it's never reused, even after its unit is archived.
 - **Nothing is created or moved under an archived unit,** an association sits only under an association, and a unit can't end up under itself.
 - **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3), grants or seat rules (§4), current or ended. Otherwise it's archived.
 - **A team can involve other associations.** The unit it sits under owns it and appoints its lead. It also has a list of the other associations taking part.
@@ -175,12 +175,16 @@ A proposal suggests a lead or chair, who may be the proposer or someone else. Wh
 
 ## 5. Access to the tools
 
-Access is **worked out from current memberships and positions,** never set by hand, apart from Operator. One function turns a person's ties into keys, and those keys go to the tools, in the login response and through the connectors, exactly as group keys do today (§8 of the spec).
+Access is **worked out from current memberships and positions,** never set by hand, apart from Operator. One function turns a person's ties into keys, and those keys go to the tools, in the login response and through the connectors (§8 of the spec). Both get the same keys.
 
-- **Keys have the form `<unit>:<role>`,** such as `robotics:member`, `robotics:chair` or `website:lead`.
-- **Today's fixed groups stay as keys,** so no module's mapping breaks: `member` is any membership, `board` is a board role on the root, `treasurer` is the root's treasurer, and `operator` is unchanged. `events` and `developer` become teams under the root.
-- **Each module maps the tree** in its own way. In Forgejo, an association becomes an organisation and a team becomes a team, and the lead gets admin. In chat, an association becomes a space and each team gets rooms, with the lead as moderator.
-- **The worker does the rest as now:** a change to a tie is saved with a note that the tools need telling. An archived project or an ended position removes access within seconds.
+- **A position gives `<unit>:<role>`,** such as `robotics:chair`, `website:lead` or `uavs:participant`. A seat is a position, so it gives the same key as an appointed one. A lead doesn't also get `participant`, and positions don't count upwards.
+- **A membership gives `<association>:member`** for its association and every association above it, as membership counts upwards (§3). So a member of Robotics gets `robotics:member` and the root's.
+- **Only what's current counts,** as for authority (§4): a tie that has started and not yet ended, in a unit that isn't archived. So a board elected in spring gets its keys the day its positions start, and an archived project's people lose theirs.
+- **Nothing else gives keys.** Grants are permissions in core, not access to the tools. A team run for another association, or one other associations take part in, gives those associations nothing: only the team's own positions do.
+- **Four keys are the same in every installation,** so a module can name them without knowing the tree: `member` is any membership, `board` a board role on the root, seats included, `treasurer` the root's treasurer, and `operator` the Operator group. Operator is the one group, given by hand, and there are no others.
+- **Keys from roles that need two-factor authentication** (board roles anywhere, `board`, `treasurer` and `operator`) only reach the tools once the person has set it up.
+- **Each module maps the tree** in its own way, and its README says how. In Forgejo, the root's association is the installation's organisation and every other association gets its own. A team becomes a team that its people write to and its leads administer. Each organisation has a team for its members, which can read a repo once someone opens it to them, and its association's chair and vice chair own it. In chat, an association becomes a space and each team gets rooms, with the lead as moderator.
+- **The worker does the rest as now:** a change to a tie, a seat or the tree is saved with a note that the tools need telling, for everyone it touches. An archived project or an ended position removes access within seconds. A tie that starts or ends on a day with no change, such as a board taking office on 1 July, is picked up just after midnight.
 
 ## 6. Events and mailings
 
