@@ -2315,7 +2315,8 @@ TOTP.activate(get_user_model().objects.get(email={email!r}), generate_totp_secre
 """
     )
     took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
-    check("Setting up 2FA does both, with no new sign-in", took is not None and "Owners" in team_names(host, token), str(team_names(host, token)))
+    waiting = core_db("select pending, attempts, retry_at, requested_at, tools from accounts_accesssync s join accounts_user u on u.id = s.user_id where u.email = ?", email)
+    check("Setting up 2FA does both, with no new sign-in", took is not None and "Owners" in team_names(host, token), f"{team_names(host, token)} {waiting}")
 
     section("Forgejo: leaving a team, including repos they created")
     org = org_of(host)
@@ -2586,13 +2587,14 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     board = Browser(host)
     board.log_in(owner_email)
     board.enter_code(totp(secrets_by_name["fake-vsync-owner"], 1))  # each code works once, and they've just used this one
-    index = board.get("/admin/").text
-    check("Board sees it on the admin page", f"{email} could see them" in html.unescape(index))
-    check("...and in its list", org_name in board.get("/admin/accounts/followup/").text)
+    index = operator.get("/admin/").text
+    check("Operators see it on the admin page", f"{email} could see them" in html.unescape(index))
+    check("...and in its list", org_name in operator.get("/admin/accounts/followup/").text)
+    check("The board doesn't, as the admin page is Operators' only", board.follow("/admin/accounts/followup/")[0].status == 403)
     member = Browser(host)
     member.log_in(email_of("fake-vsync-member"))
     check("A Member doesn't", member.get("/admin/accounts/followup/").status != 200)
-    check("Nobody can add one by hand", board.get("/admin/accounts/followup/add/").status == 403)
+    check("Nobody can add one by hand", operator.get("/admin/accounts/followup/add/").status == 403)
 
     # What a person does: the owner changes the entry and removes them from the organisation.
     status, _ = owner.api("PUT", f"/api/ciphers/{entry}", {"type": 2, "name": VAULT_KEY, "organizationId": org, "encryptedFor": owner_id, "secureNote": {"type": 0}, "notes": VAULT_KEY.replace("bm90LXJlYWw=", "Y2hhbmdlZA==", 1)})
@@ -2600,15 +2602,15 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     status, _ = owner.api("DELETE", f"/api/organizations/{org}/users/{member_id}")
     check("...and remove them from the organisation, though their account is off", status == 200, str(status))
     pk = core_db("select id from accounts_followup where about = ?", email)[0][0]
-    page = board.get("/admin/accounts/followup/")
+    page = operator.get("/admin/accounts/followup/")
     token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text)
-    done = board.send("POST", "/admin/accounts/followup/", [("csrfmiddlewaretoken", token.group(1) if token else ""), ("action", "mark_done"), ("_selected_action", str(pk))])
-    check("...and mark the follow-up done", done.status == 302, str(done.status))
+    done = operator.send("POST", "/admin/accounts/followup/", [("csrfmiddlewaretoken", token.group(1) if token else ""), ("action", "mark_done"), ("_selected_action", str(pk))])
+    check("An Operator marks the follow-up done", done.status == 302, str(done.status))
     closed = follow_ups(email)[0]
-    board_pk = core_db("select id from accounts_user where email = ?", owner_email)[0][0]
-    check("It records when and who", closed[1] is not None and closed[2] == board_pk, str(closed))
-    check("...and it's no longer shown as to do", f"{email} could see them" not in html.unescape(board.get("/admin/").text))
-    check("...while another that's still open is", f"{email_of('fake-vsync-removed')} could see them" in html.unescape(board.get("/admin/").text))
+    operator_pk = core_db("select id from accounts_user where email = ?", email_of("fake-operator"))[0][0]
+    check("It records when and who", closed[1] is not None and closed[2] == operator_pk, str(closed))
+    check("...and it's no longer shown as to do", f"{email} could see them" not in html.unescape(operator.get("/admin/").text))
+    check("...while another that's still open is", f"{email_of('fake-vsync-removed')} could see them" in html.unescape(operator.get("/admin/").text))
 
     status = admin_page_set_active(operator, email, True)
     wait_for_sync()
