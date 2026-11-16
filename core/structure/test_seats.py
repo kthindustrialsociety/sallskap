@@ -756,7 +756,7 @@ class AdminPage(Federation):
         )
         self.assertEqual(Position.objects.get(pk=appointed.pk).end, TODAY)  # ending it ends the seat too
         self.assertEqual(Position.objects.get(pk=seat.pk).end, TODAY)
-        self.assertEqual([m.level_tag for m in response.context["messages"]], ["warning", "success"])
+        self.assertEqual([m.level_tag for m in response.context["messages"]], ["warning", "info"])
 
     def test_a_position_is_never_made_a_seat_in_the_form(self):
         self.enter("operator")
