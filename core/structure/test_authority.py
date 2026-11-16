@@ -612,7 +612,7 @@ class MadeUp(TestCase):
         self.assertFalse(Position.objects.current().filter(person=finances.given_by, role=Role.CHAIR).exists())
 
         # The root's board members see every society's members.
-        board_member = Position.objects.current().get(unit=root, role=Role.BOARD_MEMBER).person
+        board_member = Position.objects.current().get(unit=root, role=Role.BOARD_MEMBER, seat_rule=None).person
         self.assertTrue(can(board_member, P.SEE_MEMBERS, chemistry))
 
         # Operations' lead sends Robotics' mailings, and the lead has changed since.
