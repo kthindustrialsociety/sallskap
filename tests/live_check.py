@@ -1334,9 +1334,13 @@ def cleanup_forgejo():
                 print(f"Fake repo {repo['name']}:", forgejo_api(host, token, "DELETE", f"/repos/{org}/{repo['name']}")[0])
     listed = in_forgejo("forgejo", "admin", "user", "list").stdout
     for name in re.findall(r"^\d+\s+(fake-\S+)", listed, re.M):
+        # Deleting someone leaves their Forgejo 2FA behind, which Forgejo's own check then
+        # warns about at every update, so that goes first.
+        in_forgejo("forgejo", "admin", "user", "reset-mfa", "--username", name)
         in_forgejo("forgejo", "admin", "user", "delete", "--username", name, "--purge")
     left = re.findall(r"^\d+\s+(fake-\S+)", in_forgejo("forgejo", "admin", "user", "list").stdout, re.M)
     print(f"Fake accounts left in Forgejo: {len(left)}")
+    print("2FA records left in Forgejo without their account:", core_db_git("select count(*) from two_factor where uid not in (select id from user)"))
 
 
 # ---- Vaultwarden ---------------------------------------------------------------

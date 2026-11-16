@@ -48,6 +48,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. Operators set and end rules in the admin page, under Seat rules, and Board can see them. A rule is only accepted from someone who could appoint in that unit.
   - Core gives each seat itself, as a position, from the day the position it comes from starts, and ends it when that position or the rule ends. A seat gives what its role gives, grants and two-factor authentication included, and stays in the record when it ends. It can't be set, changed or ended by hand.
   - Nobody's access in the tools changes yet, as for every other position.
+- fix: `tests/live_check.py` turns off its fake people's own Forgejo 2FA before removing them. Removing them left the 2FA behind, so on a test server Forgejo's own check warned of one more orphaned 2FA record after every run. A test server with those warnings can clear them once with `docker exec sallskap-forgejo-1 forgejo doctor check --run check-db-consistency --fix`.
 
 ## 0.7.2 (2026-11-10)
 
