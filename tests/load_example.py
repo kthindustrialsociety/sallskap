@@ -35,7 +35,8 @@ try:
 except (ValidationError, Unit.DoesNotExist) as error:
     print(" ".join(getattr(error, "messages", [str(error)])), file=sys.stderr)
     sys.exit(1)
-print(json.dumps({{"units": len(units), "people": len(EXAMPLES[{name}].people), "grants": len(EXAMPLES[{name}].grants)}}))
+example = EXAMPLES[{name}]
+print(json.dumps({{"units": len(units), "people": len(example.people), "grants": len(example.grants), "seat_rules": len(example.seat_rules)}}))
 """
 
 
@@ -66,9 +67,12 @@ def main(argv=None):
     loaded = json.loads(result.stdout.strip().splitlines()[-1])
     parts = [f"{loaded['units']} units under the association", f"{loaded['people']} people"]
     pages = ["Units", "People"]
-    if loaded["grants"]:  # none in Example Society, where grants stay out of sight
+    if loaded["grants"]:  # none in Example Society, where grants and seat rules stay out of sight
         parts.append(f"{loaded['grants']} grants")
         pages.append("Grants")
+    if loaded["seat_rules"]:
+        parts.append(f"{loaded['seat_rules']} seat rules")
+        pages.append("Seat rules")
     print(f"Loaded Example {args.example.title()}: {', '.join(parts[:-1])} and {parts[-1]}. See them in the admin page, under {', '.join(pages[:-1])} and {pages[-1]}.")
 
 
