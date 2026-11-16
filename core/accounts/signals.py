@@ -1,4 +1,5 @@
-"""Every way someone's access can change marks them as waiting: see accounts/sync.py."""
+"""Every way someone's access can change marks them as waiting: see accounts/sync.py.
+Changes to ties and the tree mark them in structure/access.py."""
 
 from allauth.idp.oidc.models import Client
 from allauth.mfa.models import Authenticator
@@ -35,13 +36,6 @@ def groups_changed(sender, instance, action, reverse, pk_set, **kwargs):
             sync.request_for(user)
 
 
-def group_saved(sender, instance, created, **kwargs):
-    # Renaming a group an Operator made changes the key that tools' access lists hold.
-    if not created:
-        for user in instance.user_set.all():
-            sync.request_for(user)
-
-
 def group_deleting(sender, instance, **kwargs):
     instance._members_before = list(instance.user_set.all())
 
@@ -52,7 +46,7 @@ def group_deleted(sender, instance, **kwargs):
 
 
 def two_factor_changed(sender, instance, **kwargs):
-    # Whether tools may hear about a group that requires it depends on this.
+    # Whether tools may hear about keys from roles that require it depends on this.
     sync.request_for(instance.user)
 
 
@@ -64,7 +58,6 @@ def connect():
     post_save.connect(user_saved, sender=User)
     post_delete.connect(user_deleted, sender=User)
     m2m_changed.connect(groups_changed, sender=User.groups.through)
-    post_save.connect(group_saved, sender=Group)
     pre_delete.connect(group_deleting, sender=Group)
     post_delete.connect(group_deleted, sender=Group)
     post_save.connect(two_factor_changed, sender=Authenticator)

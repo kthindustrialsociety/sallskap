@@ -3,8 +3,6 @@ installations from examples.py. The README shows how to run them in Docker."""
 
 from datetime import date
 
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
@@ -51,11 +49,9 @@ class Keys(Tree):
             with self.subTest(key=key), self.assertRaises(ValidationError):
                 team(key, self.root)
 
-    def test_custom_is_reserved(self):
-        # Tools already see groups made by hand as custom:<name>, so a unit called
-        # custom would give keys such as custom:lead that look like those.
-        with self.assertRaises(ValidationError):
-            team("custom", self.root)
+    def test_custom_is_an_ordinary_key(self):
+        # It was reserved while groups made by hand went to the tools as custom:<name>.
+        self.assertEqual(team("custom", self.root).key, "custom")
 
     def test_a_key_cannot_change_once_set(self):
         self.uavs.key = "drones"
@@ -556,15 +552,13 @@ class AdminPage(TestCase):
         page = response.content.decode()
         self.assertLess(page.index("Website"), page.index("Design"))
 
-    def test_board_sees_units_but_cannot_change_them(self):
+    def test_the_board_cannot_reach_units_until_its_own_pages(self):
         self.enter("board")
-        self.assertEqual(self.client.get(reverse("admin:structure_unit_changelist")).status_code, 200)
-        self.assertEqual(self.client.post(reverse("admin:structure_unit_add"), self.form(key="events", name="Events")).status_code, 403)
+        self.assertEqual(self.client.get(reverse("admin:structure_unit_changelist"), follow=True).status_code, 403)
+        self.assertEqual(self.client.post(reverse("admin:structure_unit_add"), self.form(key="events", name="Events"), follow=True).status_code, 403)
         self.assertFalse(Unit.objects.filter(key="events").exists())
 
     def test_a_member_sees_nothing(self):
-        user, _ = get_user_model().objects.create_user("member@example.org"), None
-        user.groups.set(Group.objects.filter(role__key="member"))
-        self.client.force_login(user)
+        self.enter("member")
         response = self.client.get(reverse("admin:structure_unit_changelist"))
         self.assertNotEqual(response.status_code, 200)

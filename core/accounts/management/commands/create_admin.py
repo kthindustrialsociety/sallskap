@@ -8,6 +8,7 @@ from django.core.validators import validate_email
 
 from accounts.links import password_link
 from accounts.models import normalize_email
+from accounts.roles import OPERATOR
 
 
 class Command(BaseCommand):
@@ -26,7 +27,7 @@ class Command(BaseCommand):
 
         User = get_user_model()
         user = User.objects.filter(email=email).first() or User.objects.create_user(email)
-        user.groups.add(Group.objects.get(role__key="operator"))
+        user.groups.add(Group.objects.get(role__key=OPERATOR))
         if not user.is_active:
             user.is_active = True
             user.save(update_fields=["is_active"])

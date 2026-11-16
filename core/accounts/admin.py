@@ -1,6 +1,5 @@
 from allauth.mfa.models import Authenticator
 from django.contrib import admin
-from django.contrib.auth.admin import GroupAdmin as DjangoGroupAdmin
 from django.contrib.auth.models import Group
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
@@ -18,7 +17,7 @@ class UserAdmin(admin.ModelAdmin):
     search_fields = ("email", "name")
     ordering = ("email",)
     filter_horizontal = ("groups", "user_permissions")
-    readonly_fields = ("last_login", "date_joined", "access_in_tools")
+    readonly_fields = ("last_login", "date_joined", "keys", "access_in_tools")
 
     def get_fields(self, request, obj=None):
         fields = ["email", "name", "is_active", "groups"]
@@ -26,8 +25,13 @@ class UserAdmin(admin.ModelAdmin):
             # Anyone who could edit these could give themselves everything.
             fields += ["is_superuser", "user_permissions"]
         if obj:
-            fields += ["access_in_tools", "last_login", "date_joined"]
+            fields += ["keys", "access_in_tools", "last_login", "date_joined"]
         return fields
+
+    def formfield_for_manytomany(self, db_field, request, **kwargs):
+        if db_field.name == "groups":
+            kwargs["help_text"] = _("Operator is the one group. Everything else comes from memberships and positions.")
+        return super().formfield_for_manytomany(db_field, request, **kwargs)
 
     def get_queryset(self, request):
         two_factor = Authenticator.objects.filter(user=OuterRef("pk"), type=Authenticator.Type.TOTP)
@@ -43,6 +47,13 @@ class UserAdmin(admin.ModelAdmin):
             obj.set_unusable_password()  # they choose their own, through `kit link`
         super().save_model(request, obj, form, change)
 
+    @admin.display(description=_("keys"))
+    def keys(self, obj):
+        """What the tools are told about them: structure.md §5."""
+        from structure.access import keys
+
+        return ", ".join(keys(obj)) or "-"
+
     @admin.display(description=_("access in tools"))
     def access_in_tools(self, obj):
         row = AccessSync.objects.filter(user=obj).first()
@@ -57,19 +68,8 @@ class UserAdmin(admin.ModelAdmin):
         return obj._has_2fa
 
 
+# Operator is the one group, made and kept by roles.py, so there's nothing to manage here.
 admin.site.unregister(Group)
-
-
-@admin.register(Group)
-class GroupAdmin(DjangoGroupAdmin):
-    def get_fields(self, request, obj=None):
-        # Permissions come from roles.py. Editing them here could grant anything.
-        return ["name", "permissions"] if request.user.is_superuser else ["name"]
-
-    def has_delete_permission(self, request, obj=None):
-        if obj is not None and hasattr(obj, "role"):
-            return False
-        return super().has_delete_permission(request, obj)
 
 
 admin.site.unregister(Authenticator)

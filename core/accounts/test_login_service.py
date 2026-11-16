@@ -22,8 +22,8 @@ from django.utils import timezone
 from sallskap.urls import not_found
 
 from .login_service import SCOPES
-from .models import ToolAccess
-from .tests import PASSWORD, Base, CaddyClient, User, make_user, totp_code
+from .models import AccessSync, ToolAccess
+from .tests import PASSWORD, Base, CaddyClient, User, give, make_user, take_away, totp_code
 
 SIGNING_KEY = (
     rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -220,7 +220,7 @@ class Login(Service):
 
 
 class TwoFactorRule(Service):
-    def test_groups_needing_2fa_cannot_reach_a_tool_without_it(self):
+    def test_roles_needing_2fa_cannot_reach_a_tool_without_it(self):
         for group in ("board", "treasurer", "operator"):
             with self.subTest(group):
                 user, _ = make_user(f"{group}@example.org", [group])
@@ -247,20 +247,20 @@ class TwoFactorRule(Service):
         self.assertIsNone(self.sent_back(response))
         self.assertFalse(Token.objects.exists())
 
-    def test_the_same_groups_get_through_with_2fa(self):
+    def test_the_same_roles_get_through_with_2fa(self):
         user, _ = make_user(groups=["board"], two_factor=True)
         self.client.force_login(user)
         self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
 
-    def test_groups_without_the_rule_get_through_without_2fa(self):
-        for group in ("member", "developer", "events"):
-            with self.subTest(group):
-                user, _ = make_user(f"{group}@example.org", [group])
+    def test_roles_without_the_rule_get_through_without_2fa(self):
+        for groups in (["member"], []):
+            with self.subTest(groups):
+                user, _ = make_user(f"{''.join(groups) or 'nobody'}@example.org", groups)
                 self.client.force_login(user)
                 self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
 
     def test_a_board_role_anywhere_cannot_reach_a_tool_without_it(self):
-        """structure.md §4: from positions, as well as from the groups."""
+        """structure.md §4: a board role in any association, not only the root."""
         from structure.models import Membership, Position, Unit
 
         root = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="example", name="Example")
@@ -276,11 +276,11 @@ class TwoFactorRule(Service):
         self.client.force_login(lead)
         self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
 
-    def test_joining_a_group_applies_the_rule_at_the_next_login(self):
+    def test_a_board_role_applies_the_rule_at_the_next_login(self):
         user, _ = make_user(groups=["member"])
         self.client.force_login(user)
         self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
-        user.groups.add(Group.objects.get(role__key="board"))
+        give(user, "board")
         self.assertIsNone(self.sent_back(self.client.get(self.authorize_url())))
 
 
@@ -310,30 +310,37 @@ class Claims(Service):
         user, _ = make_user("anna@example.org")
         self.assertEqual(self.login_claims(user)["preferred_username"], "anna")
 
-    def test_it_passes_on_each_persons_groups(self):
+    def test_it_passes_on_each_persons_keys(self):
         user, _ = make_user(groups=["board", "treasurer"], two_factor=True)
-        self.assertEqual(self.login_claims(user)["groups"], ["board", "treasurer"])
+        self.assertEqual(
+            self.login_claims(user)["groups"],
+            ["board", "example:board_member", "example:member", "example:treasurer", "member", "treasurer"],
+        )
 
-    def test_someone_with_no_groups_gets_an_empty_list(self):
+    def test_someone_with_no_ties_gets_an_empty_list(self):
         user, _ = make_user()
         self.assertEqual(self.login_claims(user)["groups"], [])
 
-    def test_renaming_a_group_cannot_break_a_tools_rules(self):
-        Group.objects.filter(role__key="board").update(name="Styrelse")
-        user, _ = make_user(groups=["board"], two_factor=True)
-        self.assertEqual(self.login_claims(user)["groups"], ["board"])
+    def test_renaming_the_operator_group_cannot_break_a_tools_rules(self):
+        Group.objects.filter(role__key="operator").update(name="Drift")
+        user, _ = make_user(groups=["operator"], two_factor=True)
+        self.assertEqual(self.login_claims(user)["groups"], ["operator"])
 
-    def test_a_group_an_operator_added_goes_by_its_name(self):
+    def test_a_group_made_by_hand_gives_nothing(self):
+        """Operator is the one group: one named after it, or anything else, is no key."""
         user, _ = make_user(groups=["member"])
-        user.groups.add(Group.objects.create(name="Robotics"))
-        self.assertEqual(self.login_claims(user)["groups"], ["custom:Robotics", "member"])
-
-    def test_a_group_an_operator_added_cannot_pass_for_a_built_in_one(self):
-        """It wouldn't carry the 2FA rule, but a tool would treat its members as Operators."""
-        user, _ = make_user()
-        user.groups.add(Group.objects.create(name="operator"))
+        user.groups.add(Group.objects.create(name="Robotics"), Group.objects.create(name="operator"))
         self.assertFalse(user.requires_2fa)
-        self.assertEqual(self.login_claims(user)["groups"], ["custom:operator"])
+        self.assertEqual(self.login_claims(user)["groups"], ["example:member", "member"])
+
+    def test_keys_that_need_2fa_wait_for_it(self):
+        """They can't log in to a tool without it, but a question about them could come
+        with a token from before they needed it."""
+        from allauth.idp.oidc.adapter import get_adapter
+
+        user, _ = make_user(groups=["board"])
+        claims = get_adapter().get_claims("userinfo", user, self.tool, ["openid", "groups"])
+        self.assertEqual(claims["groups"], ["example:member", "member"])
 
     def test_a_tool_only_gets_what_it_asked_for(self):
         user, _ = make_user(groups=["member"])
@@ -342,12 +349,15 @@ class Claims(Service):
         for name in ("email", "name", "preferred_username", "groups"):
             self.assertNotIn(name, claims)
 
-    def test_group_changes_show_at_the_next_login(self):
+    def test_changes_to_ties_show_at_the_next_login(self):
+        from structure.models import Position, Unit
+
         user, _ = make_user(groups=["member"])
-        self.assertEqual(self.login_claims(user)["groups"], ["member"])
-        user.groups.set(Group.objects.filter(role__key="developer"))
-        self.assertEqual(self.login_claims(user)["groups"], ["developer"])
-        user.groups.clear()
+        self.assertEqual(self.login_claims(user)["groups"], ["example:member", "member"])
+        website = Unit.objects.create(kind=Unit.Kind.TEAM, key="website", name="Website", parent=Unit.objects.root())
+        Position.objects.create(person=user.person, unit=website, role="participant")
+        self.assertEqual(self.login_claims(user)["groups"], ["example:member", "member", "website:participant"])
+        take_away(user)
         self.assertEqual(self.login_claims(user)["groups"], [])
 
     def test_a_statement_altered_in_transit_is_refused(self):
@@ -369,8 +379,26 @@ class Tokens(Service):
         access_token = self.exchange(self.get_code()).json()["access_token"]
         response = CaddyClient().get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["groups"], ["member"])
+        self.assertEqual(response.json()["groups"], ["example:member", "member"])
         self.assertEqual(response.json()["email"], "person@example.org")
+
+    def test_a_sign_in_asks_the_worker_to_tell_the_tools_a_little_later(self):
+        """A tool makes someone's account at their first sign-in, and one that maps the tree
+        only hears about their units from the worker, once that account is there."""
+        user, _ = make_user(groups=["member"])
+        AccessSync.objects.all().delete()
+        self.client.force_login(user)
+        self.exchange(self.get_code())
+        row = AccessSync.objects.get(user=user)
+        self.assertTrue(row.pending)
+        self.assertGreater(row.retry_at, timezone.now() + timedelta(seconds=5))
+
+    def test_a_sign_in_with_only_keys_forgejo_maps_by_itself_asks_nothing(self):
+        user, _ = make_user(groups=["operator"], two_factor=True)
+        AccessSync.objects.all().delete()
+        self.client.force_login(user)
+        self.exchange(self.get_code())
+        self.assertFalse(AccessSync.objects.exists())
 
     def test_asking_with_no_token_is_refused(self):
         self.assertEqual(self.client.get(USERINFO_URL).status_code, 401)
@@ -580,7 +608,7 @@ class Tools(ToolCommand):
         self.client.force_login(user)
         response = self.exchange(self.get_code(client_id=client_id), secret=secret, client_id=client_id)
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(self.verified_claims(response.json()["id_token"], audience=client_id)["groups"], ["member"])
+        self.assertEqual(self.verified_claims(response.json()["id_token"], audience=client_id)["groups"], ["example:member", "member"])
 
     def test_a_new_tool_is_limited_to_the_safe_flow(self):
         self.run_command("add", "git", "https://git.example.org/callback")
@@ -635,21 +663,22 @@ class Tools(ToolCommand):
 
 
 class ToolGroups(Service):
-    """A tool limited to certain groups, as Vaultwarden is. It can't check for itself."""
+    """A tool limited to certain keys, as Vaultwarden is. It can't check for itself."""
 
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
         ToolAccess.objects.create(tool=cls.tool, group_keys=["board", "operator"])
 
-    def test_someone_in_a_listed_group_gets_through(self):
-        for group in ("board", "operator"):
+    def test_someone_with_a_listed_key_gets_through(self):
+        """The root's treasurer is on its board, so has the board key too."""
+        for group in ("board", "treasurer", "operator"):
             with self.subTest(group):
                 user, _ = make_user(f"{group}@example.org", [group], two_factor=True)
                 self.assertEqual(self.login_claims(user)["sub"], str(user.pk))
 
-    def test_someone_with_another_group_is_refused_with_no_code(self):
-        for groups in (["member"], ["developer"], ["treasurer"], []):
+    def test_someone_with_other_keys_is_refused_with_no_code(self):
+        for groups in (["member"], []):
             with self.subTest(groups):
                 user, _ = make_user(f"{'-'.join(groups) or 'nobody'}@example.org", groups, two_factor=True)
                 self.client.force_login(user)
@@ -680,57 +709,67 @@ class ToolGroups(Service):
         self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
 
     def test_being_refused_comes_before_being_asked_to_set_up_2fa(self):
-        user, _ = make_user(groups=["treasurer"])
+        from structure.models import Membership, Position, Unit
+
+        user, _ = make_user(groups=["member"])
+        inside = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="robotics", name="Robotics", parent=Unit.objects.root())
+        Membership.objects.create(person=user.person, association=inside)
+        Position.objects.create(person=user.person, unit=inside, role="treasurer")  # needs 2FA, but isn't the root's board
+        self.assertTrue(user.needs_2fa_setup)
         self.client.force_login(user)
         self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
 
-    def test_a_listed_group_still_needs_2fa(self):
+    def test_a_listed_key_still_needs_2fa(self):
         user, _ = make_user(groups=["board"])
         self.client.force_login(user)
         self.assertRedirects(self.client.get(self.authorize_url()), reverse("mfa_index"), fetch_redirect_response=False)
 
-    def test_a_superuser_outside_the_groups_is_refused(self):
+    def test_a_superuser_without_the_keys_is_refused(self):
         user, _ = make_user(two_factor=True)
         user.is_superuser = True
         user.save()
         self.client.force_login(user)
         self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
 
-    def test_a_custom_group_named_after_a_listed_one_is_refused(self):
-        """It goes by custom:board, so this is the rule that protects the group list."""
+    def test_a_group_named_after_a_listed_key_is_refused(self):
         user, _ = make_user()
         user.groups.add(Group.objects.create(name="board"))
         self.client.force_login(user)
         self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
 
-    def test_renaming_a_listed_group_keeps_its_people_in(self):
-        user, _ = make_user(groups=["board"], two_factor=True)
-        Group.objects.filter(role__key="board").update(name="Styrelsen")
-        self.assertEqual(self.login_claims(user)["sub"], str(user.pk))
+    def test_a_board_role_in_another_association_is_not_the_board(self):
+        from structure.models import Membership, Position, Unit
 
-    def test_joining_a_listed_group_gives_access_at_the_next_login(self):
+        user, _ = make_user(groups=["member"], two_factor=True)
+        inside = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="robotics", name="Robotics", parent=Unit.objects.root())
+        Membership.objects.create(person=user.person, association=inside)
+        Position.objects.create(person=user.person, unit=inside, role="chair")
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
+
+    def test_a_board_role_gives_access_at_the_next_login(self):
         user, _ = make_user(groups=["member"], two_factor=True)
         self.client.force_login(user)
         self.assertEqual(self.client.get(self.authorize_url()).status_code, 403)
-        user.groups.add(Group.objects.get(role__key="board"))
+        give(user, "board")
         self.assertIsNotNone(self.sent_back(self.client.get(self.authorize_url())))
 
-    def test_leaving_the_groups_stops_a_code_already_issued(self):
+    def test_leaving_the_board_stops_a_code_already_issued(self):
         user, _ = make_user(groups=["board"], two_factor=True)
         self.client.force_login(user)
         code = self.get_code()
-        user.groups.clear()
+        take_away(user)
         response = self.exchange(code)
         self.assertEqual(response.status_code, 401)
         self.assertNotIn("access_token", response.json())
 
-    def test_leaving_the_groups_stops_a_token_already_issued(self):
+    def test_leaving_the_board_stops_a_token_already_issued(self):
         user, _ = make_user(groups=["board"], two_factor=True)
         self.client.force_login(user)
         access_token = self.exchange(self.get_code()).json()["access_token"]
         asking = CaddyClient()
         self.assertEqual(asking.get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}).status_code, 200)
-        user.groups.clear()
+        take_away(user)
         self.assertEqual(asking.get(USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}).status_code, 401)
 
     def test_a_tool_with_no_list_stays_open_to_every_account(self):
@@ -785,22 +824,28 @@ class ToolGroupCommands(ToolCommand):
     def access_of(self, name):
         return Client.objects.get(name=name).access.group_keys
 
-    def test_adding_a_tool_with_groups_limits_it(self):
+    def test_adding_a_tool_with_keys_limits_it(self):
         self.run_command("add", "vault", "https://vault.example.org/callback", "--group=board", "--group=operator")
         self.assertEqual(self.access_of("vault"), ["board", "operator"])
 
-    def test_adding_a_tool_with_no_groups_leaves_it_open(self):
+    def test_adding_a_tool_with_no_keys_leaves_it_open(self):
         self.run_command("add", "git", "https://git.example.org/callback")
         self.assertFalse(ToolAccess.objects.filter(tool__name="git").exists())
 
-    def test_a_custom_group_goes_by_its_marked_name(self):
-        Group.objects.create(name="Alumni")
-        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=custom:Alumni")
-        self.assertEqual(self.access_of("vault"), ["custom:Alumni"])
+    def test_a_units_key_can_be_listed(self):
+        from structure.models import Unit
 
-    def test_a_group_that_does_not_exist_is_refused_with_no_tool_left_behind(self):
-        for group in ("bord", "custom:Nobody", "custom:board", ""):
-            with self.subTest(group), self.assertRaisesRegex(CommandError, "No such group"):
+        root = Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="example", name="Example")
+        Unit.objects.create(kind=Unit.Kind.TEAM, key="website", name="Website", parent=root)
+        self.run_command("add", "vault", "https://vault.example.org/callback", "--group=example:chair", "--group=website:lead")
+        self.assertEqual(self.access_of("vault"), ["example:chair", "website:lead"])
+
+    def test_a_key_that_cannot_exist_is_refused_with_no_tool_left_behind(self):
+        from structure.models import Unit
+
+        Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="example", name="Example")
+        for group in ("bord", "custom:Alumni", "developer", "example:lead", "nowhere:member", ""):
+            with self.subTest(group), self.assertRaisesRegex(CommandError, "No such key"):
                 self.run_command("add", "vault", "https://vault.example.org/callback", f"--group={group}")
         self.assertFalse(Client.objects.filter(name="vault").exists())
 

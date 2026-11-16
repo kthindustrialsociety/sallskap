@@ -3,6 +3,7 @@
 import io
 import logging
 import time
+from datetime import date
 
 from allauth.account.models import EmailAddress
 from allauth.mfa.models import Authenticator
@@ -19,7 +20,7 @@ from django.core.exceptions import ValidationError
 from django.core.management import CommandError, call_command
 from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
-from django.urls import resolve, reverse
+from django.urls import NoReverseMatch, resolve, reverse
 from sallskap.urls import not_found
 
 from .links import password_link
@@ -42,10 +43,42 @@ def totp_code(secret):
     return format_hotp_value(hotp_value(secret, int(time.time()) // 30))
 
 
+def root():
+    from structure.models import Unit
+
+    return Unit.objects.filter(parent=None).first() or Unit.objects.create(kind=Unit.Kind.ASSOCIATION, key="example", name="Example")
+
+
+def give(user, *roles):
+    """What tests used to give as groups. `operator` is the one group (structure.md §5);
+    `member` is a membership of the root, and `board` and `treasurer` that and a
+    position on its board."""
+    from structure.models import Membership, Position
+
+    for role in roles:
+        if role == "operator":
+            user.groups.add(Group.objects.get(role__key="operator"))
+            continue
+        if not user.person.is_member(root()):
+            Membership.objects.create(person=user.person, association=root(), start=date(2020, 1, 1))
+        if role != "member":
+            position = {"board": Position.Role.BOARD_MEMBER, "treasurer": Position.Role.TREASURER}[role]
+            Position.objects.create(person=user.person, unit=root(), role=position, start=date(2020, 1, 1))
+
+
+def take_away(user):
+    """Ends every tie the account's person holds today: positions first, as a membership
+    can't end while a board role rests on it."""
+    from structure.models import Membership, Position
+
+    for tie in [*Position.objects.current().filter(person__user=user), *Membership.objects.current().filter(person__user=user)]:
+        tie.end_on()
+
+
 def make_user(email="person@example.org", groups=(), password=None, two_factor=False):
-    """Returns the user, and their 2FA secret if they have one."""
+    """Returns the user, and their 2FA secret if they have one. `groups` is what give() takes."""
     user = User.objects.create_user(email, password)
-    user.groups.set(Group.objects.filter(role__key__in=groups))
+    give(user, *groups)
     secret = None
     if two_factor:
         secret = generate_totp_secret()
@@ -297,11 +330,8 @@ class Groups(Base):
             for group in Group.objects.all()
         )
 
-    def test_all_six_exist_automatically(self):
-        self.assertEqual(
-            sorted(Group.objects.values_list("name", flat=True)),
-            ["Board", "Developer", "Events", "Member", "Operator", "Treasurer"],
-        )
+    def test_operator_is_the_one_group_and_exists_automatically(self):
+        self.assertEqual(list(Group.objects.values_list("name", "role__key")), [("Operator", "operator")])
 
     def test_running_setup_again_changes_nothing(self):
         before = self.snapshot()
@@ -310,19 +340,20 @@ class Groups(Base):
 
     def test_setup_repairs_changed_permissions(self):
         before = self.snapshot()
-        Group.objects.get(role__key="board").permissions.clear()
+        Group.objects.get(role__key="operator").permissions.clear()
         call_command("migrate", verbosity=0)
         self.assertEqual(self.snapshot(), before)
 
-    def test_renaming_a_group_keeps_its_rules_and_its_name(self):
-        Group.objects.filter(role__key="board").update(name="Styrelse")
+    def test_renaming_the_group_keeps_its_rules_and_its_name(self):
+        Group.objects.filter(role__key="operator").update(name="Drift")
         call_command("migrate", verbosity=0)
-        self.assertEqual(Group.objects.get(role__key="board").name, "Styrelse")
-        self.assertFalse(Group.objects.filter(name="Board").exists())
+        self.assertEqual(Group.objects.get(role__key="operator").name, "Drift")
+        self.assertFalse(Group.objects.filter(name="Operator").exists())
 
-        user, _ = make_user(groups=["board"])
+        user, _ = make_user(groups=["operator"])
         self.assertTrue(user.requires_2fa)
         self.assertTrue(user.is_staff)
+        self.assertTrue(user.has_perm("accounts.change_user"))
 
 
 class Admin(Base):
@@ -369,80 +400,73 @@ class Admin(Base):
         self.assertEqual(response.status_code, 302)
         self.assertNotIn("evil", response.url)
 
-    def test_groups_needing_2fa_are_refused_without_it(self):
-        for group in ("board", "treasurer", "operator"):
-            with self.subTest(group):
-                self.enter([group], two_factor=False, email=f"{group}@example.org")
-                self.assert_sent_to_2fa_setup(reverse("admin:index"))
-                self.assert_sent_to_2fa_setup(reverse("admin:accounts_user_changelist"))
+    def test_an_operator_is_sent_to_set_up_2fa_first(self):
+        self.enter(["operator"], two_factor=False)
+        self.assert_sent_to_2fa_setup(reverse("admin:index"))
+        self.assert_sent_to_2fa_setup(reverse("admin:accounts_user_changelist"))
 
     def test_a_superuser_is_refused_without_2fa_too(self):
         self.client.force_login(User.objects.create_superuser("root@example.org"))
         self.assert_sent_to_2fa_setup(reverse("admin:index"))
 
-    def test_the_same_groups_get_in_with_2fa(self):
-        for group in ("board", "treasurer", "operator"):
-            with self.subTest(group):
-                self.enter([group], email=f"{group}@example.org")
-                self.assertEqual(self.client.get(reverse("admin:index")).status_code, 200)
+    def test_an_operator_gets_in_with_2fa(self):
+        self.enter(["operator"])
+        self.assertEqual(self.client.get(reverse("admin:index")).status_code, 200)
 
-    def test_events_gets_in_without_2fa_and_sees_nothing_yet(self):
-        self.enter(["events"], two_factor=False)
-        response = self.client.get(reverse("admin:index"))
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context["app_list"], [])
-
-    def test_developer_and_member_are_refused(self):
-        for group in ("developer", "member"):
-            with self.subTest(group):
-                self.enter([group], email=f"{group}@example.org")
-                response = self.get_admin()
-                self.assertEqual(response.status_code, 403)
+    def test_the_admin_page_is_operators_only(self):
+        """structure.md §7: the board's own pages come with C6."""
+        for roles in (["board"], ["treasurer"], ["member"]):
+            with self.subTest(roles):
+                self.enter(roles, email=f"{roles[0]}@example.org")
+                self.assertEqual(self.get_admin().status_code, 403)
 
     def test_someone_with_no_group_is_refused(self):
         self.enter([])
         self.assertEqual(self.get_admin().status_code, 403)
 
-    def test_treasurer_cannot_see_what_is_meant_for_operators(self):
-        self.enter(["treasurer"])
-        self.assertEqual(self.client.get(reverse("admin:index")).context["app_list"], [])
-        for name in ("accounts_user_changelist", "accounts_user_add", "auth_group_changelist", "mfa_authenticator_changelist"):
-            with self.subTest(name):
-                self.assertEqual(self.client.get(reverse(f"admin:{name}")).status_code, 403)
-
-    def test_board_can_view_users_but_change_nothing(self):
+    def test_the_board_can_reach_nothing_there(self):
         other, _ = make_user("other@example.org", ["member"])
         self.enter(["board"])
-        self.assertContains(self.client.get(reverse("admin:accounts_user_changelist")), "other@example.org")
-
         change = reverse("admin:accounts_user_change", args=[other.pk])
-        self.assertEqual(self.client.get(change).status_code, 200)
+        for url in (reverse("admin:accounts_user_changelist"), change, reverse("admin:accounts_user_add"), reverse("admin:mfa_authenticator_changelist")):
+            with self.subTest(url):
+                self.assertEqual(self.client.get(url, follow=True).status_code, 403)
         operators = Group.objects.get(role__key="operator")
-        self.assertEqual(self.client.post(change, self.user_form(other, groups=[operators.pk])).status_code, 403)
-        self.assertFalse(other.has_role("operator"))
+        self.assertEqual(self.client.post(change, self.user_form(other, groups=[operators.pk]), follow=True).status_code, 403)
+        self.assertFalse(other.is_operator)
 
-        self.assertEqual(self.client.get(reverse("admin:accounts_user_add")).status_code, 403)
-        self.assertEqual(self.client.get(reverse("admin:auth_group_changelist")).status_code, 403)
-        self.assertEqual(self.client.get(reverse("admin:mfa_authenticator_changelist")).status_code, 403)
-
-    def test_board_cannot_put_itself_in_a_group(self):
+    def test_board_cannot_make_itself_an_operator(self):
         me = self.enter(["board"])
         operators = Group.objects.get(role__key="operator")
         change = reverse("admin:accounts_user_change", args=[me.pk])
-        self.assertEqual(self.client.post(change, self.user_form(me, groups=[operators.pk])).status_code, 403)
-        self.assertFalse(me.has_role("operator"))
+        self.assertEqual(self.client.post(change, self.user_form(me, groups=[operators.pk]), follow=True).status_code, 403)
+        self.assertFalse(me.is_operator)
 
-    def test_operator_adds_a_person_to_a_group_with_no_password(self):
+    def test_operator_adds_a_person_with_no_password(self):
         self.enter(["operator"])
-        board = Group.objects.get(role__key="board")
         response = self.client.post(
             reverse("admin:accounts_user_add"),
-            {"email": "New.Person@Example.org", "name": "New Person", "is_active": "on", "groups": [board.pk]},
+            {"email": "New.Person@Example.org", "name": "New Person", "is_active": "on"},
         )
         self.assertEqual(response.status_code, 302)
         added = User.objects.get(email="new.person@example.org")
-        self.assertTrue(added.has_role("board"))
+        self.assertFalse(added.is_operator)
         self.assertFalse(added.has_usable_password())
+
+    def test_operator_makes_someone_an_operator(self):
+        other, _ = make_user("other@example.org")
+        self.enter(["operator"])
+        operators = Group.objects.get(role__key="operator")
+        response = self.client.post(reverse("admin:accounts_user_change", args=[other.pk]), self.user_form(other, groups=[operators.pk]))
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(other.is_operator)
+
+    def test_the_form_offers_operator_alone_and_shows_someones_keys(self):
+        other, _ = make_user("other@example.org", ["board"])
+        self.enter(["operator"])
+        response = self.client.get(reverse("admin:accounts_user_change", args=[other.pk]))
+        self.assertEqual([str(choice[1]) for choice in response.context["adminform"].form.fields["groups"].choices], ["Operator"])
+        self.assertContains(response, "board, example:board_member, example:member, member")
 
     def test_two_accounts_cannot_differ_only_by_case(self):
         make_user("taken@example.org")
@@ -476,23 +500,12 @@ class Admin(Base):
         boss.refresh_from_db()
         self.assertTrue(boss.is_active)
 
-    def test_operator_can_rename_a_group_but_not_change_its_permissions(self):
+    def test_there_are_no_groups_to_manage(self):
+        """Operator is the one group, so nobody can make another, or change or delete it."""
+        with self.assertRaises(NoReverseMatch):
+            reverse("admin:auth_group_changelist")
         self.enter(["operator"])
-        treasurer = Group.objects.get(role__key="treasurer")
-        change = reverse("admin:auth_group_change", args=[treasurer.pk])
-        any_permission = Group.objects.get(role__key="operator").permissions.first()
-        self.client.post(change, {"name": "Kassör", "permissions": [any_permission.pk]})
-        treasurer.refresh_from_db()
-        self.assertEqual(treasurer.name, "Kassör")
-        self.assertEqual(treasurer.permissions.count(), 0)
-
-    def test_nobody_can_delete_a_built_in_group(self):
-        self.client.force_login(User.objects.create_superuser("root@example.org"))
-        TOTP.activate(User.objects.get(email="root@example.org"), generate_totp_secret())
-        board = Group.objects.get(role__key="board")
-        response = self.client.post(reverse("admin:auth_group_delete", args=[board.pk]), {"post": "yes"})
-        self.assertEqual(response.status_code, 403)
-        self.assertTrue(Group.objects.filter(pk=board.pk).exists())
+        self.assertEqual(self.client.get("/admin/auth/group/", follow=True).status_code, 404)
 
     def test_operator_cannot_see_a_2fa_secret(self):
         other, secret = make_user("other@example.org", two_factor=True)
@@ -583,14 +596,14 @@ class Admin(Base):
         me.groups.clear()
         self.assertEqual(self.client.get(reverse("admin:accounts_user_changelist"), follow=True).status_code, 403)
 
-    def test_joining_a_group_requires_2fa_at_the_next_click(self):
-        me = self.enter(["events"], two_factor=False)
-        self.assertEqual(self.client.get(reverse("admin:index")).status_code, 200)
-        me.groups.add(Group.objects.get(role__key="board"))
+    def test_becoming_an_operator_requires_2fa_at_the_next_click(self):
+        me = self.enter([], two_factor=False)
+        self.assertEqual(self.get_admin().status_code, 403)
+        me.groups.add(Group.objects.get(role__key="operator"))
         self.assert_sent_to_2fa_setup(reverse("admin:index"))
 
     def test_turning_off_2fa_ends_admin_access_at_the_next_click(self):
-        me = self.enter(["board"])
+        me = self.enter(["operator"])
         self.assertEqual(self.client.get(reverse("admin:index")).status_code, 200)
         Authenticator.objects.filter(user=me).delete()
         self.assert_sent_to_2fa_setup(reverse("admin:index"))
@@ -609,9 +622,9 @@ class Admin(Base):
 
 
 class TwoFactorSetup(Base):
-    def test_a_new_board_member_can_set_up_2fa_and_get_in(self):
+    def test_a_new_operator_can_set_up_2fa_and_get_in(self):
         """The whole first visit, with no email in the system at any point."""
-        user, _ = make_user(groups=["board"], password=PASSWORD)
+        user, _ = make_user(groups=["operator"], password=PASSWORD)
         self.log_in("person@example.org")
         self.assertContains(self.client.get(reverse("home")), reverse("mfa_index"))
 
@@ -732,7 +745,7 @@ class Commands(Base):
     def test_create_admin_makes_an_operator_who_must_choose_a_password(self):
         output = self.run_command("create_admin", "First.Admin@Example.org")
         user = User.objects.get(email="first.admin@example.org")
-        self.assertTrue(user.has_role("operator"))
+        self.assertTrue(user.is_operator)
         self.assertFalse(user.is_superuser)
         self.assertFalse(user.has_usable_password())
         self.assertIn(f"https://{settings.APP_HOST}/set-password/", output)
@@ -766,7 +779,7 @@ class Commands(Base):
         self.run_command("create_admin", "admin@example.org")
         user.refresh_from_db()
         self.assertTrue(user.is_active)
-        self.assertTrue(user.has_role("operator"))
+        self.assertTrue(user.is_operator)
 
     def test_create_admin_leaves_2fa_alone_unless_asked(self):
         user, _ = make_user("admin@example.org", ["operator"], two_factor=True)

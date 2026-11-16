@@ -9,7 +9,8 @@ which faces the internet, never has them, and a tool being down never holds up a
 Each module that can be told about changes ships a `connector.py`, which core loads from
 its folder, so a module that's off just isn't asked. A connector has no Django in it: it
 has a `tool`, its name in the login service, and `apply(person, note)`, which makes the
-tool match what's decided for that person and has to be safe to repeat. `note(key, text)`
+tool match what's decided for that person and has to be safe to repeat. The person
+carries their keys (structure.md §5) and the tree of units, for a tool that maps it. `note(key, text)`
 records something only a person can do, and it should be called before the change that
 makes it needed, so a crash partway can't lose it."""
 
@@ -24,10 +25,13 @@ from allauth.idp.oidc.models import Client
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext as _
+from structure.access import for_tools
+from structure.models import Membership, Position
+from structure.models import Unit as Node
+from structure.models import path_and_above
 
 from .login_service import may_use
 from .models import AccessSync, FollowUp, User
-from .roles import TWO_FACTOR_ROLES
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +41,35 @@ BATCH = 50
 
 
 @dataclass(frozen=True)
+class Unit:
+    """A unit of the tree, as a connector sees it."""
+
+    key: str
+    name: str
+    team: bool
+    association: str  # its own key for an association, or the key of the one owning the team
+    root: bool = False
+
+
+@dataclass(frozen=True)
 class Person:
     """What a connector gets told about someone."""
 
     sub: str
     email: str
     allowed: bool  # may they use this tool at all, right now?
-    groups: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()  # their keys, as the login response sends them
+    units: tuple[Unit, ...] = ()  # the whole tree, archived units too, for a tool that maps it
+
+
+def tree():
+    """Every unit, with the association each one is or belongs to: one query."""
+    rows = list(Node.objects.values_list("key", "name", "kind", "path", "parent_id"))
+    associations = {path: key for key, _name, kind, path, _parent in rows if kind == Node.Kind.ASSOCIATION}
+    return tuple(
+        Unit(key, name, kind == Node.Kind.TEAM, next(associations[above] for above in reversed(path_and_above(path)) if above in associations), parent is None)
+        for key, name, kind, path, parent in rows
+    )
 
 
 def sub_of(user):
@@ -53,15 +79,17 @@ def sub_of(user):
     return get_adapter().get_user_sub(None, user)
 
 
-def _ask(sub, user, label):
+def _ask(sub, user, label, wait=None):
+    now = timezone.now()
     AccessSync.objects.update_or_create(
         sub=sub,
-        defaults={"user": user, "label": label, "requested_at": timezone.now(), "pending": True, "attempts": 0, "retry_at": None},
+        defaults={"user": user, "label": label, "requested_at": now, "pending": True, "attempts": 0, "retry_at": now + wait if wait else None},
     )
 
 
-def request_for(user):
-    _ask(sub_of(user), user, user.email)
+def request_for(user, wait=None):
+    """`wait` holds it back for a while, such as until a tool has made someone's account."""
+    _ask(sub_of(user), user, user.email, wait)
 
 
 def request_for_deleted(user):
@@ -82,6 +110,24 @@ def request_for_everyone():
         update_fields=["user", "label", "requested_at", "pending", "attempts", "retry_at"],
     )
     AccessSync.objects.filter(user__isnull=True).update(requested_at=now, pending=True, attempts=0, retry_at=None)
+
+
+def request_for_new_days(since, today):
+    """Ties that start or end on a day with no save, such as a board taking office on
+    1 July, change keys all the same. So the worker asks about everyone whose ties started
+    or ended after `since`, up to and including `today`, once the day has changed."""
+    days = Q(start__gt=since, start__lte=today) | Q(end__gt=since, end__lte=today)
+    ties = Q(person__memberships__in=Membership.objects.filter(days)) | Q(person__positions__in=Position.objects.filter(days))
+    for user in User.objects.filter(ties).distinct():
+        request_for(user)
+
+
+def new_day(day):
+    """Returns today, having asked about the days since `day` if it has changed."""
+    today = timezone.localdate()
+    if today > day:
+        request_for_new_days(day, today)
+    return today
 
 
 class Unavailable:
@@ -130,25 +176,18 @@ def check(connectors):
     return problems
 
 
-def _groups_for_tools(user):
-    """Core won't let someone through to a tool until they've set up the 2FA a group
-    requires, or every tool would be a way around the rule. Telling a tool about that group
-    directly would be one too, so it has to wait for them as well."""
-    keys = user.group_keys()
-    return [key for key in keys if key not in TWO_FACTOR_ROLES] if user.needs_2fa_setup else keys
-
-
 def label(row):
     return row.label or _("A deleted account (%(sub)s)") % {"sub": row.sub}
 
 
-def _person(row, tool):
+def _person(row, tool, units=()):
     user = row.user
     return Person(
         sub=row.sub,
         email=label(row),
         allowed=bool(user and user.is_active and may_use(user, tool)),
-        groups=tuple(_groups_for_tools(user)) if user else (),
+        groups=tuple(for_tools(user)) if user else (),  # the same keys as the login response
+        units=units,
     )
 
 
@@ -169,12 +208,13 @@ def _wait(attempts):
     return min(timedelta(seconds=5 * 2 ** min(attempts, 8)), LONGEST_WAIT)  # a tool can be down for days
 
 
-def process(row, connectors, down=None):
+def process(row, connectors, down=None, units=None):
     """Each tool is told once for each change, and one being down doesn't hold up the
     others. A change arriving partway only moves requested_at, so it's picked up next time.
     `down` holds tools that aren't answering, so a hung one costs one timeout and not one
     for everyone who's waiting."""
     down = {} if down is None else down
+    units = tree() if units is None else units
     version = row.requested_at.isoformat()
     tools = dict(row.tools)
     failed = False
@@ -194,7 +234,7 @@ def process(row, connectors, down=None):
             asked.discard(connector.tool)
             continue  # not registered, so nobody can use it. Registering it asks for everyone again
         try:
-            connector.apply(_person(row, tool), _note(row, connector.tool))
+            connector.apply(_person(row, tool, units), _note(row, connector.tool))
         except Exception as error:  # whatever one tool does, the others still get told
             failed = True
             tools[connector.tool] = {"error": str(error)[:300], "at": now}
@@ -225,8 +265,9 @@ def run_once(connectors, tick=lambda: None):
     due = AccessSync.objects.filter(Q(retry_at__isnull=True) | Q(retry_at__lte=timezone.now()), pending=True)
     rows = list(due.select_related("user").order_by("-requested_at")[:BATCH])
     down = {}
+    units = tree() if rows else ()
     for row in rows:
-        process(row, connectors, down)
+        process(row, connectors, down, units)
         tick()
     return len(rows)
 

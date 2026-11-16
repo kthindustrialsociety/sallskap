@@ -6,7 +6,7 @@ from django.db.models.functions import Lower
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from .roles import ADMIN_ROLES, TWO_FACTOR_ROLES
+from .roles import OPERATOR
 
 
 def normalize_email(email):
@@ -75,15 +75,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     def get_short_name(self):
         return self.name or self.email
 
-    def has_role(self, *keys):
-        return self.groups.filter(role__key__in=keys).exists()
-
-    def group_keys(self):
-        """What other tools are told. Built-in groups go by their fixed key, so
-        renaming one can't silently change what someone can do in a tool. Others are
-        marked as custom, so one named "operator" can't pass for the real thing."""
-        groups = self.groups.select_related("role")
-        return sorted(group.role.key if hasattr(group, "role") else f"custom:{group.name}" for group in groups)
+    @property
+    def is_operator(self):
+        """Operator is the one group (structure.md §4). Everything else comes from ties."""
+        return self.groups.filter(role__key=OPERATOR).exists()
 
     def tool_username(self):
         """The part of the email before the @. Tools like Forgejo allow one account per
@@ -94,19 +89,19 @@ class User(AbstractBaseUser, PermissionsMixin):
         taken = User.objects.filter(email__startswith=f"{name}@", pk__lt=self.pk).exists()
         return f"{name}-{self.pk}" if taken else name
 
-    # A property rather than Django's usual stored flag, so groups alone decide:
-    # removing someone from a group removes their admin access at their next click.
+    # A property rather than Django's usual stored flag, so the group alone decides:
+    # taking someone out of Operator removes their admin access at their next click.
+    # The admin page is Operators' only (structure.md §7).
     @property
     def is_staff(self):
-        return self.is_superuser or self.has_role(*ADMIN_ROLES)
+        return self.is_superuser or self.is_operator
 
     @property
     def requires_2fa(self):
-        """The groups that need it, and a board role anywhere (structure.md §4). The Board
-        and Treasurer groups keep needing it until they're worked out from positions."""
+        """Operators, and a board role anywhere (structure.md §4)."""
         from structure.authority import requires_2fa
 
-        return self.is_superuser or self.has_role(*TWO_FACTOR_ROLES) or requires_2fa(self)
+        return self.is_superuser or self.is_operator or requires_2fa(self)
 
     @property
     def needs_2fa_setup(self):
@@ -117,11 +112,12 @@ class User(AbstractBaseUser, PermissionsMixin):
 
 
 class ToolAccess(models.Model):
-    """Which groups may log in to a tool through the login service. A tool with no row
-    is open to every account, and decides for itself what they can do."""
+    """Which keys may log in to a tool through the login service: anyone with one of
+    them. A tool with no row is open to every account, and decides for itself what they
+    can do. Keys are worked out in structure/access.py."""
 
     tool = models.OneToOneField("allauth_idp_oidc.Client", on_delete=models.CASCADE, related_name="access")
-    group_keys = models.JSONField(default=list)  # the same keys as User.group_keys
+    group_keys = models.JSONField(default=list)  # keys, such as board or robotics:chair
     # For a tool whose sessions last as long as its access token does. Empty: the usual 10 minutes.
     session_hours = models.PositiveSmallIntegerField(null=True, blank=True)
 
@@ -130,8 +126,8 @@ class ToolAccess(models.Model):
 
 
 class GroupRole(models.Model):
-    """Ties a group to a built-in role by a key that never changes, so the rules
-    in roles.py still apply if the association renames the group."""
+    """Ties the Operator group to its key, which never changes, so the rules in roles.py
+    still apply if the association renames the group."""
 
     group = models.OneToOneField(Group, on_delete=models.CASCADE, related_name="role")
     key = models.SlugField(unique=True)

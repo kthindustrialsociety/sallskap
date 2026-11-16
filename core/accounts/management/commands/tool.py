@@ -4,7 +4,6 @@ from allauth.idp.oidc.adapter import get_adapter
 from allauth.idp.oidc.models import Client
 from django.conf import settings
 from django.contrib.auth.hashers import make_password
-from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.core.validators import URLValidator
@@ -12,7 +11,7 @@ from django.db import transaction
 
 from accounts.hashers import ToolSecretHasher
 from accounts.login_service import SCOPES
-from accounts.models import GroupRole, ToolAccess
+from accounts.models import ToolAccess
 
 
 class Command(BaseCommand):
@@ -23,7 +22,7 @@ class Command(BaseCommand):
         add = actions.add_parser("add")
         add.add_argument("name")
         add.add_argument("callback", help="the exact address the tool wants people sent back to")
-        add.add_argument("--group", action="append", default=[], dest="groups", help="only this group may log in (repeatable)")
+        add.add_argument("--group", action="append", default=[], dest="groups", help="only people with this key may log in, such as board or robotics:chair (repeatable)")
         add.add_argument("--session-hours", type=int, help="for a tool whose sessions last as long as its access token (1-24)")
         actions.add_parser("list")
         actions.add_parser("remove").add_argument("name")
@@ -43,7 +42,7 @@ class Command(BaseCommand):
         self.check_groups(groups)
         if session_hours is not None:
             if not groups:
-                raise CommandError("A longer session is only for a tool limited to certain groups.")
+                raise CommandError("A longer session is only for a tool limited to certain keys.")
             if not 1 <= session_hours <= 24:
                 raise CommandError("A session can last from 1 to 24 hours.")
 
@@ -79,12 +78,15 @@ class Command(BaseCommand):
             raise problem
 
     def check_groups(self, groups):
-        """A misspelt group would quietly keep everyone out."""
-        known = set(GroupRole.objects.values_list("key", flat=True))
-        known |= {f"custom:{name}" for name in Group.objects.filter(role__isnull=True).values_list("name", flat=True)}
-        unknown = sorted(set(groups) - known)
+        """A misspelt key would quietly keep everyone out."""
+        from structure.access import known_keys
+
+        unknown = sorted(set(groups) - known_keys())
         if unknown:
-            raise CommandError(f"No such group: {', '.join(unknown)}. These exist: {', '.join(sorted(known))}.")
+            raise CommandError(
+                f"No such key: {', '.join(unknown)}. A key is member, board, treasurer or operator, or a unit's key with a role "
+                f"it can have, such as robotics:chair, robotics:member or website:lead (structure.md §5)."
+            )
 
     def list(self):
         tools = Client.objects.select_related("access").order_by("name")
