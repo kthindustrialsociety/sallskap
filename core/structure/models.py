@@ -2,6 +2,7 @@
 every save, wherever it comes from, and the database holds the ones it can."""
 
 import re
+from contextvars import ContextVar
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, ValidationError
@@ -232,9 +233,12 @@ class Unit(models.Model):
                 for unit in below:
                     unit.path = self.path + unit.path[len(before):]
                 Unit.objects.bulk_update(below, ["path"])
-                problems = self.membership_problems()
+                problems = self.membership_problems() + SeatRule.problems_after_moving()
                 if problems:  # rolls the move back
                     raise ValidationError(problems)
+                from .seats import after_tree_changed
+
+                after_tree_changed(SeatRule.objects.filter(each_association_under=True))  # associations moved in or out of reach
 
     # ---- Archiving and deleting --------------------------------------------------
 
@@ -242,16 +246,24 @@ class Unit(models.Model):
         """Archives this team and everything under it. Ones already archived keep their date."""
         if self.kind != Unit.Kind.TEAM:
             raise ValidationError(_("Only teams are archived. %(unit)s is an association.") % {"unit": self})
+        from .seats import after_tree_changed
+
         now = timezone.now()
-        Unit.objects.filter(path__startswith=self.path, archived_at__isnull=True).update(archived_at=now)
-        self.archived_at = self.archived_at or now
+        with transaction.atomic():
+            Unit.objects.filter(path__startswith=self.path, archived_at__isnull=True).update(archived_at=now)
+            self.archived_at = self.archived_at or now
+            after_tree_changed(SeatRule.objects.filter(held_in__path__startswith=self.path))  # a position in an archived team gives no seat
 
     def unarchive(self):
         """Brings back this team alone. The ones under it stay archived until brought back too."""
+        from .seats import after_tree_changed
+
         if self.parent and self.parent.archived:
             raise ValidationError(_("%(parent)s is archived, so take it out of the archive first.") % {"parent": self.parent})
-        Unit.objects.filter(pk=self.pk).update(archived_at=None)
-        self.archived_at = None
+        with transaction.atomic():
+            Unit.objects.filter(pk=self.pk).update(archived_at=None)
+            self.archived_at = None
+            after_tree_changed(SeatRule.objects.filter(models.Q(held_in=self) | models.Q(unit=self)))
 
     def deletion_problem(self):
         """Why this unit can't be deleted, or None. A unit is deleted only if nothing
@@ -269,6 +281,8 @@ class Unit(models.Model):
             return _("People are or were tied to %(unit)s, and that record is kept.") % {"unit": self}
         if self.grants.exists() or self.grants_to_roles.exists():
             return _("A grant covers %(unit)s, or goes to a role in it, now or before, and that record is kept.") % {"unit": self}
+        if self.seat_rules.exists() or self.seat_rules_from.exists():
+            return _("A seat rule gives seats in %(unit)s, or comes from a role in it, now or before, and that record is kept.") % {"unit": self}
         return None
 
     def membership_problems(self, below=True):
@@ -340,6 +354,10 @@ def _today():
     return timezone.localdate()
 
 
+# Set while seats.py saves a seat: Position.save refuses one saved from anywhere else.
+_seating = ContextVar("seating", default=False)
+
+
 def _erase(queryset):
     """Removes rows that are otherwise never deleted: a duplicate left by a merge, or a
     made-up installation being replaced. Nothing else may call this."""
@@ -378,7 +396,7 @@ class Person(models.Model):
     def deletion_problem(self):
         if self.user_id:
             return _("%(person)s has an account.") % {"person": self}
-        if self.memberships.exists() or self.positions.exists() or self.reasons.exists() or self.grants_given.exists():
+        if self.memberships.exists() or self.positions.exists() or self.reasons.exists() or self.grants_given.exists() or self.seat_rules_made.exists():
             return _("%(person)s is or was tied to a unit, and that record is kept.") % {"person": self}
         return None
 
@@ -440,6 +458,7 @@ class Person(models.Model):
         Position.objects.filter(person=gone).update(person=kept)
         Reason.objects.filter(person=gone).update(person=kept)
         Grant.objects.filter(given_by=gone).update(given_by=kept)
+        SeatRule.objects.filter(made_by=gone).update(made_by=kept)
 
         if gone.user_id:
             user = gone.user
@@ -645,8 +664,12 @@ class Tie(models.Model):
             self.check_rules()
             self.before_save()
             super().save(*args, **kwargs)
+            self.after_save()
 
     def before_save(self):
+        pass
+
+    def after_save(self):
         pass
 
 
@@ -714,9 +737,17 @@ class Position(Tie):
     title = models.CharField(_("title"), max_length=100, blank=True, help_text=_("Shown beside the role, such as Head of PR. It gives nothing beyond the role."))
     appointed_by = models.CharField(_("appointed by"), max_length=200, blank=True, help_text=_("Such as Annual meeting 2026, or the board."))
     minutes = models.CharField(_("minutes"), max_length=500, blank=True, help_text=_("Where the decision is recorded."))
+    # A seat (structure.md §4): core sets both, and keeps its dates in step. Empty for a
+    # position someone appointed.
+    seat_rule = models.ForeignKey("SeatRule", verbose_name=_("seat rule"), null=True, blank=True, editable=False, on_delete=models.PROTECT, related_name="seats")
+    seat_from = models.ForeignKey("self", verbose_name=_("comes from"), null=True, blank=True, editable=False, on_delete=models.PROTECT, related_name="seats_given")
+    # The day a move or bringing a team back put the position it comes from in the rule's
+    # reach, and the day a move or archiving put it out, if either did: see seats.py.
+    seat_since = models.DateField(_("in reach from"), null=True, blank=True, editable=False)
+    seat_until = models.DateField(_("out of reach from"), null=True, blank=True, editable=False)
 
     unit_field = "unit"
-    fixed_fields = ("role",)
+    fixed_fields = ("role", "seat_rule_id", "seat_from_id")
 
     class Meta:
         verbose_name = _("position")
@@ -725,6 +756,11 @@ class Position(Tie):
         constraints = [
             models.CheckConstraint(condition=models.Q(end__isnull=True) | models.Q(end__gte=models.F("start")), name="position_ends_after_start"),
             models.UniqueConstraint(fields=["unit"], condition=models.Q(role="chair", end__isnull=True), name="one_open_chair"),
+            models.CheckConstraint(
+                condition=models.Q(seat_rule__isnull=True, seat_from__isnull=True) | models.Q(seat_rule__isnull=False, seat_from__isnull=False),
+                name="seat_has_rule_and_source",
+            ),
+            models.UniqueConstraint(fields=["seat_rule", "seat_from"], condition=models.Q(seat_until__isnull=True), name="one_open_seat_per_rule_and_source"),
         ]
 
     def __str__(self):
@@ -760,6 +796,7 @@ class Position(Tie):
         if problem := self.role_problem(self.role, unit):
             problems.append(problem)
         stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
+        self._dates_changed = stored is None or (stored.start, stored.end) != (self.start, self.end)  # for after_save
         if stored is None and unit.archived:
             problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
         if not problems and self.start and (stored is None or stored.start != self.start):
@@ -774,11 +811,22 @@ class Position(Tie):
                 problems.append(_("%(unit)s has one chair at a time, and %(other)s is chair then.") % {"unit": unit, "other": others.first().person})
         return problems
 
+    def is_seat(self):
+        return self.seat_rule_id is not None
+
     def before_save(self):
+        if self.is_seat() and not _seating.get():  # and problems() keeps a seat a seat
+            raise ValidationError(_("%(seat)s is a seat, from a seat rule, so core alone sets, changes and ends it. Change the rule, or the position it comes from.") % {"seat": self})
         # Appointing the next chair ends the last one's position on the day the new one starts.
         if self.role == self.Role.CHAIR and self.pk is None:
             for chair in Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True):
                 chair.end_on(self.start)
+
+    def after_save(self):
+        if not self.is_seat():
+            from .seats import after_position_saved
+
+            after_position_saved(self, dates_changed=getattr(self, "_dates_changed", True))
 
 
 class Reason(Tie):
@@ -904,4 +952,158 @@ class Grant(Tie):
         if not problems and self.start and (stored is None or stored.start != self.start):
             if not can(self.given_by, Permission.GIVE_GRANTS, self.unit, on=self.start):
                 problems.append(_("%(person)s couldn't give grants in %(unit)s on %(day)s: only a chair or vice chair with authority there can.") % {"person": self.given_by, "unit": self.unit, "day": self.start})
+        return problems
+
+
+# ---- Seats that come with another position: structure.md §4 ------------------------------
+
+# Any role a unit can have, but chair: a unit has one at a time, and a rule can seat several.
+SEAT_ROLES = [(value, label) for value, label in Position.Role.choices if value != Position.Role.CHAIR]
+
+
+class SeatRule(Tie):
+    """Whoever holds one of some roles, in one unit or in each association directly under
+    it, has a seat in this unit, for as long as they hold it: such as the chair of each
+    association under the root on the root's board. Core makes, changes and ends the
+    seats, which are positions: see seats.py. Dated like a tie, ended and never deleted."""
+
+    unit = models.ForeignKey(Unit, verbose_name=_("seats in"), on_delete=models.PROTECT, related_name="seat_rules")
+    role = models.CharField(_("as"), max_length=20, choices=SEAT_ROLES)
+    from_roles = models.JSONField(_("for the roles"), default=list, help_text=_("Whoever holds one of these roles gets the seat."))
+    held_in = models.ForeignKey(
+        Unit, verbose_name=_("held in"), on_delete=models.PROTECT, related_name="seat_rules_from",
+        help_text=_("Where those roles are held, such as the association whose vice chair it's for."),
+    )
+    each_association_under = models.BooleanField(
+        _("in each association directly under it"), default=False,
+        help_text=_("Such as the chair of each association directly under the root, rather than the root's own."),
+    )
+    made_by = models.ForeignKey(
+        Person, verbose_name=_("made by"), on_delete=models.PROTECT, related_name="seat_rules_made",
+        help_text=_("Someone who could appoint in the unit with the seats, on the day it starts."),
+    )
+
+    fixed_fields = ("role", "from_roles", "each_association_under")
+
+    class Meta:
+        verbose_name = _("seat rule")
+        verbose_name_plural = _("seat rules")
+        ordering = ["-start", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(end__isnull=True) | models.Q(end__gte=models.F("start")), name="seat_rule_ends_after_start"),
+            models.CheckConstraint(condition=~models.Q(role="chair"), name="seat_is_never_a_chair"),
+        ]
+
+    def role_labels(self):
+        return [str(Position.Role(role).label) for role in self.from_roles if role in Position.Role.values]
+
+    def __str__(self):
+        labels = self.role_labels()
+        roles = _("%(some)s or %(last)s") % {"some": ", ".join(labels[:-1]), "last": labels[-1]} if len(labels) > 1 else "".join(labels)
+        if self.each_association_under:
+            source = _("the %(roles)s of each association directly under %(unit)s")
+        else:
+            source = _("the %(roles)s of %(unit)s")
+        return _("%(role)s of %(unit)s, for %(source)s") % {
+            "role": self.get_role_display(), "unit": self.unit, "source": source % {"roles": roles, "unit": self.held_in},
+        }
+
+    def identity(self):
+        return ("unit_id", "held_in_id", "made_by_id")
+
+    def save(self, *args, **kwargs):
+        if isinstance(self.from_roles, list):  # in the kit's order, each once, so a rule reads the same however it was given
+            known = [role for role in Position.Role.values if role in self.from_roles]
+            self.from_roles = known + [role for role in self.from_roles if role not in known]
+        super().save(*args, **kwargs)
+
+    def after_save(self):
+        from .seats import after_rule_saved
+
+        after_rule_saved(self)
+
+    # ---- Whose seats
+
+    def reaches(self, unit):
+        """Whether the roles it comes from are held in this unit, by today's tree."""
+        if self.each_association_under:
+            return unit.kind == Unit.Kind.ASSOCIATION and unit.parent_id == self.held_in_id
+        return unit.pk == self.held_in_id
+
+    def takes(self, position):
+        """Whether this rule seats whoever holds that position. Seats come only from
+        appointed positions, so there are no chains of seats, and no loops."""
+        return not position.is_seat() and position.role in self.from_roles and self.reaches(position.unit)
+
+    def shares_places(self, other):
+        """Whether both take roles held in some same unit, by today's tree."""
+        if self.each_association_under == other.each_association_under:
+            return self.held_in_id == other.held_in_id
+        each, named = (self, other) if self.each_association_under else (other, self)
+        return each.reaches(named.held_in)
+
+    def sources(self):
+        """The appointed positions, current or not, whose holders it seats by today's tree."""
+        if self.each_association_under:
+            where = models.Q(unit__parent=self.held_in_id, unit__kind=Unit.Kind.ASSOCIATION)
+        else:
+            where = models.Q(unit=self.held_in_id)
+        return Position.objects.filter(where, role__in=self.from_roles, seat_rule__isnull=True)
+
+    # ---- Rules
+
+    def membership_problem(self):
+        """A seat that needs a membership (structure.md §3) comes only from board roles held
+        in an association at or inside the one the seat needs. Then every holder, now and
+        later, already is a member, and a rule here never stops an appointment there."""
+        if self.role not in Position.NEEDS_MEMBERSHIP:
+            return None
+        needed = self.unit if self.role in Position.BOARD_ROLES else self.unit.association()
+        if all(role in Position.BOARD_ROLES for role in self.from_roles) and self.held_in.path.startswith(needed.path):
+            return None
+        return _("A %(role)s of %(unit)s has to be a member of %(needed)s, so the seat can only come from board roles held in %(needed)s or an association inside it.") % {
+            "role": self.get_role_display(), "unit": self.unit, "needed": needed,
+        }
+
+    @staticmethod
+    def problems_after_moving():
+        """After a move: any rule that's not ended whose seats would need a membership their
+        holders needn't have."""
+        rules = SeatRule.objects.filter(models.Q(end__isnull=True) | models.Q(end__gt=_today())).select_related("unit", "held_in")
+        return [problem for rule in rules if (problem := rule.membership_problem())]
+
+    def problems(self):
+        from .authority import can
+
+        problems = super().problems()
+        roles = self.from_roles
+        if not isinstance(roles, list) or not roles or not all(role in Position.Role.values for role in roles):
+            return [*problems, _("Choose the roles it comes from, from the kit's roles.")]
+        unit, held_in = self.unit, self.held_in
+        if problem := Position.role_problem(self.role, unit):  # never chair: see SEAT_ROLES
+            problems.append(problem)
+        if self.each_association_under:
+            if held_in.kind != Unit.Kind.ASSOCIATION or not all(role in Position.BOARD_ROLES for role in roles):
+                problems.append(_("Only an association has associations directly under it, and they hold board roles alone."))
+        else:
+            problems += list(dict.fromkeys(problem for role in roles if (problem := Position.role_problem(role, held_in))))
+        stored = SeatRule.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None:
+            for where in {unit, held_in}:
+                if where.archived:
+                    problems.append(_("%(unit)s is archived, so nothing new is set in it.") % {"unit": where})
+        if problems:
+            return problems
+
+        if problem := self.membership_problem():
+            problems.append(problem)
+        if self.role in roles and self.reaches(unit):
+            problems.append(_("A seat can't come from the same role in the same unit."))
+        if self.start:
+            alike = Tie.overlapping(SeatRule.objects.filter(unit=unit, role=self.role).exclude(pk=self.pk), self.start, self.end)
+            if any(set(other.from_roles) & set(roles) and self.shares_places(other) for other in alike.select_related("held_in")):
+                problems.append(_("Another seat rule already gives this seat for one of these roles, held in the same place, at that time."))
+        if not problems and self.start and (stored is None or stored.start != self.start):
+            if not can(self.made_by, Permission.APPOINT, unit, on=self.start):
+                problems.append(_("%(person)s couldn't appoint in %(unit)s on %(day)s, so they can't make its seat rules.") % {"person": self.made_by, "unit": unit, "day": self.start})
         return problems

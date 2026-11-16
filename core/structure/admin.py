@@ -2,10 +2,11 @@ from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils.text import capfirst
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
-from .models import EmailAddress, Grant, Membership, Person, Position, Reason, Unit, normalize_address, path_and_above
+from .models import EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, Unit, normalize_address, path_and_above
 
 
 class UnitForm(forms.ModelForm):
@@ -325,13 +326,47 @@ class MembershipAdmin(TieAdmin):
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
+class SeatFilter(admin.SimpleListFilter):
+    title = _("from a seat rule")
+    parameter_name = "seat"
+
+    def lookups(self, request, model_admin):
+        return [("yes", _("Yes")), ("no", _("No"))]
+
+    def queryset(self, request, queryset):
+        if self.value() in ("yes", "no"):
+            return queryset.filter(seat_rule__isnull=self.value() == "no")
+        return queryset
+
+
 @admin.register(Position)
 class PositionAdmin(TieAdmin):
+    """A seat is shown with its rule and the position it comes from, and never changed
+    here: core keeps it in step with them (seats.py)."""
+
     list_display = ("person", "role", "title", "unit", "start", "end", "current")
-    list_filter = (CurrentFilter, "role", "unit")
+    list_filter = (CurrentFilter, SeatFilter, "role", "unit")
     fields = ("person", "unit", "role", "title", "start", "end", "appointed_by", "minutes")
     fixed_on_change = ("person", "unit", "role")
     list_select_related = ("person", "unit")
+
+    def get_fields(self, request, obj=None):
+        return (*self.fields, "seat_rule", "seat_from") if obj is not None and obj.is_seat() else self.fields
+
+    def has_change_permission(self, request, obj=None):
+        if obj is not None and obj.is_seat():  # so its page is read-only
+            return False
+        return super().has_change_permission(request, obj)
+
+    @admin.action(description=_("End today"), permissions=["change"])
+    def end_today(self, request, queryset):
+        seats = queryset.current().filter(seat_rule__isnull=False).count()
+        if seats:
+            self.message_user(request, ngettext(
+                "%d seat left as it is: it ends with its rule, or the position it comes from.",
+                "%d seats left as they are: each ends with its rule, or the position it comes from.", seats,
+            ) % seats, messages.WARNING)
+        super().end_today(request, queryset.filter(seat_rule__isnull=True))
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         if db_field.name == "unit":
@@ -362,5 +397,41 @@ class GrantAdmin(TieAdmin):
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         if db_field.name in ("held_in", "unit"):
+            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+
+@admin.register(SeatRule)
+class SeatRuleAdmin(TieAdmin):
+    """Seats that come with another position (structure.md §4). Setting or ending a rule
+    sets or ends its seats at once. Ended, never deleted."""
+
+    list_display = ("__str__", "start", "end", "current")
+    list_filter = (CurrentFilter, "role")
+    fields = ("unit", "role", "from_roles", "held_in", "each_association_under", "start", "end", "made_by")
+    fixed_on_change = ("unit", "role", "roles_shown", "held_in", "each_association_under", "made_by")
+    list_select_related = ("unit", "held_in")
+    search_fields = ("unit__name", "held_in__name", "made_by__name")
+    autocomplete_fields = ("made_by",)
+
+    def get_fields(self, request, obj=None):
+        if obj is None:
+            return self.fields
+        return ["roles_shown" if name == "from_roles" else name for name in self.fields]  # fixed once made
+
+    @admin.display(description=_("for the roles"))
+    def roles_shown(self, obj):
+        return ", ".join(obj.role_labels())
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        if db_field.name == "from_roles":
+            return forms.MultipleChoiceField(
+                label=capfirst(db_field.verbose_name), help_text=db_field.help_text,
+                choices=Position.Role.choices, widget=forms.CheckboxSelectMultiple,
+            )
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name in ("unit", "held_in"):
             kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)

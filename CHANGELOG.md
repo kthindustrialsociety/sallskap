@@ -44,6 +44,10 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - One check decides what each role can do, and in which units, from current positions and grants. Nothing but grants uses it yet: the admin page's changes, the member pages and the CLI move to it later.
   - Operators give and end grants in the admin page, under Grants, and Board can see them. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
   - **Two-factor authentication is required for anyone with a board role in any association,** from the day the position is recorded, as well as for the Board, Treasurer and Operator groups as before. Someone given a board role is asked to set it up before the admin page or any tool lets them in.
+- feat: seat rules, for posts that come with another (structure.md §4).
+  - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. Operators set and end rules in the admin page, under Seat rules, and Board can see them. A rule is only accepted from someone who could appoint in that unit.
+  - Core gives each seat itself, as a position, from the day the position it comes from starts, and ends it when that position or the rule ends. A seat gives what its role gives, grants and two-factor authentication included, and stays in the record when it ends. It can't be set, changed or ended by hand.
+  - Nobody's access in the tools changes yet, as for every other position.
 
 ## 0.7.2 (2026-11-10)
 

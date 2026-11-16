@@ -1,6 +1,6 @@
 """The two made-up installations, for core's tests, the test server and later the
-public demo. They grow with each segment: units, people and grants now, then seat rules
-and words. Nothing calls this on a real installation. The test server loads
+public demo. They grow with each segment: units, people, grants and seat rules now,
+then words. Nothing calls this on a real installation. The test server loads
 one with tests/load_example.py.
 
 Reserved names only (RFC 2606), so nothing can be mistaken for a real association."""
@@ -13,7 +13,7 @@ from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
-from .models import EmailAddress, Grant, Membership, Permission, Person, Position, Reason, Unit, _erase
+from .models import EmailAddress, Grant, Membership, Permission, Person, Position, Reason, SeatRule, Unit, _erase
 
 TEAM, ASSOCIATION = Unit.Kind.TEAM, Unit.Kind.ASSOCIATION
 
@@ -81,12 +81,27 @@ class Given:
 
 
 @dataclass(frozen=True)
+class Seats:
+    """A seat rule: a role in a unit for whoever holds one of some roles held in a unit,
+    or in each association directly under it. Core gives the seats."""
+
+    unit: str  # a key, or ROOT
+    role: str
+    from_roles: tuple[str, ...]
+    held_in: str  # a key, or ROOT
+    start: date
+    by: str  # the maker's address
+    each_association_under: bool = False
+
+
+@dataclass(frozen=True)
 class Example:
     root_key: str  # used when the tests make the root. On a server, it comes from the config
     root_name: str
     units: tuple[Spec, ...]
     people: tuple[Who, ...] = ()
     grants: tuple[Given, ...] = ()  # none in Example Society: they're optional
+    seat_rules: tuple[Seats, ...] = ()  # none in Example Society either
 
 
 R = Position.Role
@@ -166,7 +181,9 @@ FEDERATION = Example(
         Who("Selma Example", "selma@example.org", memberships=(member(ROOT, date(2024, 9, 1)),), positions=(holds(ROOT, R.TREASURER, date(2026, 7, 1)),)),
         Who("Rikard Example", "rikard@example.org", memberships=(member("chemistry", date(2023, 9, 1)),), positions=(holds(ROOT, R.SECRETARY, date(2026, 7, 1)),)),
         Who("Ylva Example", "ylva@example.org", memberships=(member("chemistry", date(2023, 9, 1)),), positions=(holds(ROOT, R.BOARD_MEMBER, date(2026, 7, 1)),)),
-        # Robotics, and one person with positions in both associations.
+        # Robotics, and one person with positions in both associations. Astrid was chair
+        # before Quinn, and her seat on the root's board ended with it (below).
+        Who("Astrid Example", "astrid@example.org", memberships=(member("robotics", date(2020, 9, 1)),), positions=(holds("robotics", R.CHAIR, date(2024, 5, 1), date(2026, 5, 1)),)),
         Who("Quinn Example", "quinn@example.org", memberships=(member("robotics", date(2023, 9, 1)),), positions=(holds("robotics", R.CHAIR, date(2026, 5, 1)),)),
         Who("Pia Example", "pia@example.org", memberships=(member("robotics", date(2023, 9, 1)),), positions=(holds("robotics", R.VICE_CHAIR, date(2026, 5, 1)),)),
         Who("Wilma Example", "wilma@example.org", memberships=(member("robotics", date(2022, 9, 1)), member("chemistry", date(2024, 1, 15))), positions=(
@@ -200,6 +217,14 @@ FEDERATION = Example(
         Given(Permission.SEE_MEMBERS, R.BOARD_MEMBER, ROOT, ROOT, date(2026, 7, 1), "una@example.org", include_below=True),
         Given(Permission.SEND_MAILINGS, R.LEAD, "operations", "robotics", date(2026, 5, 15), "quinn@example.org"),
     ),
+    (
+        # structure.md §4's three, the extended board as two rules. The grant to the
+        # root's board members above reaches Quinn and Kim, seated on it.
+        Seats(ROOT, R.BOARD_MEMBER, (R.CHAIR,), ROOT, date(2025, 9, 1), "viktor@example.org", each_association_under=True),
+        Seats("extended-board", R.PARTICIPANT, Position.BOARD_ROLES, ROOT, date(2026, 7, 1), "una@example.org"),
+        Seats("extended-board", R.PARTICIPANT, (R.CHAIR, R.VICE_CHAIR), ROOT, date(2026, 7, 1), "una@example.org", each_association_under=True),
+        Seats("development", R.LEAD, (R.VICE_CHAIR,), "robotics", date(2026, 5, 1), "quinn@example.org"),
+    ),
 )
 
 EXAMPLES = {"society": SOCIETY, "federation": FEDERATION}
@@ -222,6 +247,11 @@ def _remove(root, below):
     addresses = example_addresses()
     people = Person.objects.filter(emails__address__in=addresses)
     _erase(Grant.objects.filter(models.Q(unit__in=below) | models.Q(held_in__in=below) | models.Q(given_by__in=people)))
+    # Seats first, as each points at its rule and at the position it comes from.
+    rules = models.Q(unit__in=below) | models.Q(held_in__in=below) | models.Q(made_by__in=people)
+    positions = models.Q(unit__in=below) | models.Q(person__in=people)
+    _erase(Position.objects.filter(models.Q(seat_rule__in=SeatRule.objects.filter(rules)) | models.Q(seat_from__in=Position.objects.filter(positions)) | positions & models.Q(seat_rule__isnull=False)))
+    _erase(SeatRule.objects.filter(rules))
     for model, unit in ((Membership, "association"), (Position, "unit"), (Reason, "unit")):
         _erase(model.objects.filter(models.Q(**{f"{unit}__in": below}) | models.Q(person__in=people)))
     get_user_model().objects.filter(email__in=addresses).delete()
@@ -287,6 +317,11 @@ def build(name, root, replace=False):
         Grant.objects.create(
             permission=given.permission, role=given.role, held_in=_where(units, root, given.held_in), unit=_where(units, root, given.unit),
             include_below=given.include_below, start=given.start, given_by=Person.objects.get(emails__address=given.by),
+        )
+    for seats in example.seat_rules:
+        SeatRule.objects.create(
+            unit=_where(units, root, seats.unit), role=seats.role, from_roles=list(seats.from_roles), held_in=_where(units, root, seats.held_in),
+            each_association_under=seats.each_association_under, start=seats.start, made_by=Person.objects.get(emails__address=seats.by),
         )
     for spec in _all(example.units):  # last, as nothing new goes into an archived team
         if spec.archived:
