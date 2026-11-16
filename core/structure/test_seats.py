@@ -3,7 +3,9 @@ seats a set of rules gives over the tree in structure.md §1, and one of what ea
 does to them; then the rules about rules, what a seat gives, the made-up installations
 and the admin page."""
 
+from contextlib import contextmanager
 from datetime import timedelta
+from unittest import mock
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -32,6 +34,13 @@ def rule(where, role, from_roles, held_in, by, each_association_under=False, sta
 
 def seats(**filters):
     return Position.objects.filter(seat_rule__isnull=False, **filters)
+
+
+@contextmanager
+def days_later(days):
+    """As if it were that many days after today, for core."""
+    with mock.patch("django.utils.timezone.localdate", return_value=TODAY + timedelta(days=days)):
+        yield
 
 
 # ---- The tables -----------------------------------------------------------------------
@@ -64,9 +73,10 @@ lead@hack           .        .          .          .         x
 """
 
 # What each event does to the seats above. A seat not named keeps its line in the table.
-# Days count from today; long is long ago, - is open, and none is no seat at all.
-# hack-help is a rule an event makes: a participant seat in the hackathon for Robotics'
-# treasurer.
+# Days count from today; long is long ago, - is open, and none is no seat at all. Two
+# lines for one seat are two seats, one after the other, by the same rule from the same
+# position. hack-help is a rule an event makes: a participant seat in the hackathon for
+# Robotics' treasurer.
 
 EVENTS = """
 event                                   holder            rule         start   end
@@ -95,10 +105,20 @@ chemistry-moves-into-robotics           chair@chem        board        long    0
 chemistry-moves-into-robotics           chair@chem        ext-chairs   long    0
 chemistry-moves-out-and-back            chair@chem        board        long    -
 chemistry-moves-out-and-back            chair@chem        ext-chairs   long    -
+chemistry-is-away-for-a-month           chair@chem        board        long    0
+chemistry-is-away-for-a-month           chair@chem        board        30      -
+chemistry-is-away-for-a-month           chair@chem        ext-chairs   long    0
+chemistry-is-away-for-a-month           chair@chem        ext-chairs   30      -
+a-chairs-end-is-put-back-after-a-move   chair@chem        board        long    -10
+a-chairs-end-is-put-back-after-a-move   chair@chem        ext-chairs   long    -10
+a-past-chair-comes-in-with-physics      past@phys         board        none    -
+a-past-chair-comes-in-with-physics      past@phys         ext-chairs   none    -
 an-association-is-added                 chair@phys        board        0       -
 an-association-is-added                 chair@phys        ext-chairs   0       -
 the-hackathon-is-archived               lead@hack         ext-hack     long    0
 the-hackathon-comes-back                lead@hack         ext-hack     long    -
+the-hackathon-comes-back-a-month-later  lead@hack         ext-hack     long    0
+the-hackathon-comes-back-a-month-later  lead@hack         ext-hack     30      -
 a-team-with-seats-is-archived           lead@hack         ext-hack     long    0
 a-team-with-seats-is-archived           treasurer@rob     hack-help    long    -
 a-team-with-seats-is-archived           next@rob          hack-help    none    -
@@ -112,10 +132,13 @@ def day(cell):
 
 
 def parse_events():
+    """{event: {(holder, rule): [(start, end), ...]}}, with an empty list for no seat."""
     events = {}
     for line in EVENTS.strip().splitlines()[1:]:
         event, holder, name, start, end = line.split()
-        events.setdefault(event, {})[holder, name] = None if start == "none" else (day(start), day(end))
+        rows = events.setdefault(event, {}).setdefault((holder, name), [])
+        if start != "none":
+            rows.append((day(start), day(end)))
     return events
 
 
@@ -130,16 +153,14 @@ class Seated(Federation):
         }
 
     def held(self):
-        """{(holder, rule): (start, end)} for every seat there is, by the names above."""
+        """{(holder, rule): [(start, end), ...]} for every seat there is, by the names above."""
         names = {p.pk: name for name, p in self.people.items()}
         rules = {r.pk: name for name, r in self.rules.items()}
         found = {}
-        for seat in seats().select_related("seat_from"):
-            key = names[seat.person_id], rules[seat.seat_rule_id]
-            self.assertNotIn(key, found, "one seat for each rule and position it comes from")
+        for seat in seats().select_related("seat_from").order_by("pk"):
             self.assertEqual(seat.seat_from.person_id, seat.person_id)
             self.assertIn(seat.seat_from.role, seat.seat_rule.from_roles)
-            found[key] = (seat.start, seat.end)
+            found.setdefault((names[seat.person_id], rules[seat.seat_rule_id]), []).append((seat.start, seat.end))
         return found
 
     def expected(self):
@@ -147,7 +168,7 @@ class Seated(Federation):
         for line in SEATS.strip().splitlines()[1:]:
             holder, *marks = line.split()
             assert len(marks) == len(RULES), line
-            expected.update({(holder, name): (LONG_AGO, None) for name, mark in zip(RULES, marks) if mark == "x"})
+            expected.update({(holder, name): [(LONG_AGO, None)] for name, mark in zip(RULES, marks) if mark == "x"})
         return expected
 
 
@@ -166,10 +187,10 @@ class Events(Seated):
     def check(self, event):
         getattr(self, event.replace("-", "_"))()
         expected = self.expected()
-        for key, seat in parse_events()[event].items():
+        for key, rows in parse_events()[event].items():
             expected.pop(key, None)
-            if seat is not None:
-                expected[key] = seat
+            if rows:
+                expected[key] = rows
         self.assertEqual(self.held(), expected)
 
     # The steps of each event.
@@ -239,6 +260,28 @@ class Events(Seated):
         chem.parent = self.u["root"]
         chem.save()
 
+    def chemistry_is_away_for_a_month(self):
+        self.chemistry_moves_into_robotics()
+        with days_later(30):
+            chem = Unit.objects.get(pk=self.u["chem"].pk)
+            chem.parent = self.u["root"]
+            chem.save()
+
+    def a_chairs_end_is_put_back_after_a_move(self):
+        self.chemistry_moves_into_robotics()
+        self.position("chair@chem").end_on(TODAY - timedelta(days=10))
+
+    def a_past_chair_comes_in_with_physics(self):
+        # Physics' chair stepped down while Physics sat inside Robotics, before it moved.
+        physics = unit(ASSOCIATION, "physics", self.u["rob"])
+        self.appoint("past@phys", physics, Role.CHAIR, start=LONG_AGO).end_on(TODAY - timedelta(days=10))
+        physics.parent = self.u["root"]
+        physics.save()
+        position = self.position("past@phys")
+        position.title = "Founding chair"  # nothing about the dates
+        position.save()
+        unit(TEAM, "spare", self.u["root"]).archive()  # nor about Physics
+
     def an_association_is_added(self):
         physics = unit(ASSOCIATION, "physics", self.u["root"])
         self.appoint("chair@phys", physics, Role.CHAIR)
@@ -249,6 +292,11 @@ class Events(Seated):
     def the_hackathon_comes_back(self):
         self.u["hack"].archive()
         Unit.objects.get(pk=self.u["hack"].pk).unarchive()
+
+    def the_hackathon_comes_back_a_month_later(self):
+        self.u["hack"].archive()
+        with days_later(30):
+            Unit.objects.get(pk=self.u["hack"].pk).unarchive()
 
     def a_team_with_seats_is_archived(self):
         self.hack_help()
@@ -462,8 +510,12 @@ class Rules(Federation):
             self.board_rule()
         with self.assertRaises(ValidationError):  # overlapping roles
             rule(self.u["root"], Role.BOARD_MEMBER, [Role.CHAIR, Role.VICE_CHAIR], self.u["root"], self.chair, each_association_under=True)
+        with self.assertRaises(ValidationError):  # Chemistry is one of the associations under the root
+            rule(self.u["root"], Role.BOARD_MEMBER, [Role.CHAIR], self.u["chem"], self.chair)
+        rule(self.u["root"], Role.BOARD_MEMBER, [Role.VICE_CHAIR], self.u["chem"], self.chair)  # another role
         r.end_on(TODAY)
         self.board_rule(start=TODAY)
+        self.assertEqual(seats(person=self.people["chair@chem"]).count(), 2)  # one ended, one from today
 
     def test_a_role_never_comes_from_itself(self):
         for where, role in (("root", Role.BOARD_MEMBER), ("dev", Role.LEAD), ("ext", Role.PARTICIPANT)):
@@ -698,11 +750,13 @@ class AdminPage(Federation):
         self.assertEqual(page.status_code, 200)
         self.assertContains(page, str(r))
         self.assertEqual(self.client.post(url, {"title": "Ex officio"}).status_code, 403)
+        appointed = Position.objects.get(person=self.people["chair@chem"], seat_rule=None)
         response = self.client.post(
-            reverse("admin:structure_position_changelist"), {"action": "end_today", "_selected_action": [seat.pk]}, follow=True,
+            reverse("admin:structure_position_changelist"), {"action": "end_today", "_selected_action": [seat.pk, appointed.pk]}, follow=True,
         )
-        self.assertIsNone(Position.objects.get(pk=seat.pk).end)
-        self.assertTrue(any(m.level_tag == "error" for m in response.context["messages"]))
+        self.assertEqual(Position.objects.get(pk=appointed.pk).end, TODAY)  # ending it ends the seat too
+        self.assertEqual(Position.objects.get(pk=seat.pk).end, TODAY)
+        self.assertEqual([m.level_tag for m in response.context["messages"]], ["warning", "success"])
 
     def test_a_position_is_never_made_a_seat_in_the_form(self):
         self.enter("operator")

@@ -238,7 +238,7 @@ class Unit(models.Model):
                     raise ValidationError(problems)
                 from .seats import after_tree_changed
 
-                after_tree_changed(since=_today())  # seats from associations moved in or out
+                after_tree_changed(SeatRule.objects.filter(each_association_under=True))  # associations moved in or out of reach
 
     # ---- Archiving and deleting --------------------------------------------------
 
@@ -252,7 +252,7 @@ class Unit(models.Model):
         with transaction.atomic():
             Unit.objects.filter(path__startswith=self.path, archived_at__isnull=True).update(archived_at=now)
             self.archived_at = self.archived_at or now
-            after_tree_changed()  # a position in an archived team gives no seat
+            after_tree_changed(SeatRule.objects.filter(held_in__path__startswith=self.path))  # a position in an archived team gives no seat
 
     def unarchive(self):
         """Brings back this team alone. The ones under it stay archived until brought back too."""
@@ -263,7 +263,7 @@ class Unit(models.Model):
         with transaction.atomic():
             Unit.objects.filter(pk=self.pk).update(archived_at=None)
             self.archived_at = None
-            after_tree_changed(since=_today())  # a seat it would have given meanwhile starts now
+            after_tree_changed(SeatRule.objects.filter(models.Q(held_in=self) | models.Q(unit=self)))
 
     def deletion_problem(self):
         """Why this unit can't be deleted, or None. A unit is deleted only if nothing
@@ -741,6 +741,10 @@ class Position(Tie):
     # position someone appointed.
     seat_rule = models.ForeignKey("SeatRule", verbose_name=_("seat rule"), null=True, blank=True, editable=False, on_delete=models.PROTECT, related_name="seats")
     seat_from = models.ForeignKey("self", verbose_name=_("comes from"), null=True, blank=True, editable=False, on_delete=models.PROTECT, related_name="seats_given")
+    # The day a move or bringing a team back put the position it comes from in the rule's
+    # reach, and the day a move or archiving put it out, if either did: see seats.py.
+    seat_since = models.DateField(_("in reach from"), null=True, blank=True, editable=False)
+    seat_until = models.DateField(_("out of reach from"), null=True, blank=True, editable=False)
 
     unit_field = "unit"
     fixed_fields = ("role", "seat_rule_id", "seat_from_id")
@@ -756,7 +760,7 @@ class Position(Tie):
                 condition=models.Q(seat_rule__isnull=True, seat_from__isnull=True) | models.Q(seat_rule__isnull=False, seat_from__isnull=False),
                 name="seat_has_rule_and_source",
             ),
-            models.UniqueConstraint(fields=["seat_rule", "seat_from"], name="one_seat_per_rule_and_source"),
+            models.UniqueConstraint(fields=["seat_rule", "seat_from"], condition=models.Q(seat_until__isnull=True), name="one_open_seat_per_rule_and_source"),
         ]
 
     def __str__(self):
@@ -792,6 +796,7 @@ class Position(Tie):
         if problem := self.role_problem(self.role, unit):
             problems.append(problem)
         stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
+        self._dates_changed = stored is None or (stored.start, stored.end) != (self.start, self.end)  # for after_save
         if stored is None and unit.archived:
             problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
         if not problems and self.start and (stored is None or stored.start != self.start):
@@ -810,7 +815,7 @@ class Position(Tie):
         return self.seat_rule_id is not None
 
     def before_save(self):
-        if not _seating.get() and (self.is_seat() or self.pk and Position.objects.filter(pk=self.pk, seat_rule__isnull=False).exists()):
+        if self.is_seat() and not _seating.get():  # and problems() keeps a seat a seat
             raise ValidationError(_("%(seat)s is a seat, from a seat rule, so core alone sets, changes and ends it. Change the rule, or the position it comes from.") % {"seat": self})
         # Appointing the next chair ends the last one's position on the day the new one starts.
         if self.role == self.Role.CHAIR and self.pk is None:
@@ -821,7 +826,7 @@ class Position(Tie):
         if not self.is_seat():
             from .seats import after_position_saved
 
-            after_position_saved(self)
+            after_position_saved(self, dates_changed=getattr(self, "_dates_changed", True))
 
 
 class Reason(Tie):
@@ -989,8 +994,11 @@ class SeatRule(Tie):
             models.CheckConstraint(condition=~models.Q(role="chair"), name="seat_is_never_a_chair"),
         ]
 
+    def role_labels(self):
+        return [str(Position.Role(role).label) for role in self.from_roles if role in Position.Role.values]
+
     def __str__(self):
-        labels = [str(Position.Role(role).label) for role in self.from_roles if role in Position.Role.values]
+        labels = self.role_labels()
         roles = _("%(some)s or %(last)s") % {"some": ", ".join(labels[:-1]), "last": labels[-1]} if len(labels) > 1 else "".join(labels)
         if self.each_association_under:
             source = _("the %(roles)s of each association directly under %(unit)s")
@@ -1016,14 +1024,23 @@ class SeatRule(Tie):
 
     # ---- Whose seats
 
-    def takes(self, position):
-        """Whether this rule seats whoever holds that position, by today's tree. Seats come
-        only from appointed positions, so there are no chains of seats, and no loops."""
-        if position.is_seat() or position.role not in self.from_roles:
-            return False
+    def reaches(self, unit):
+        """Whether the roles it comes from are held in this unit, by today's tree."""
         if self.each_association_under:
-            return position.unit.kind == Unit.Kind.ASSOCIATION and position.unit.parent_id == self.held_in_id
-        return position.unit_id == self.held_in_id
+            return unit.kind == Unit.Kind.ASSOCIATION and unit.parent_id == self.held_in_id
+        return unit.pk == self.held_in_id
+
+    def takes(self, position):
+        """Whether this rule seats whoever holds that position. Seats come only from
+        appointed positions, so there are no chains of seats, and no loops."""
+        return not position.is_seat() and position.role in self.from_roles and self.reaches(position.unit)
+
+    def shares_places(self, other):
+        """Whether both take roles held in some same unit, by today's tree."""
+        if self.each_association_under == other.each_association_under:
+            return self.held_in_id == other.held_in_id
+        each, named = (self, other) if self.each_association_under else (other, self)
+        return each.reaches(named.held_in)
 
     def sources(self):
         """The appointed positions, current or not, whose holders it seats by today's tree."""
@@ -1063,9 +1080,7 @@ class SeatRule(Tie):
         if not isinstance(roles, list) or not roles or not all(role in Position.Role.values for role in roles):
             return [*problems, _("Choose the roles it comes from, from the kit's roles.")]
         unit, held_in = self.unit, self.held_in
-        if self.role == Position.Role.CHAIR:
-            problems.append(_("A seat is never a chair: a unit has one at a time, and a rule can seat several people."))
-        elif problem := Position.role_problem(self.role, unit):
+        if problem := Position.role_problem(self.role, unit):  # never chair: see SEAT_ROLES
             problems.append(problem)
         if self.each_association_under:
             if held_in.kind != Unit.Kind.ASSOCIATION or not all(role in Position.BOARD_ROLES for role in roles):
@@ -1082,13 +1097,12 @@ class SeatRule(Tie):
 
         if problem := self.membership_problem():
             problems.append(problem)
-        itself = unit == held_in if not self.each_association_under else unit.kind == Unit.Kind.ASSOCIATION and unit.parent_id == held_in.pk
-        if itself and self.role in roles:
+        if self.role in roles and self.reaches(unit):
             problems.append(_("A seat can't come from the same role in the same unit."))
         if self.start:
-            alike = SeatRule.objects.filter(unit=unit, role=self.role, held_in=held_in, each_association_under=self.each_association_under).exclude(pk=self.pk)
-            if any(set(other.from_roles) & set(roles) for other in Tie.overlapping(alike, self.start, self.end)):
-                problems.append(_("Another seat rule already gives this seat for one of these roles at that time."))
+            alike = Tie.overlapping(SeatRule.objects.filter(unit=unit, role=self.role).exclude(pk=self.pk), self.start, self.end)
+            if any(set(other.from_roles) & set(roles) and self.shares_places(other) for other in alike.select_related("held_in")):
+                problems.append(_("Another seat rule already gives this seat for one of these roles, held in the same place, at that time."))
         if not problems and self.start and (stored is None or stored.start != self.start):
             if not can(self.made_by, Permission.APPOINT, unit, on=self.start):
                 problems.append(_("%(person)s couldn't appoint in %(unit)s on %(day)s, so they can't make its seat rules.") % {"person": self.made_by, "unit": unit, "day": self.start})

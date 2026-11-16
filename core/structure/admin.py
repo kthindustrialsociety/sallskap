@@ -353,15 +353,20 @@ class PositionAdmin(TieAdmin):
     def get_fields(self, request, obj=None):
         return (*self.fields, "seat_rule", "seat_from") if obj is not None and obj.is_seat() else self.fields
 
-    def get_readonly_fields(self, request, obj=None):
-        if obj is not None and obj.is_seat():
-            return self.get_fields(request, obj)
-        return super().get_readonly_fields(request, obj)
-
     def has_change_permission(self, request, obj=None):
-        if obj is not None and obj.is_seat():
+        if obj is not None and obj.is_seat():  # so its page is read-only
             return False
         return super().has_change_permission(request, obj)
+
+    @admin.action(description=_("End today"), permissions=["change"])
+    def end_today(self, request, queryset):
+        seats = queryset.current().filter(seat_rule__isnull=False).count()
+        if seats:
+            self.message_user(request, ngettext(
+                "%d seat left as it is: it ends with its rule, or the position it comes from.",
+                "%d seats left as they are: each ends with its rule, or the position it comes from.", seats,
+            ) % seats, messages.WARNING)
+        super().end_today(request, queryset.filter(seat_rule__isnull=True))
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         if db_field.name == "unit":
@@ -416,7 +421,7 @@ class SeatRuleAdmin(TieAdmin):
 
     @admin.display(description=_("for the roles"))
     def roles_shown(self, obj):
-        return ", ".join(str(Position.Role(role).label) for role in obj.from_roles if role in Position.Role.values)
+        return ", ".join(obj.role_labels())
 
     def formfield_for_dbfield(self, db_field, request, **kwargs):
         if db_field.name == "from_roles":

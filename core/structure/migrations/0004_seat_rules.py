@@ -42,12 +42,22 @@ class Migration(migrations.Migration):
             name='seat_rule',
             field=models.ForeignKey(blank=True, editable=False, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='seats', to='structure.seatrule', verbose_name='seat rule'),
         ),
+        migrations.AddField(
+            model_name='position',
+            name='seat_since',
+            field=models.DateField(blank=True, editable=False, null=True, verbose_name='in reach from'),
+        ),
+        migrations.AddField(
+            model_name='position',
+            name='seat_until',
+            field=models.DateField(blank=True, editable=False, null=True, verbose_name='out of reach from'),
+        ),
         migrations.AddConstraint(
             model_name='position',
             constraint=models.CheckConstraint(condition=models.Q(models.Q(('seat_from__isnull', True), ('seat_rule__isnull', True)), models.Q(('seat_from__isnull', False), ('seat_rule__isnull', False)), _connector='OR'), name='seat_has_rule_and_source'),
         ),
         migrations.AddConstraint(
             model_name='position',
-            constraint=models.UniqueConstraint(fields=('seat_rule', 'seat_from'), name='one_seat_per_rule_and_source'),
+            constraint=models.UniqueConstraint(condition=models.Q(('seat_until__isnull', True)), fields=('seat_rule', 'seat_from'), name='one_open_seat_per_rule_and_source'),
         ),
     ]
