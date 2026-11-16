@@ -139,7 +139,7 @@ A rule names the role it gives here, the roles it comes from, and where those ar
 
 - **Rules are optional,** and each unit sets its own, or none. They're for posts that statutes tie together. Otherwise, positions are appointed one by one: Development's lead can just as well be appointed directly.
 - **Rules are set by whoever can appoint in the unit** that has the seats, on the day the rule starts. Nothing new is set in an archived unit.
-- **A rule is dated like a grant,** records who made it, and is never deleted, only ended, so the record of why someone held a seat is kept. The seat it gives and where it comes from are fixed once made: end it and make a new one. A rule that repeats a current one is refused, and so is one giving a role from the same role in the same unit.
+- **A rule is dated like a grant,** records who made it, and is never deleted, only ended, so the record of why someone held a seat is kept. The seat it gives and where it comes from are fixed once made: end it and make a new one. A rule that would give someone the same seat a current one gives them, for the same role held in the same place, is refused, and so is one giving a role from the same role in the same unit.
 - **Any role that fits the unit can be a seat, except `chair`,** as a unit has one chair at a time and a rule can seat several people. A seat sits beside the positions appointed there and ends none of them: a lead by seat and an appointed lead are co-leads.
 - **A seat that needs a membership comes only from a board role,** held in an association at or inside the one the seat needs: the seat's own association for a board role, or the association owning the team for a `lead` (§3). Every holder, now and later, is then already a member, so a rule in one unit never stops an appointment in another. A `participant` seat can come from any role. A move that would break this for a rule is refused.
 - **Seats come only from appointed positions, never from other seats,** so there are no chains and no loops. The extended board above has Robotics' chair once, by the second rule, though they also hold a seat on the root's board.
@@ -150,8 +150,8 @@ A rule names the role it gives here, the roles it comes from, and where those ar
 
 - **A new chair gets the board seat,** and its rooms and documents, the moment they're appointed, and the last chair's seat ends with their position. A position recorded with a future start gets its seat at once, with the same start, so a board seat needs 2FA from that day too.
 - **A rule made when holders already exist** seats them from its own start, never earlier. Ending a rule ends its seats on the same day.
-- **When an association moves in under a rule's named unit,** its holders' seats start that day, and when it moves out, they end. A new association's holders get theirs as they're appointed.
-- **A position in a team that's archived gives no seat** from the day it's archived, and gives it again if the team is brought back, as a project that's over gives nothing. Seats in an archived team stay there like any other position there, giving nothing, and no new ones are added.
+- **When an association moves in under a rule's named unit,** its holders' seats start that day, and when it moves out, they end. If it moves back later, new seats start that day, so the gap stays in the record. A new association's holders get theirs as they're appointed.
+- **A position in a team that's archived gives no seat** from the day it's archived, and a new one from the day the team is brought back, as a project that's over gives nothing. Seats in an archived team stay there like any other position there, giving nothing, and no new ones are added.
 - **A seat that would never start isn't made,** and one already recorded that no longer would ends on its start day, as positions are never deleted.
 
 ### The dictionary
