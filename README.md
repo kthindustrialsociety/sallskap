@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, groups, 2FA, an admin page, and the login service for other tools. The other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, the tree of associations and teams with people's ties to them, 2FA, an admin page, and the login service for other tools, which tells them each person's keys. The other modules aren't built yet.
 
 ## Install
 
@@ -85,12 +85,12 @@ Core is the login service for every other tool, using OpenID Connect. A module d
 
 ```sh
 kit tool add mytool https://tool.example.org/callback   # prints its settings, and the secret once
-kit tool add mytool https://tool.example.org/callback --group board --group operator   # only these groups can log in
+kit tool add mytool https://tool.example.org/callback --group board --group operator   # only people with these keys can log in
 kit tool list
 kit tool remove mytool                                  # ends its access
 ```
 
-A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`. `preferred_username` is the part of the email before the @, with the account's id added if an earlier account has the same one. That covers the usual clash, but it isn't guaranteed unique, and it can change. Built-in groups are sent by their fixed key (`board`, `treasurer`, `events`, `developer`, `operator`, `member`), so renaming one can't change what someone can do in a tool. Groups an Operator added are sent as `custom:<name>`. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
+A tool can ask for the scopes `openid`, `email`, `profile` and `groups`, and has to identify people by `sub`. `preferred_username` is the part of the email before the @, with the account's id added if an earlier account has the same one. That covers the usual clash, but it isn't guaranteed unique, and it can change. `groups` holds the person's keys ([docs/structure.md](docs/structure.md) §5): `<unit>:<role>` for each position they hold, such as `robotics:chair` or `website:lead`, and `<association>:member` for each association they're a member of, plus `member`, `board`, `treasurer` and `operator`, which are the same in every installation. Keys never change, so renaming a unit or a role can't change what someone can do in a tool. `--group` takes any of them. A tool only hears about changes when someone logs in to it, and a silent `prompt=none` check usually gets `consent_required`.
 
 ## Tests
 
