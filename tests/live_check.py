@@ -60,6 +60,8 @@ VAULT_IDENTIFIER = "00000000-01DC-01DC-01DC-000000000000"  # the one Vaultwarden
 VAULT_SESSION_SECONDS = 12 * 3600
 PASSWORD = "fake-user-long-password-42"
 FAKE_TEAM = "fake-team"  # a team the fake leads lead, under the association (structure.md §5)
+FAKE_ASSOCIATION = "fake-association"  # inside the installation's, so it gets its own organisation
+FAKE_PROJECT = "fake-project"  # a team that gets archived
 # What the fake people can be given: Operator, the one group, and ties to the association:
 # member, board (a board member) and treasurer, and lead of the fake team.
 LOCKED_TEXT = "Too many failed login attempts"
@@ -123,6 +125,9 @@ FAKE = {
     "fake-vsync-down": (["board"], True),
     "fake-vsync-off-down": (["board"], True),
     "fake-vsync-member": (["member"], False),
+    "fake-tree-chair": (["member"], True),
+    "fake-tree-next": (["member"], True),
+    "fake-tree-lead": (["member"], False),
 }
 # These can't be named fake-something, as what's being tested is the name itself.
 FAKE_OTHER = ["fake-git-clash@example.net", f"{FORGEJO_SERVICE_USER}@example.org", "admin@example.org"]
@@ -1404,8 +1409,10 @@ def cleanup_forgejo():
                 print(f"Fake repo {repo['name']}:", forgejo_api(host, token, "DELETE", f"/repos/{org}/{repo['name']}")[0])
         teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams?limit=50")[1] or []
         for team in teams:
-            if team["name"] in (FAKE_TEAM, f"{FAKE_TEAM}.lead"):
+            if team["name"].removesuffix(".lead") in (FAKE_TEAM, FAKE_PROJECT):
                 print(f"Fake team {team['name']}:", forgejo_api(host, token, "DELETE", f"/teams/{team['id']}")[0])
+        if forgejo_api(host, token, "GET", f"/orgs/{FAKE_ASSOCIATION}")[0] == 200:
+            print("Fake organisation:", forgejo_api(host, token, "DELETE", f"/orgs/{FAKE_ASSOCIATION}")[0])
     listed = in_forgejo("forgejo", "admin", "user", "list").stdout
     for name in re.findall(r"^\d+\s+(fake-\S+)", listed, re.M):
         # Deleting someone leaves their Forgejo 2FA behind, which Forgejo's own check then
@@ -2850,6 +2857,80 @@ def public_vault_status(host, token):
     return person.api("GET", "/api/sync")[0]
 
 
+TREE = f"""
+from django.contrib.auth import get_user_model
+from structure.models import Membership, Position, Unit
+
+User = get_user_model()
+
+
+def person(name):
+    return User.objects.get(email=name + "@example.org").person
+
+
+def association():
+    found = Unit.objects.filter(key={FAKE_ASSOCIATION!r}).first()
+    return found or Unit.objects.create(kind="association", key={FAKE_ASSOCIATION!r}, name="Fake association", parent=Unit.objects.root())
+
+
+def chair(name):
+    who = person(name)
+    if not Membership.objects.current().filter(person=who, association=association()).exists():
+        Membership.objects.create(person=who, association=association())
+    for last in Position.objects.current().filter(unit=association(), role="chair"):
+        last.end_on()  # the handover, today
+    Position.objects.create(person=who, unit=association(), role="chair")
+
+
+def lead_a_project(name):
+    project = Unit.objects.create(kind="team", key={FAKE_PROJECT!r}, name="Fake project", parent=Unit.objects.root())
+    Position.objects.create(person=person(name), unit=project, role="lead")
+
+
+def archive_the_project():
+    Unit.objects.get(key={FAKE_PROJECT!r}).archive()
+"""
+
+
+def owners_of(host, org):
+    token = sync_env()["FORGEJO_ADMIN_TOKEN"]
+    teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams")[1] or []
+    owners = next((team for team in teams if team["name"] == "Owners"), None)
+    return sorted(member["login"] for member in forgejo_api(host, token, "GET", f"/teams/{owners['id']}/members")[1]) if owners else []
+
+
+def check_git_tree(host, secrets_by_name):
+    """structure.md §5: an association inside the installation's gets its own organisation,
+    its chair owns it, and an archived project's people lose its repos."""
+    section("Forgejo: an association and its chair")
+    _, first = git_person(host, "fake-tree-chair", secrets_by_name)
+    _, second = git_person(host, "fake-tree-next", secrets_by_name)
+    in_core(TREE + "chair('fake-tree-chair')")
+    took = wait_for(lambda: "fake-tree-chair" in owners_of(host, FAKE_ASSOCIATION))
+    check("A chair of an association inside it owns its own organisation, with no new sign-in", took is not None, str(owners_of(host, FAKE_ASSOCIATION)))
+    print(f"  info  It took {took} seconds.")
+    made = forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{FAKE_ASSOCIATION}")[1] or {}
+    check("...which core made, and marked as its own", (made.get("description") or "").startswith("Kept in step with core."), str(made.get("description")))
+    check("...and they read its members' repos", "members" in [t["name"] for t in forgejo_api(host, first, "GET", "/user/teams")[1] if t["organization"]["username"] == FAKE_ASSOCIATION])
+    in_core(TREE + "chair('fake-tree-next')")
+    took = wait_for(lambda: owners_of(host, FAKE_ASSOCIATION) == sorted(["fake-tree-next", FORGEJO_SERVICE_USER]))
+    check("A new chair gets the organisation's admin, and the last one loses it", took is not None, str(owners_of(host, FAKE_ASSOCIATION)))
+    print(f"  info  It took {took} seconds.")
+
+    section("Forgejo: an archived project")
+    lead, token = git_person(host, "fake-tree-lead", secrets_by_name)
+    in_core(TREE + "lead_a_project('fake-tree-lead')")
+    wait_for_sync()
+    repo = "fake-project-repo"
+    check("A project's lead creates a repo", make_repo(host, token, repo))
+    check("...and gives it to the project", give_repo(host, token, FAKE_PROJECT, repo) == 204)
+    in_core(TREE + "archive_the_project()")
+    took = wait_for(lambda: forgejo_api(host, token, "GET", f"/repos/{org_of(host)}/{repo}")[0] == 404)
+    check("Archiving the project takes its repos away from its people within seconds", took is not None)
+    print(f"  info  It took {took} seconds.")
+    check("...and the project's team stays, with its repo", repo in [r["name"] for r in forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/teams/{team_id(host, FAKE_PROJECT)}/repos")[1]])
+
+
 def check_access_table(host, operator, secrets_by_name):
     """Both tools together, as some of this takes core itself down."""
     check_sync_exposure(host)
@@ -2859,6 +2940,8 @@ def check_access_table(host, operator, secrets_by_name):
     check_git_groups_now(host, operator, secrets_by_name)
     clear_limits()
     check_git_offboarding(host, operator, secrets_by_name)
+    clear_limits()
+    check_git_tree(host, secrets_by_name)
     clear_limits()
     check_worker_down(host, operator, secrets_by_name)
     clear_limits()
@@ -3416,11 +3499,12 @@ from django.core.cache import cache
 from django.db.models import Q
 from accounts.models import FollowUp
 from structure.models import Membership, Person, Position, Unit, _erase
-fake = list(Person.objects.filter(Q(emails__address__startswith="fake-") | Q(user__email__in={FAKE_OTHER!r}) | Q(positions__unit__key={FAKE_TEAM!r})).distinct().values_list("pk", flat=True))
+units = Unit.objects.filter(key__in={[FAKE_TEAM, FAKE_PROJECT, FAKE_ASSOCIATION]!r})
+fake = list(Person.objects.filter(Q(emails__address__startswith="fake-") | Q(user__email__in={FAKE_OTHER!r}) | Q(positions__unit__in=units) | Q(memberships__association__in=units)).distinct().values_list("pk", flat=True))
 print(_erase(Position.objects.filter(person__in=fake, seat_rule__isnull=False)))  # seats first, as they point at their source
-print(_erase(Position.objects.filter(person__in=fake)))
-print(_erase(Membership.objects.filter(person__in=fake)))
-print(Unit.objects.filter(key={FAKE_TEAM!r}).delete())
+print(_erase(Position.objects.filter(Q(person__in=fake) | Q(unit__in=units))))
+print(_erase(Membership.objects.filter(Q(person__in=fake) | Q(association__in=units))))
+print(units.delete())
 print(FollowUp.objects.filter(about__startswith="fake-", about__endswith="@example.org").delete())
 print(FollowUp.objects.filter(about__startswith="A deleted account").delete())
 print(get_user_model().objects.filter(email__startswith="fake-", email__endswith="@example.org").delete())
