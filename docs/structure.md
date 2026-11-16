@@ -20,7 +20,7 @@ Example Federation              association, the root
 ```
 
 - **The root is the installation's association,** and the legal entity. Most installations have no other associations: a root with teams under it. It's created from `name` and `key` under `[association]` in the config, follows the config's name, and can't be moved, archived or deleted.
-- **A federation is an association with associations under it.** There's no separate kind. KTHIS, for example, is the root, with its societies under it.
+- **A federation is an association with associations under it.** There's no separate kind. Example Federation, above, is one: the root, with Example Robotics under it.
 - **Any depth is allowed.** Pages are designed for the usual two or three levels.
 - **Projects and services are both teams.** A project has an end date and a service doesn't. When a project is over, someone archives it by hand, as projects rarely end exactly on their date: everyone's access through it ends, and its history is kept. Archiving a team archives everything under it. Taking a team out of the archive brings back that team alone, and only if the unit above it isn't archived.
 - **Teams can contain teams,** to any depth. That's how an association splits into departments, such as Operations and Development, which have teams of their own, which have projects.
@@ -28,7 +28,7 @@ Example Federation              association, the root
   - A key is lowercase letters, digits and single hyphens, starts with a letter, ends with a letter or digit, and is at most 40 characters, so every tool can use it as a name.
   - It can't be changed once set, and it's never reused, even after its unit is archived. `custom` is reserved, as tools already see groups made by hand as `custom:<name>`.
 - **Nothing is created or moved under an archived unit,** an association sits only under an association, and a unit can't end up under itself.
-- **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3) or grants (§4), current or ended. Otherwise it's archived.
+- **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3), grants or seat rules (§4), current or ended. Otherwise it's archived.
 - **A team can involve other associations.** The unit it sits under owns it and appoints its lead. It also has a list of the other associations taking part.
 - **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's head (§4) can end the arrangement.
 
@@ -50,7 +50,7 @@ What connects a person to a unit. Every tie has a start and an end. **Ending a t
 | Tie | Fields | Meaning |
 |---|---|---|
 | `Membership` | person, association, kind (ordinary, honorary), start, end, member fields | A member of that association, **and of every association above it** |
-| `Position` | person, unit, role, title, start, end, appointed by, minutes, seat rule | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms. A position that comes from a seat rule (§4) records which one. "Appointed by" and "minutes" are free text, such as "Annual meeting 2026" and where its minutes are |
+| `Position` | person, unit, role, title, start, end, appointed by, minutes, seat rule, comes from | A board post or a role in a team (§4). Open until someone replaces the holder, as there are no fixed terms. A seat (§4) records the rule it comes from and the position that gives it. "Appointed by" and "minutes" are free text, such as "Annual meeting 2026" and where its minutes are |
 | `Registration` | person, event, ticket, status, checked in | Signed up for an event (§6) |
 | `Subscription` | person, unit, topic (events, news), include units below, confirmed, ended | Follows a unit's events or news (§6) |
 | `Reason` | person, kind, unit, source, legal basis, start, expires | Why data is held on someone with no other tie: applicant, alumnus, partner contact, contact-form sender. The legal basis is consent, contract, legitimate interest or legal obligation (GDPR art. 6). It always expires, and ending it sets that date to today |
@@ -117,13 +117,13 @@ Every action asks one question: **can this person do this, in this unit, today?*
 
 ### Grants
 
-A `chair` or `vice_chair` can **give a role a specific permission** anywhere they have authority themselves. For example, KTHIS's president could give:
-- KTHIS's treasurer fees and treasury in every society;
-- KTHIS's board members a view of every society's members, for the annual meeting;
+A `chair` or `vice_chair` can **give a role a specific permission** anywhere they have authority themselves. For example, the root's chair could give:
+- the root's treasurer fees and treasury in every association inside it;
+- the root's board members a view of every association's members, for the annual meeting;
 - Robotics' Operations lead the right to send Robotics' mailings.
 
 - **Only the six permissions marked above can be granted:** see members, manage memberships, manage events, send mailings, manage documents, and fees and treasury. Appointing people, managing units and giving grants can't be given away, so authority over people stays with chairs, vice chairs and heads.
-- **A grant goes to a role in a unit, not to a person,** such as "KTHIS's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too. A role with several holders gives it to each of them, and a role nobody holds gives it to nobody until someone does. The role can be held anywhere: only the unit the grant covers has to be within the giver's authority.
+- **A grant goes to a role in a unit, not to a person,** such as "the root's treasurer". It passes to whoever holds that role next, and holders by a seat rule get it too. A role with several holders gives it to each of them, and a role nobody holds gives it to nobody until someone does. The role can be held anywhere: only the unit the grant covers has to be within the giver's authority.
 - **It covers one unit,** or that unit and everything under it.
 - **It's dated like a tie,** records who gave it, and lasts until a chair or vice chair ends it. It doesn't end when the person who gave it leaves. Whoever could give it can end it.
 - **What it gives, to whom and where are fixed once given:** end it and give a new one. It's never deleted, so the record of who could do what is kept. The person who gave it must have been able to on the day it starts, and nothing new is given in an archived unit.
@@ -135,20 +135,31 @@ A unit can have **seat rules:** holding one position gives you a seat in another
 - **An extended board:** a team whose participants are the root's board, plus the chair and vice chair of each association directly under the root;
 - **A department led by the vice chair:** Robotics' vice chair is the `lead` of Development.
 
-A rule names the role it gives here, the role it comes from, and where that role is held: one named unit, or every association directly under a named one.
+A rule names the role it gives here, the roles it comes from, and where those are held: one named unit, or every association directly under a named one. So the extended board is two rules: one for the root's five board roles, and one for the chair and vice chair of each association directly under the root.
 
 - **Rules are optional,** and each unit sets its own, or none. They're for posts that statutes tie together. Otherwise, positions are appointed one by one: Development's lead can just as well be appointed directly.
-- **A seat gives exactly its role, scoped as above.** Robotics' chair, seated on KTHIS's board, can do what a KTHIS `board_member` can in KTHIS and its teams, and nothing in the other societies.
-- **A seat is a position like any other.** It gives the same access, needs 2FA if its role does, and stays in the record when it ends.
-- **It starts and ends with the position it comes from,** so a new chair gets the board seat, and its rooms and documents, the moment they're appointed. It can't be set or ended by hand: change the rule, or the position behind it.
-- **Rules are set by whoever can appoint in the unit** that has the seats.
+- **Rules are set by whoever can appoint in the unit** that has the seats, on the day the rule starts. Nothing new is set in an archived unit.
+- **A rule is dated like a grant,** records who made it, and is never deleted, only ended, so the record of why someone held a seat is kept. The seat it gives and where it comes from are fixed once made: end it and make a new one. A rule that repeats a current one is refused, and so is one giving a role from the same role in the same unit.
+- **Any role that fits the unit can be a seat, except `chair`,** as a unit has one chair at a time and a rule can seat several people. A seat sits beside the positions appointed there and ends none of them: a lead by seat and an appointed lead are co-leads.
+- **A seat that needs a membership comes only from a board role,** held in an association at or inside the one the seat needs: the seat's own association for a board role, or the association owning the team for a `lead` (§3). Every holder, now and later, is then already a member, so a rule in one unit never stops an appointment in another. A `participant` seat can come from any role. A move that would break this for a rule is refused.
+- **Seats come only from appointed positions, never from other seats,** so there are no chains and no loops. The extended board above has Robotics' chair once, by the second rule, though they also hold a seat on the root's board.
+- **A seat gives exactly its role, scoped as above.** Robotics' chair, seated on the root's board, can do what the root's `board_member` can in the root and its teams, and nothing in the other associations.
+- **A seat is a position like any other.** It gives the same access, gets the grants to its role, needs 2FA if its role does, and stays in the record when it ends. It records its rule and the position it comes from.
+
+**A seat runs from the later of the rule's start and the start of the position it comes from, to the earlier of their ends,** and follows when either one's dates change. It can't be set, changed or ended by hand: change the rule, or the position behind it.
+
+- **A new chair gets the board seat,** and its rooms and documents, the moment they're appointed, and the last chair's seat ends with their position. A position recorded with a future start gets its seat at once, with the same start, so a board seat needs 2FA from that day too.
+- **A rule made when holders already exist** seats them from its own start, never earlier. Ending a rule ends its seats on the same day.
+- **When an association moves in under a rule's named unit,** its holders' seats start that day, and when it moves out, they end. A new association's holders get theirs as they're appointed.
+- **A position in a team that's archived gives no seat** from the day it's archived, and gives it again if the team is brought back, as a project that's over gives nothing. Seats in an archived team stay there like any other position there, giving nothing, and no new ones are added.
+- **A seat that would never start isn't made,** and one already recorded that no longer would ends on its start day, as positions are never deleted.
 
 ### The dictionary
 
 Every installation has its own **dictionary:** the word shown for each role key, unit kind and tie, in Swedish and English, singular and plural.
 
 - **The kit ships plain words:** Chair, Vice chair, Treasurer, Secretary, Board member, Lead, Participant, Member, Association and Team. An installation can replace any of them: `sk words set treasurer "Head of Treasury" --sv "Kassör"`.
-- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while the associations inside it keep Chair: `sk words set chair "President" --unit kthis`.
+- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while the associations inside it keep Chair: `sk words set chair "President" --unit example-federation`.
 - **It changes words only.** What a role can do comes from its key, so renaming `lead` to "Officer" changes nobody's access.
 - **Custom titles** are still free text on a single position, such as "Head of PR", shown beside the word for its role.
 - **The kinds of unit have words too,** such as Society for an association, or Committee for a team.
