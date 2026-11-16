@@ -638,10 +638,8 @@ def _check_callback(address: str) -> str:
 FORGEJO_TOOL = "forgejo"  # its name in core's login service
 FORGEJO_SERVICE_USER = "sallskap-admin"  # owns the organisation. Nobody can log in as it
 FORGEJO_UNITS = ["repo.code", "repo.issues", "repo.pulls", "repo.releases", "repo.wiki", "repo.projects"]
-FORGEJO_TEAMS = (
-    {"name": "developers", "permission": "write", "can_create_org_repo": True},
-    {"name": "board", "permission": "read", "can_create_org_repo": False},
-)
+FORGEJO_TEAMS = ({"name": "board", "permission": "read", "can_create_org_repo": False},)  # Forgejo makes Owners
+FORGEJO_HEADS = ("chair", "vice_chair")  # the root's are owners of its organisation, as the connector says
 NO_LIMIT = 1_000_000  # repos the organisation may have: 0 would fall back on the limit for people
 
 
@@ -775,6 +773,9 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
         raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
     manifest = module_manifest("git")
     team_map = {group: {org: [team]} for group, team in manifest["teams"].items()}
+    # Forgejo takes someone off a mapped team at sign-in unless a key maps them to it, so
+    # the root's chair and vice chair are here beside operators. The connector does the rest.
+    team_map |= {f"{config.key}:{role}": {org: ["Owners"]} for role in FORGEJO_HEADS}
     settings = [
         "--name", org,
         "--provider", "openidConnect",

@@ -116,7 +116,7 @@ class Connector:
                 note(
                     organisation["id"],
                     f"Nobody can manage {name} now. {person.email} was its only owner, and has lost access to the vault. "
-                    f"Add them back to a group for long enough to make someone else an owner. "
+                    f"Give them back their position, or Operator, for long enough to make someone else an owner. "
                     f"Then remove them from {name}, and change every password they could see there.",
                 )
             else:
