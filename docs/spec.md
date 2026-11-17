@@ -22,7 +22,7 @@ KTHIS builds it and is its first installation. Any other association should be a
 ## 3. Goals and non-goals
 
 ### Goals
-1. **One account for everything.** A member logs in once; groups decide what they can reach.
+1. **One account for everything.** A member logs in once; their memberships and positions decide what they can reach.
 2. **Modular.** An association turns on only what it needs: website, dashboard features, password vault, Git, chat, files.
 3. **Lean.** One server, one Compose file, one config file, one backup method.
 4. **Easy to reproduce.** A fresh server plus one pasted snippet gives a working installation.
@@ -44,8 +44,7 @@ KTHIS builds it and is its first installation. Any other association should be a
 | Member | Member portal: profile, fees, event sign-ups, chat |
 | Board | Admin for members, events and governance; password vault |
 | Treasurer | Fees and treasury |
-| Events | Events and sign-ups |
-| Developer | Git, build runner |
+| Team lead and participants | Their team's work: its events and sign-ups, Git, build runner |
 | Operator (IT, 1–2 people) | Server, backups, updates, module config |
 
 Roles come from the structure in [structure.md](structure.md): an association, the associations and teams inside it, and each person's memberships and positions in them. A board role in an association inside another gives board access to that association and everything under it, not the whole installation. Operator is the one role given by hand. Someone signed up for an event or following an association needs no account. Every module maps access to roles (§8).
@@ -126,7 +125,7 @@ Each module is a folder under `modules/<name>/` containing:
 
 | File | Required | Content |
 |---|---|---|
-| `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access group, session length if it needs its own, setup questions |
+| `module.toml` | yes | Name, description, default subdomain, RAM estimate, dependencies, data paths, access keys, session length if it needs its own, setup questions |
 | `compose.yml` | yes | The module's containers, with memory limits |
 | `site.caddy` | if web-facing | Caddy routing lines, imported automatically, with `__HOST__` for its hostname |
 | `connector.py` | if it can | How core tells the tool about changes to someone's access straight away, without waiting for their next login: see §8 |
@@ -142,7 +141,7 @@ subdomain   = "git"
 ram_mb      = 1700            # Forgejo ~200 MB + runner capped at 1.5 GB
 requires    = []
 data        = ["/srv/git"]
-access      = ["developer"]   # group mapped via OIDC
+access      = ["board"]       # a key mapped via OIDC: see structure.md §5
 oidc        = true
 
 [[setup]]
@@ -244,10 +243,10 @@ An installation has one **primary domain** and any number of **site domains**.
 ## 8. Identity and access
 
 - **One account per person,** stored in Django. Every module has a "Log in with <association>" button (OpenID Connect). People who only sign up for events or subscribe have no account ([structure.md](structure.md) §2).
-- **Groups carry access:** the login response includes the user's groups, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. A tool that can't do this, such as Vaultwarden, can be limited to certain groups in core instead. Built-in groups are sent by a fixed key, so renaming one doesn't change anyone's access.
-- **Groups are worked out from the structure:** apart from Operator, nobody is put in a group by hand. Each person's current memberships and positions become keys such as `robotics:member` or `website:lead`, beside the built-in ones. See [structure.md](structure.md) §5.
+- **Keys carry access:** the login response includes the person's keys, in its `groups` claim, and each module maps them to its own permissions, e.g. Forgejo teams or admin rights. A tool that can't do this, such as Vaultwarden, can be limited to certain keys in core instead. Keys never change, so renaming a unit or a role doesn't change anyone's access.
+- **Keys are worked out from the structure:** each person's current memberships and positions become keys such as `robotics:member` or `website:lead`, plus `member`, `board` and `treasurer`, which are the same in every installation. Operator is the one group, given by hand, and its key is `operator`. See [structure.md](structure.md) §5.
 - **Membership drives accounts:** when a membership lapses or someone leaves the board, changing it in Django updates their access within seconds, in every tool whose module has a connector, and at their next login in the rest. Whether a tool's API can do this counts when choosing one.
-- **How core reaches tools:** a change to someone's access is saved along with a note that the tools need telling. A worker in its own container, with no ports, picks that up within seconds, retries if a tool is down, and the admin page says if it's stuck. It's the only process with the tools' admin tokens, so core's web process, which faces the internet, never has them. Each module's `connector.py` does the talking, using only the standard library. It also goes over everyone once a day and when it starts, which covers a tool restored from a backup.
+- **How core reaches tools:** a change to someone's access is saved along with a note that the tools need telling. A worker in its own container, with no ports, picks that up within seconds, retries if a tool is down, and the admin page says if it's stuck. It's the only process with the tools' admin tokens, so core's web process, which faces the internet, never has them. Each module's `connector.py` does the talking, using only the standard library. It also goes over everyone once a day and when it starts, which covers a tool restored from a backup, and just after midnight over everyone whose ties start or end that day.
 - **When someone leaves:** what can be done for them is done at once, and anything only a person can do becomes a follow-up on the admin page that stays open until someone marks it done, such as changing shared passwords.
 - **If core is down:** each module's README says how to get in. Nothing opens a way around 2FA at a public address: an emergency way in needs SSH on the server.
 - **Sessions:** short lifetimes for sensitive modules (vault: 8–24 h).
@@ -328,7 +327,7 @@ An association should never have to ask its provider how the server works. The k
 | `kit init <domain> --name <name> --key <key>` | Create the first config, with the association's name and fixed key (the setup wizard does this in a browser) |
 | `kit admin <email>` | Create the first admin, or restore someone's Operator access and clear any login lockouts. `--reset-2fa` also removes their 2FA |
 | `kit link <email>` | Create a one-time link that lets someone choose a password. It doesn't log them in, so it can't get around 2FA |
-| `kit tool add <name> <callback> [--group <group>] [--session-hours <1-24>]` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once, optionally limited to certain groups; list tools; remove a tool and end its access |
+| `kit tool add <name> <callback> [--group <key>] [--session-hours <1-24>]` / `kit tool list` / `kit tool remove <name>` | Register a tool with the login service and show its settings and secret once, optionally limited to certain keys; list tools; remove a tool and end its access |
 | `kit emergency vault [--off]` / `kit emergency git <username>` | Get into a tool while core is down: a private copy of the vault reached over SSH; a token on someone's own Forgejo account |
 | `kit enable <module>` | Ask the setup questions, show any DNS record needed, start the module |
 | `kit disable <module>` | Stop the module and keep its data |
