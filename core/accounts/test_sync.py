@@ -21,7 +21,7 @@ from django.utils import timezone
 from . import sync
 from .models import AccessSync, FollowUp, ToolAccess
 from .test_login_service import make_tool
-from .tests import PASSWORD, Base, make_user, totp_code
+from .tests import PASSWORD, Base, make_user, take_away, totp_code
 
 
 class FakeConnector:
@@ -45,10 +45,12 @@ def waiting(user):
 
 
 class Asking(Base):
-    """Every way someone's access can change has to mark them as waiting."""
+    """Every way someone's access can change has to mark them as waiting. Changes to ties
+    and the tree are in structure/test_access.py."""
 
     def setUp(self):
-        self.user, _ = make_user(groups=["developer"])
+        self.user, _ = make_user(groups=["member", "operator"])
+        self.operators = Group.objects.get(role__key="operator")
         AccessSync.objects.all().delete()
 
     def test_turning_off_an_account(self):
@@ -66,12 +68,17 @@ class Asking(Base):
         make_user("new@example.org")
         self.assertFalse(AccessSync.objects.exists())
 
-    def test_adding_them_to_a_group(self):
-        self.user.groups.add(Group.objects.get(role__key="board"))
+    def test_making_them_an_operator(self):
+        other, _ = make_user("other@example.org")
+        other.groups.add(self.operators)
+        self.assertTrue(waiting(other))
+
+    def test_taking_them_out_of_operator(self):
+        self.user.groups.remove(self.operators)
         self.assertTrue(waiting(self.user))
 
-    def test_removing_them_from_a_group(self):
-        self.user.groups.remove(Group.objects.get(role__key="developer"))
+    def test_ending_their_ties(self):
+        take_away(self.user)
         self.assertTrue(waiting(self.user))
 
     def test_clearing_their_groups(self):
@@ -83,7 +90,7 @@ class Asking(Base):
         self.assertTrue(waiting(self.user))
 
     def test_changing_a_groups_members_from_the_other_side(self):
-        group = Group.objects.get(role__key="developer")
+        group = self.operators
         group.user_set.remove(self.user)
         self.assertTrue(waiting(self.user))
         AccessSync.objects.all().delete()
@@ -91,7 +98,7 @@ class Asking(Base):
         self.assertTrue(waiting(self.user))
 
     def test_clearing_a_groups_members(self):
-        Group.objects.get(role__key="developer").user_set.clear()
+        self.operators.user_set.clear()
         self.assertTrue(waiting(self.user))
 
     def test_deleting_a_group(self):
@@ -99,15 +106,6 @@ class Asking(Base):
         self.user.groups.add(group)
         AccessSync.objects.all().delete()
         group.delete()
-        self.assertTrue(waiting(self.user))
-
-    def test_renaming_a_group(self):
-        """A tool's access list holds custom:<name>, so this can take someone's access away."""
-        group = Group.objects.create(name="Temporary")
-        self.user.groups.add(group)
-        AccessSync.objects.all().delete()
-        group.name = "Renamed"
-        group.save()
         self.assertTrue(waiting(self.user))
 
     def test_changing_who_may_use_a_tool_asks_for_everyone(self):
@@ -128,12 +126,30 @@ class Asking(Base):
         self.user.groups.clear()
         row = AccessSync.objects.get(user=self.user)
         AccessSync.objects.filter(pk=row.pk).update(pending=False, attempts=4, retry_at=timezone.now() + timedelta(hours=1))
-        self.user.groups.add(Group.objects.get(role__key="board"))
+        self.user.groups.add(self.operators)
         again = AccessSync.objects.get(user=self.user)
         self.assertGreater(again.requested_at, row.requested_at)
         self.assertTrue(again.pending)
         self.assertEqual(again.attempts, 0)
         self.assertIsNone(again.retry_at)
+
+    def test_asking_after_a_wait_holds_it_back_until_then(self):
+        sync.request_for(self.user, wait=timedelta(seconds=10))
+        row = AccessSync.objects.get(user=self.user)
+        self.assertTrue(row.pending)
+        self.assertAlmostEqual((row.retry_at - timezone.now()).total_seconds(), 10, delta=2)
+        self.assertEqual(sync.run_once([]), 0)
+
+    def test_a_wait_never_holds_back_or_resets_a_change_already_waiting(self):
+        """A sign-in asks with a wait. It mustn't undo a tool's backing off, or bring it forward."""
+        sync.request_for(self.user)
+        row = AccessSync.objects.get(user=self.user)
+        AccessSync.objects.filter(pk=row.pk).update(attempts=3, retry_at=timezone.now() + timedelta(minutes=2))
+        sync.request_for(self.user, wait=timedelta(seconds=10))
+        again = AccessSync.objects.get(pk=row.pk)
+        self.assertEqual(again.attempts, 3)
+        self.assertGreater(again.retry_at, timezone.now() + timedelta(minutes=1))
+        self.assertGreater(again.requested_at, row.requested_at)  # what's sent is worked out afresh
 
     def test_asking_for_everyone_includes_new_accounts_and_keeps_one_row_each(self):
         make_user("new@example.org")
@@ -159,7 +175,7 @@ class Asking(Base):
 class Working(Base):
     def setUp(self):
         self.tool = make_tool()
-        self.user, _ = make_user(groups=["developer"])
+        self.user, _ = make_user(groups=["member"])
         AccessSync.objects.all().delete()
         self.connector = FakeConnector()
 
@@ -173,7 +189,8 @@ class Working(Base):
         person = self.connector.seen[0]
         self.assertEqual((person.sub, person.email), (str(self.user.pk), self.user.email))
         self.assertTrue(person.allowed)
-        self.assertEqual(person.groups, ("developer",))
+        self.assertEqual(person.groups, ("example:member", "member"))
+        self.assertEqual([(unit.key, unit.team, unit.association, unit.root) for unit in person.units], [("example", False, "example", True)])
 
     def test_someone_turned_off_isnt_allowed(self):
         self.user.is_active = False
@@ -181,14 +198,14 @@ class Working(Base):
         sync.run_once([self.connector])
         self.assertFalse(self.connector.seen[0].allowed)
 
-    def test_someone_outside_a_tools_groups_isnt_allowed(self):
+    def test_someone_without_a_tools_keys_isnt_allowed(self):
         ToolAccess.objects.create(tool=self.tool, group_keys=["board"])
         sync.run_once([self.connector])
         self.assertFalse(self.connector.seen[0].allowed)
-        self.assertEqual(self.connector.seen[0].groups, ("developer",))
+        self.assertEqual(self.connector.seen[0].groups, ("example:member", "member"))
 
-    def test_someone_in_a_tools_groups_is(self):
-        ToolAccess.objects.create(tool=self.tool, group_keys=["developer"])
+    def test_someone_with_one_is(self):
+        ToolAccess.objects.create(tool=self.tool, group_keys=["member"])
         sync.run_once([self.connector])
         self.assertTrue(self.connector.seen[0].allowed)
 
@@ -250,11 +267,11 @@ class Working(Base):
         self.assertIn("deleted account", restored.seen[0].email)
         self.assertIn("deleted account", FollowUp.objects.get().about)
 
-    def test_a_group_that_requires_2fa_waits_for_it(self):
+    def test_a_key_that_requires_2fa_waits_for_it(self):
         """Core wouldn't let them through to a tool, so telling it directly would get around that."""
         self.user.groups.add(Group.objects.get(role__key="operator"))
         sync.run_once([self.connector])
-        self.assertEqual(self.connector.seen[-1].groups, ("developer",))
+        self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member"))
 
     def test_setting_up_2fa_lets_it_through(self):
         self.user.groups.add(Group.objects.get(role__key="operator"))
@@ -262,33 +279,54 @@ class Working(Base):
         TOTP.activate(self.user, generate_totp_secret())
         self.assertTrue(waiting(self.user))
         sync.run_once([self.connector])
-        self.assertEqual(self.connector.seen[-1].groups, ("developer", "operator"))
+        self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member", "operator"))
 
     def test_losing_2fa_takes_it_away_again(self):
         self.user.groups.add(Group.objects.get(role__key="operator"))
         TOTP.activate(self.user, generate_totp_secret())
         sync.run_once([self.connector])
-        self.assertEqual(self.connector.seen[-1].groups, ("developer", "operator"))
+        self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member", "operator"))
         Authenticator.objects.filter(user=self.user).delete()
         self.assertTrue(waiting(self.user))
         sync.run_once([self.connector])
-        self.assertEqual(self.connector.seen[-1].groups, ("developer",))
+        self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member"))
 
-    def test_groups_that_dont_require_2fa_dont_wait(self):
-        self.user.groups.add(Group.objects.get(role__key="member"))
+    def test_keys_that_dont_require_2fa_dont_wait(self):
+        from structure.models import Position, Unit
+
+        self.user.groups.add(Group.objects.get(role__key="operator"))
+        website = Unit.objects.create(kind=Unit.Kind.TEAM, key="website", name="Website", parent=Unit.objects.root())
+        Position.objects.create(person=self.user.person, unit=website, role="lead")
         sync.run_once([self.connector])
-        self.assertEqual(self.connector.seen[-1].groups, ("developer", "member"))
+        self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member", "website:lead"))
 
     def test_someone_just_removed_goes_ahead_of_a_look_at_everyone(self):
-        other, _ = make_user("other@example.org", ["developer"])
+        other, _ = make_user("other@example.org", ["member"])
         sync.request_for_everyone()
         sync.request_for(other)
         sync.run_once([self.connector])
         self.assertEqual(self.connector.seen[0].sub, sync.sub_of(other))
 
+    def test_a_change_during_a_look_at_everyone_goes_next(self):
+        """Not after the rest of the people already picked up."""
+        others = [make_user(f"other{n}@example.org", ["member"])[0] for n in range(3)]
+        sync.request_for_everyone()
+        late = make_user("late@example.org")[0]
+        order = []
+
+        class Watching(FakeConnector):
+            def apply(self, person, note):
+                order.append(person.sub)
+                if len(order) == 1:
+                    sync.request_for(late)
+
+        sync.run_once([Watching()])
+        self.assertEqual(order[1], sync.sub_of(late))
+        self.assertEqual(len(order), len(others) + 2)
+
     def test_a_tool_not_answering_only_costs_one_try_each_time(self):
         """A hung tool times out for every person otherwise, which holds up the worker."""
-        make_user("other@example.org", ["developer"])
+        make_user("other@example.org", ["member"])
         sync.request_for_everyone()
 
         class Hung(FakeConnector):
@@ -307,7 +345,7 @@ class Working(Base):
             self.assertIn("timed out", row.tools["tool"]["error"])
 
     def test_a_tool_refusing_one_person_doesnt_stop_it_being_asked_about_others(self):
-        other, _ = make_user("other@example.org", ["developer"])
+        other, _ = make_user("other@example.org", ["member"])
         sync.request_for_everyone()
 
         class Picky(FakeConnector):
@@ -321,7 +359,7 @@ class Working(Base):
         self.assertEqual(len(picky.seen), 2)
 
     def test_it_says_its_alive_after_each_person(self):
-        make_user("other@example.org", ["developer"])
+        make_user("other@example.org", ["member"])
         sync.request_for_everyone()
         ticks = []
         sync.run_once([self.connector], tick=lambda: ticks.append(1))
@@ -421,7 +459,7 @@ class Working(Base):
             def apply(self, person, note):
                 super().apply(person, note)
                 if len(self.seen) == 1:
-                    user.groups.clear()
+                    take_away(user)
 
         connector = Changing()
         sync.run_once([connector])
@@ -591,13 +629,13 @@ class FollowUps(Base):
     def list_url(self):
         return reverse("admin:accounts_followup_changelist")
 
-    def test_board_and_operators_see_them_and_nobody_else(self):
+    def test_operators_see_them_and_nobody_else(self):
         self.run_with_note()
-        for groups, status in ((["board"], 200), (["operator"], 200), (["treasurer"], 403), (["events"], 403)):
+        for groups, status in ((["operator"], 200), (["board"], 403), (["treasurer"], 403)):
             self.client.logout()
             user = self.enter_admin(groups, f"{groups[0]}@example.org")
             with self.subTest(groups):
-                self.assertEqual(self.client.get(self.list_url()).status_code, status)
+                self.assertEqual(self.client.get(self.list_url(), follow=True).status_code, status)
             user.delete()
 
     def test_a_member_cant_reach_them(self):
@@ -607,17 +645,17 @@ class FollowUps(Base):
 
     def test_marking_one_done_says_who_and_when(self):
         self.run_with_note()
-        board = self.enter_admin(["board"])
+        operator = self.enter_admin(["operator"])
         item = self.open_ones().get()
         response = self.client.post(self.list_url(), {"action": "mark_done", "_selected_action": [item.pk]})
         self.assertEqual(response.status_code, 302)
         item.refresh_from_db()
         self.assertIsNotNone(item.done_at)
-        self.assertEqual(item.done_by, board)
+        self.assertEqual(item.done_by, operator)
 
     def test_marking_one_done_twice_keeps_the_first(self):
         self.run_with_note()
-        board = self.enter_admin(["board"])
+        operator = self.enter_admin(["operator"])
         item = self.open_ones().get()
         self.client.post(self.list_url(), {"action": "mark_done", "_selected_action": [item.pk]})
         item.refresh_from_db()
@@ -625,7 +663,7 @@ class FollowUps(Base):
         self.client.post(self.list_url(), {"action": "mark_done", "_selected_action": [item.pk]})
         item.refresh_from_db()
         self.assertEqual(item.done_at, first)
-        self.assertEqual(item.done_by, board)
+        self.assertEqual(item.done_by, operator)
 
     def test_nobody_can_add_or_delete_one(self):
         self.run_with_note()
@@ -646,7 +684,7 @@ class FollowUps(Base):
 
     def test_open_ones_are_on_the_admin_page_until_done(self):
         self.run_with_note()
-        self.enter_admin(["board"])
+        self.enter_admin(["operator"])
         self.assertContains(self.client.get(reverse("admin:index")), "Change the passwords in Shared.")
         self.open_ones().update(done_at=timezone.now())
         self.assertNotContains(self.client.get(reverse("admin:index")), "Change the passwords in Shared.")
@@ -654,20 +692,20 @@ class FollowUps(Base):
     def test_more_than_can_be_shown_says_how_many(self):
         for number in range(13):
             FollowUp.objects.create(about="a@example.org", sub=str(number), tool="tool", key="k", text=f"Follow-up {number}.")
-        self.enter_admin(["board"])
+        self.enter_admin(["operator"])
         self.assertContains(self.client.get(reverse("admin:index")), "and 3 more")
 
     def test_a_treasurer_isnt_told(self):
         self.run_with_note()
         self.enter_admin(["treasurer"])
-        self.assertNotContains(self.client.get(reverse("admin:index")), "Change the passwords in Shared.")
+        self.assertNotContains(self.client.get(reverse("admin:index"), follow=True), "Change the passwords in Shared.", status_code=403)
 
     def test_text_from_a_tool_is_escaped(self):
         connector = FakeConnector()
         connector.notes = [("org-1", "Change the passwords in <script>alert(1)</script>.")]
         sync.request_for(self.user)
         sync.run_once([connector])
-        self.enter_admin(["board"])
+        self.enter_admin(["operator"])
         for url in (reverse("admin:index"), self.list_url()):
             self.assertNotContains(self.client.get(url), "<script>alert(1)</script>")
 
@@ -681,7 +719,7 @@ class AdminPage(Base):
 
     def setUp(self):
         self.tool = make_tool()
-        self.person, _ = make_user(groups=["developer"])
+        self.person, _ = make_user(groups=["member"])
         self.enter_as_operator()
         AccessSync.objects.all().delete()
 
@@ -718,15 +756,6 @@ class AdminPage(Base):
         AccessSync.objects.update(requested_at=timezone.now() - timedelta(minutes=2))
         self.assertContains(self.client.get(reverse("admin:index")), "reached every tool")
 
-    def test_a_board_member_is_told_too(self):
-        self.client.logout()
-        _, secret = make_user("board@example.org", ["board"], password=PASSWORD, two_factor=True)
-        self.log_in("board@example.org")
-        self.enter_code(totp_code(secret))
-        sync.request_for(self.person)
-        AccessSync.objects.update(requested_at=timezone.now() - timedelta(minutes=2))
-        self.assertContains(self.client.get(reverse("admin:index")), "reached every tool")
-
     def test_tools_are_not_a_condition_for_saving(self):
         """The page only writes down what's wanted. It never waits on a tool."""
         self.assertFalse(Client.objects.filter(name="not-there").exists())
@@ -735,14 +764,14 @@ class AdminPage(Base):
 
 
 class Roles(Base):
-    def test_follow_ups_are_for_board_and_operators(self):
-        for key, expected in (("board", True), ("operator", True), ("treasurer", False), ("events", False), ("developer", False), ("member", False)):
+    def test_follow_ups_are_for_operators(self):
+        for key, expected in (("operator", True), ("board", False), ("treasurer", False), ("member", False)):
             with self.subTest(key):
                 user, _ = make_user(f"{key}@example.org", [key])
                 self.assertEqual(user.has_perm("accounts.change_followup"), expected)
 
     def test_nobody_gets_to_change_the_queue(self):
-        for key in ("board", "operator"):
+        for key in ("operator",):
             user, _ = make_user(f"{key}@example.org", [key])
             self.assertFalse(user.has_perm("accounts.change_accesssync"))
             self.assertFalse(user.has_perm("accounts.add_followup"))

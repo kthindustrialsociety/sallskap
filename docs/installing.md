@@ -127,7 +127,7 @@ kit enable vault     # passwords, for the board, at vault.example.org
 kit enable git       # code and issues, at git.example.org
 ```
 
-Who gets in, and what they can do, is in [modules/vault/README.md](../modules/vault/README.md) and [modules/git/README.md](../modules/git/README.md). In short: Board and Operator get into the vault, and in Git, groups decide who can read and who can write.
+Who gets in, and what they can do, is in [modules/vault/README.md](../modules/vault/README.md) and [modules/git/README.md](../modules/git/README.md). In short: your association's board and Operators get into the vault, and in Git, memberships and positions decide who can read and who can write.
 
 ## 7. Add your websites
 

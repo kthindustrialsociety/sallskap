@@ -14,9 +14,9 @@ It's safe to run again, which is also how to finish if something fails partway. 
 
 ## Who gets in
 
-Only Board and Operator, which are set in `module.toml`. Both require 2FA in core, so every login to the vault has passed it. Core shows anyone else a "No access" page.
+Only your association's board and Operators: the keys `board` and `operator`, set in `module.toml`. `board` is anyone with a board role on your association (chair, vice chair, treasurer, secretary or board member), seats included, and not the boards of associations inside it ([docs/structure.md](../../docs/structure.md) §5). Both need 2FA in core, so every login to the vault has passed it. Core shows anyone else a "No access" page.
 
-To change the groups or the session length, edit `module.toml`, then:
+To change the keys or the session length, edit `module.toml`, then:
 
 ```sh
 kit tool remove vaultwarden
@@ -33,7 +33,7 @@ The first time, they choose a master password. The page calls this joining an or
 
 ## Sharing passwords
 
-Shared passwords live in an organisation. Groups in core decide who can sign in, but not who's in an organisation, as Vaultwarden has no way of taking that from core. With no mail, an owner adds each person by hand:
+Shared passwords live in an organisation. Keys in core decide who can sign in, but not who's in an organisation, as Vaultwarden has no way of taking that from core. With no mail, an owner adds each person by hand:
 
 1. They sign in once and choose a master password.
 2. An owner adds their address under the organisation's members, and they're accepted right away.
@@ -41,19 +41,19 @@ Shared passwords live in an organisation. Groups in core decide who can sign in,
 
 ## When someone leaves
 
-Turning off someone's account in core, deleting it, or removing them from Board and Operator all do the same thing. Core tells Vaultwarden straight away, usually within a few seconds, and it turns off their account here. If it's down at the time, it's told as soon as it's back.
+Turning off someone's account in core, deleting it, or ending their board position, unless they're an Operator, all do the same thing. Core tells Vaultwarden straight away, usually within a few seconds, and it turns off their account here. If it's down at the time, it's told as soon as it's back.
 
 That ends every token at once, including one used by hand, and an open page logs itself out. It also refuses their master password, so the emergency copy below won't let them in either. Adding them back turns the account on again, and they sign in as usual.
 
-**Their personal entries are locked too,** as nothing here can tell them apart. So before someone hands over, they should copy out anything of their own. If that gets missed, add them back to a group for long enough to do it.
+**Their personal entries are locked too,** as nothing here can tell them apart. So before someone hands over, they should copy out anything of their own. If that gets missed, give them back their position, or Operator, for long enough to do it.
 
-**What only a person can do.** Someone who has left may have copied or kept the passwords they saw. Vaultwarden's server can't read entries, and they're passwords to other sites anyway, so these can't be changed for you. If they were in any organisations, Board and Operators get a follow-up on the admin page for each one, until someone marks it done:
+**What only a person can do.** Someone who has left may have copied or kept the passwords they saw. Vaultwarden's server can't read entries, and they're passwords to other sites anyway, so these can't be changed for you. If they were in any organisations, Operators get a follow-up on the admin page for each one, until someone marks it done:
 
 1. An owner of the organisation removes them from its members.
 2. The owner changes every password they could see, at the site each one belongs to, then updates the entry.
 3. Someone marks the follow-up as done, which records who and when.
 
-If they were an organisation's only owner, the follow-up says so, as nobody can manage it after that. Add them back to a group for long enough to make someone else an owner.
+If they were an organisation's only owner, the follow-up says so, as nobody can manage it after that. Give them back their position, or Operator, for long enough to make someone else an owner.
 
 ## If core is down
 

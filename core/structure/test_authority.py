@@ -542,22 +542,11 @@ class TwoFactor(Federation):
         TOTP.activate(User.objects.get(pk=p.user_id), generate_totp_secret())
         self.assertFalse(User.objects.get(pk=p.user_id).needs_2fa_setup)
 
-    def test_operators_and_the_board_and_treasurer_groups_still_need_it(self):
-        # The groups keep it until their members become positions (A5).
+    def test_operators_need_it_and_so_does_a_board_role_on_the_root(self):
         for group in ("operator", "board", "treasurer"):
             with self.subTest(group):
                 user, _ = make_user(f"{group}-group@example.org", [group])
                 self.assertTrue(user.requires_2fa)
-
-    def test_a_board_role_sends_someone_to_set_it_up_before_the_admin_page(self):
-        user, _ = make_user("events@example.org", ["events"])  # staff, with no 2FA of its own
-        client = CaddyClient()
-        client.force_login(user)
-        self.assertEqual(client.get(reverse("admin:index")).status_code, 200)
-        Membership.objects.create(person=user.person, association=self.u["chem"], start=LONG_AGO)
-        holds(user.person, self.u["chem"], Role.BOARD_MEMBER)
-        response = client.get(reverse("admin:index"), follow=True)
-        self.assertEqual(response.redirect_chain[-1][0], reverse("mfa_index"))
 
     def test_the_home_page_says_so(self):
         p = self.account("home", member_of=self.u["chem"])
@@ -681,8 +670,8 @@ class AdminPage(Federation):
         self.assertEqual(Grant.objects.get().end, TODAY)
         self.assertEqual(self.client.post(reverse("admin:structure_grant_delete", args=[g.pk]), {"post": "yes"}).status_code, 403)
 
-    def test_board_sees_grants_and_cannot_give_them(self):
+    def test_the_board_cannot_reach_grants_until_its_own_pages(self):
         self.enter("board")
-        self.assertEqual(self.client.get(reverse("admin:structure_grant_changelist")).status_code, 200)
-        self.assertEqual(self.client.post(reverse("admin:structure_grant_add"), self.form()).status_code, 403)
+        self.assertEqual(self.client.get(reverse("admin:structure_grant_changelist"), follow=True).status_code, 403)
+        self.assertEqual(self.client.post(reverse("admin:structure_grant_add"), self.form(), follow=True).status_code, 403)
         self.assertFalse(Grant.objects.exists())

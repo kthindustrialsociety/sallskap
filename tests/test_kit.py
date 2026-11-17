@@ -124,7 +124,7 @@ class ParseConfig(unittest.TestCase):
         self.assertEqual((config.name, config.key), (None, None))
 
     def test_refuses_a_bad_key(self):
-        for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', '"custom"', f'"{"x" * 41}"', "7"):
+        for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', f'"{"x" * 41}"', "7"):
             with self.subTest(key=key), self.assertRaisesRegex(kit.KitError, "isn't valid"):
                 kit.parse_config(f'[association]\nkey = {key}\ndomain = "a.org"\n')
 
@@ -1088,11 +1088,10 @@ class GitSetup(unittest.TestCase):
         self.assertEqual(self.find("update-oauth"), [])
         self.assertEqual(self.find(" restart "), [])
 
-    def test_it_creates_the_teams_a_group_can_lead_to(self):
+    def test_it_creates_the_teams_a_key_can_lead_to(self):
         self.setup()
         teams = {team["name"]: team for team in self.bodies("/orgs/kthis/teams")}
-        self.assertEqual(teams["developers"]["permission"], "write")
-        self.assertTrue(teams["developers"]["can_create_org_repo"])
+        self.assertEqual(set(teams), {"board"})  # the connector makes the rest when they're needed
         self.assertEqual(teams["board"]["permission"], "read")
         self.assertFalse(teams["board"]["can_create_org_repo"])
         for team in teams.values():
@@ -1100,9 +1099,9 @@ class GitSetup(unittest.TestCase):
 
     def test_it_only_creates_what_is_missing(self):
         self.org_exists = True
-        self.teams = ["Owners", "developers"]
+        self.teams = ["Owners", "board"]
         self.setup()
-        self.assertEqual([team["name"] for team in self.bodies("/orgs/kthis/teams")], ["board"])
+        self.assertEqual([team["name"] for team in self.bodies("/orgs/kthis/teams")], [])
         self.assertFalse([b for b in self.bodies("/api/v1/orgs") if "username" in b])
 
     def test_the_organisation_may_make_repos_when_people_may_not(self):
@@ -1136,13 +1135,18 @@ class GitSetup(unittest.TestCase):
         self.assertEqual(source["--auto-discover-url"], ["https://app.kthis.example/.well-known/openid-configuration"])
         self.assertEqual(source["--scopes"], ["email", "profile", "groups"])
 
-    def test_groups_decide_teams_and_taking_one_away_counts(self):
+    def test_keys_decide_teams_and_taking_one_away_counts(self):
         self.setup()
         source = self.source()
         self.assertEqual(source["--group-claim-name"], ["groups"])
         self.assertEqual(
             json.loads(source["--group-team-map"][0]),
-            {"operator": {"kthis": ["Owners"]}, "developer": {"kthis": ["developers"]}, "board": {"kthis": ["board"]}},
+            {
+                "operator": {"kthis": ["Owners"]},
+                "board": {"kthis": ["board"]},
+                "example:chair": {"kthis": ["Owners"]},  # the root's chair and vice chair own its organisation
+                "example:vice_chair": {"kthis": ["Owners"]},
+            },
         )
         self.assertIn("--group-team-map-removal", source)
 
@@ -2223,15 +2227,14 @@ class WorkerSettings(unittest.TestCase):
 
     def test_the_team_map_has_one_home(self):
         manifest = kit.module_manifest("git")
-        self.assertEqual(manifest["teams"], {"operator": "Owners", "developer": "developers", "board": "board"})
+        self.assertEqual(manifest["teams"], {"operator": "Owners", "board": "board"})
+        self.assertEqual(manifest["owners"], ["chair", "vice_chair"])  # the connector reads the same
         self.assertEqual(manifest["admin_group"], "operator")
         for team in kit.FORGEJO_TEAMS:
             self.assertIn(team["name"], manifest["teams"].values())
         # Forgejo silently skips a team in its map that doesn't exist. It makes Owners itself.
         self.assertEqual(set(manifest["teams"].values()) - {"Owners"}, {team["name"] for team in kit.FORGEJO_TEAMS})
 
-    def test_someone_who_can_only_read_never_stays_a_collaborator(self):
-        self.assertNotIn("board", kit.module_manifest("git")["collaborator_groups"])
 
 
 class Emergency(unittest.TestCase):

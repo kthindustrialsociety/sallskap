@@ -52,7 +52,6 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[a-z0-9.-]+")
 # The association's key: the same rule as KEY in core/structure/models.py. It's the
 # root unit's, so it ends up in every tool, and it can't change once set.
 UNIT_KEY = re.compile(r"[a-z]([a-z0-9-]{0,38}[a-z0-9])?")
-RESERVED_KEYS = {"custom"}
 NEEDS_NAME_AND_KEY = (
     "The config file needs the association's name and key under [association], such as\n\n"
     '  name = "Example Society"\n  key  = "example"\n\n'
@@ -258,7 +257,7 @@ def _check_name_and_key(name, key) -> tuple[str | None, str | None]:
             raise KitError("Under [association], name must be the association's name, on one line, at most 100 characters.")
         name = name.strip()
     if key is not None:
-        if not isinstance(key, str) or not UNIT_KEY.fullmatch(key) or "--" in key or key in RESERVED_KEYS:
+        if not isinstance(key, str) or not UNIT_KEY.fullmatch(key) or "--" in key:
             raise KitError(
                 f"Under [association], the key {key!r} isn't valid. Use lowercase letters, digits and single hyphens, "
                 "starting with a letter and ending with a letter or digit, at most 40 characters, such as \"example\"."
@@ -638,10 +637,7 @@ def _check_callback(address: str) -> str:
 FORGEJO_TOOL = "forgejo"  # its name in core's login service
 FORGEJO_SERVICE_USER = "sallskap-admin"  # owns the organisation. Nobody can log in as it
 FORGEJO_UNITS = ["repo.code", "repo.issues", "repo.pulls", "repo.releases", "repo.wiki", "repo.projects"]
-FORGEJO_TEAMS = (
-    {"name": "developers", "permission": "write", "can_create_org_repo": True},
-    {"name": "board", "permission": "read", "can_create_org_repo": False},
-)
+FORGEJO_TEAMS = ({"name": "board", "permission": "read", "can_create_org_repo": False},)  # Forgejo makes Owners
 NO_LIMIT = 1_000_000  # repos the organisation may have: 0 would fall back on the limit for people
 
 
@@ -775,6 +771,9 @@ def _connect_login(config: Config, org: str, source, registered) -> None:
         raise KitError("Core registered Forgejo, but kit couldn't read its settings. Run this again.")
     manifest = module_manifest("git")
     team_map = {group: {org: [team]} for group, team in manifest["teams"].items()}
+    # Forgejo takes someone off a mapped team at sign-in unless a key maps them to it, so
+    # the root's chair and vice chair are here beside operators. The connector does the rest.
+    team_map |= {f"{config.key}:{role}": {org: ["Owners"]} for role in manifest["owners"]}
     settings = [
         "--name", org,
         "--provider", "openidConnect",

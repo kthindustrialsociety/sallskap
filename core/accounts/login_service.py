@@ -1,9 +1,10 @@
 """The login service for other tools, built on allauth's OpenID Connect provider.
 What's here is what that provider doesn't do for us: it doesn't know our 2FA rule,
-our groups, or that we don't use allauth's table of email addresses."""
+our keys, or that we don't use allauth's table of email addresses."""
 
 import json
 import secrets
+from datetime import timedelta
 
 from allauth.idp.oidc.adapter import DefaultOIDCAdapter
 from allauth.idp.oidc.models import Client, Token
@@ -17,6 +18,7 @@ from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 from oauthlib.oauth2.rfc6749.errors import InvalidTokenError, MismatchingRedirectURIError
+from structure.access import for_tools, keys
 
 from .models import ToolAccess
 
@@ -25,11 +27,16 @@ CLAIMS = ["sub", "email", "name", "preferred_username", "groups"]
 
 
 ACCESS_TOKEN_SECONDS = 10 * 60  # most tools only need it just after someone logs in
+# A tool makes someone's account when it gets their first token. One that maps the tree,
+# as Forgejo does, only hears about their units through the worker, so it's asked about
+# them once the account is there.
+AFTER_SIGN_IN = timedelta(seconds=10)
 
 
-def may_use(user, tool):
+def may_use(user, tool, held=None):
+    """`held` is keys(user), if it's already been worked out."""
     access = ToolAccess.objects.filter(tool=tool).first()
-    return access is None or bool(set(access.group_keys) & set(user.group_keys()))
+    return access is None or bool(set(access.group_keys) & set(keys(user) if held is None else held))
 
 
 def access_token_seconds(request):
@@ -38,7 +45,7 @@ def access_token_seconds(request):
 
 
 class LoginServiceAdapter(DefaultOIDCAdapter):
-    scope_display = {**DefaultOIDCAdapter.scope_display, "groups": _("View your groups")}
+    scope_display = {**DefaultOIDCAdapter.scope_display, "groups": _("View your memberships and positions")}
 
     def get_issuer(self):
         # Fixed rather than read from the request: tools store it, so it can never vary.
@@ -50,8 +57,9 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
 
     def get_claims(self, purpose, user, client, scopes, email=None, **kwargs):
         # Every token and every question about one comes through here, so someone who
-        # has left a tool's groups since logging in gets no further either.
-        if not may_use(user, client):
+        # has lost a tool's keys since logging in gets no further either.
+        held = keys(user)
+        if not may_use(user, client, held):
             raise InvalidTokenError()
         claims = {"sub": self.get_user_sub(client, user)}
         if "email" in scopes:
@@ -62,7 +70,11 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
         if "profile" in scopes:
             claims.update(name=user.get_full_name(), preferred_username=user.tool_username())
         if "groups" in scopes:
-            claims["groups"] = user.group_keys()
+            claims["groups"] = for_tools(user, held)  # the same keys the worker sends
+            if purpose == "id_token" and any(":" in key for key in claims["groups"]):
+                from .sync import request_for
+
+                request_for(user, wait=AFTER_SIGN_IN)
         return claims
 
     def populate_server_metadata(self, data):
@@ -79,10 +91,10 @@ class LoginServiceAdapter(DefaultOIDCAdapter):
 
 @method_decorator(csrf_exempt, name="dispatch")  # as on the view this extends
 class AuthorizationView(ProviderAuthorizationView):
-    """The door other tools send people through. Someone whose group requires 2FA
+    """The door other tools send people through. Someone whose role requires 2FA
     can't get through without it, or every other tool would be a way around the rule.
-    A tool can also be limited to certain groups: the group check comes first, as
-    there's no point in setting up 2FA for a tool someone can't use."""
+    A tool can also be limited to certain keys: that check comes first, as there's no
+    point in setting up 2FA for a tool someone can't use."""
 
     def dispatch(self, request, *args, **kwargs):
         if self.has_wrong_return_address(request):

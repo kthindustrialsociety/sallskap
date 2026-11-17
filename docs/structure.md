@@ -1,6 +1,6 @@
 # Structure: associations, people, and doing everything from a command line
 
-*Working design, first agreed 2026-11-13, and expected to change as it's built and used. Being built, before `members` and `events`: units (§1), people (§2), memberships, positions and reasons (§3), and authority, grants and seat rules (§4) are in core, and the rest follows. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
+*Working design, first agreed 2026-11-13, and expected to change as it's built and used. Being built, before `members` and `events`: units (§1), people (§2), memberships, positions and reasons (§3), authority, grants and seat rules (§4), and keys to the tools (§5) are in core, and the rest follows. Part of the [spec](spec.md), which points here from §4, §8, §9 and §11.*
 
 Everything here is the same for every installation. An association's own structure is data in core's database, not code or config.
 

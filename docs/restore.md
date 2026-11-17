@@ -9,7 +9,7 @@ One encrypted [restic](https://restic.net) repository in `/srv/backup/repo`, hol
 | What | Why it's needed |
 |---|---|
 | `/etc/sallskap` | The config, and every secret: core's keys, each tool's settings, the worker's admin tokens, the backup password itself |
-| `/srv/core` | Accounts, groups, 2FA records, and what's waiting to be told to a tool |
+| `/srv/core` | Accounts, people and their ties to associations and teams, 2FA records, and what's waiting to be told to a tool |
 | Each module's `data`, from its `module.toml` | Today `/srv/git`, `/srv/vault` and `/srv/website`. A module that's switched off is kept too, because disabling one keeps its data |
 | `/srv/caddy` | The certificates, so a restored server serves HTTPS without asking for new ones |
 | `/var/lib/sallskap-deploy` | The publishing keys, so CI keeps working after a restore |
@@ -127,7 +127,7 @@ With `--force`, the folders it replaces are moved aside first, not mixed with th
 
 Three things a restore can't do:
 
-- **It can't know who has left.** Measured on a real restore: someone deleted in core after the backup was taken came back as an active member of their group, and core held no record of the departure. Restoring one tool from an older copy is the opposite case — there core is current, so the worker corrects the tool by itself — but a full restore rolls core back with everything else.
+- **It can't know who has left.** Measured on a real restore: someone deleted in core after the backup was taken came back with their access as it was, and core held no record of the departure. Restoring one tool from an older copy is the opposite case — there core is current, so the worker corrects the tool by itself — but a full restore rolls core back with everything else.
 
 - **It can't bring back a forgotten master password.** Vault entries are encrypted with each person's own, which the server never has. A restored vault is as locked as the original.
 - **It can't undo what someone already copied.** Anyone who left before the backup was taken may still hold passwords they saw, and those have to be changed at the site each one belongs to.

@@ -59,6 +59,11 @@ VAULT_KEY = "2.bm90LXJlYWw=|bm90LXJlYWw=|bm90LXJlYWw="
 VAULT_IDENTIFIER = "00000000-01DC-01DC-01DC-000000000000"  # the one Vaultwarden uses for itself
 VAULT_SESSION_SECONDS = 12 * 3600
 PASSWORD = "fake-user-long-password-42"
+FAKE_TEAM = "fake-team"  # a team the fake leads lead, under the association (structure.md §5)
+FAKE_ASSOCIATION = "fake-association"  # inside the installation's, so it gets its own organisation
+FAKE_PROJECT = "fake-project"  # a team that gets archived
+# What the fake people can be given: Operator, the one group, and ties to the association:
+# member, board (a board member) and treasurer, and lead of the fake team.
 LOCKED_TEXT = "Too many failed login attempts"
 FAKE = {
     "fake-member": (["member"], False),
@@ -72,19 +77,19 @@ FAKE = {
     "fake-tool-2fa": (["treasurer"], True),
     "fake-tool-member": (["member"], False),
     "fake-tool-off": (["member"], False),
-    "fake-git-dev": (["developer"], False),
-    "fake-git-keeper": (["developer"], False),
+    "fake-git-dev": (["lead"], False),
+    "fake-git-keeper": (["lead"], False),
     "fake-git-board": (["board"], True),
     "fake-git-operator": (["operator"], True),
     "fake-git-member": (["member"], False),
     "fake-git-moving": (["member"], True),
-    "fake-git-leaving": (["developer"], False),
+    "fake-git-leaving": (["lead"], False),
     "fake-git-clash": (["member"], False),
     "fake-vault-board": (["board"], True),
     "fake-vault-operator": (["operator"], True),
     "fake-vault-board-no2fa": (["board"], False),
     "fake-vault-member": (["member"], False),
-    "fake-vault-dev": (["developer"], False),
+    "fake-vault-dev": (["lead"], False),
     "fake-vault-treasurer": (["treasurer"], True),
     "fake-vault-moving": (["member"], True),
     "fake-vault-newcomer": (["board"], True),
@@ -94,21 +99,21 @@ FAKE = {
     "fake-vault-renamed": (["board"], True),
     "fake-vault-rules": (["board"], True),
     "fake-vault-offon": (["board"], True),
-    "fake-sync-2fa": (["developer"], False),
+    "fake-sync-2fa": (["lead"], False),
     "fake-sync-joiner": (["member"], True),
-    "fake-sync-creator": (["developer"], False),
-    "fake-sync-colleague": (["developer"], False),
-    "fake-sync-moved": (["developer"], True),
+    "fake-sync-creator": (["lead"], False),
+    "fake-sync-colleague": (["lead"], False),
+    "fake-sync-moved": (["lead"], True),
     "fake-sync-admin": (["operator"], True),
-    "fake-sync-leaver": (["developer"], False),
-    "fake-sync-deleted": (["developer"], False),
-    "fake-sync-bypass": (["developer"], False),
-    "fake-sync-outage": (["developer"], False),
-    "fake-sync-nowork": (["developer"], False),
-    "fake-sync-down": (["developer"], False),
-    "fake-sync-blocked": (["developer"], False),
+    "fake-sync-leaver": (["lead"], False),
+    "fake-sync-deleted": (["lead"], False),
+    "fake-sync-bypass": (["lead"], False),
+    "fake-sync-outage": (["lead"], False),
+    "fake-sync-nowork": (["lead"], False),
+    "fake-sync-down": (["lead"], False),
+    "fake-sync-blocked": (["lead"], False),
     "fake-sync-rescuer": (["operator"], True),
-    "fake-sync-no2fa": (["developer"], False),
+    "fake-sync-no2fa": (["lead"], False),
     "fake-vsync-owner": (["board"], True),
     "fake-vsync-removed": (["board"], True),
     "fake-vsync-off": (["board"], True),
@@ -120,6 +125,9 @@ FAKE = {
     "fake-vsync-down": (["board"], True),
     "fake-vsync-off-down": (["board"], True),
     "fake-vsync-member": (["member"], False),
+    "fake-tree-chair": (["member"], True),
+    "fake-tree-next": (["member"], True),
+    "fake-tree-lead": (["member"], False),
 }
 # These can't be named fake-something, as what's being tested is the name itself.
 FAKE_OTHER = ["fake-git-clash@example.net", f"{FORGEJO_SERVICE_USER}@example.org", "admin@example.org"]
@@ -317,11 +325,38 @@ except Exception as error:
     return json.loads(in_core(code).splitlines()[-1])
 
 
+GIVE = f"""
+from django.contrib.auth.models import Group
+from structure.models import Membership, Position, Unit
+
+
+def give(user, roles):
+    root = Unit.objects.root()
+    team = Unit.objects.filter(key={FAKE_TEAM!r}).first() or Unit.objects.create(kind="team", key={FAKE_TEAM!r}, name="Fake team", parent=root)
+    person = user.person
+    wanted = {{(root.pk, "board_member")}} if "board" in roles else set()
+    wanted |= {{(root.pk, "treasurer")}} if "treasurer" in roles else set()
+    wanted |= {{(team.pk, "lead")}} if "lead" in roles else set()
+    for position in Position.objects.current().filter(person=person, seat_rule=None):
+        if (position.unit_id, position.role) in wanted:
+            wanted.discard((position.unit_id, position.role))
+        else:
+            position.end_on()
+    membership = Membership.objects.current().filter(person=person, association=root).first()
+    if set(roles) - {{"operator"}} and membership is None:
+        Membership.objects.create(person=person, association=root)
+    elif not set(roles) - {{"operator"}} and membership is not None:
+        membership.end_on()
+    for unit, role in wanted:
+        Position.objects.create(person=person, unit_id=unit, role=role)
+    user.groups.set(Group.objects.filter(role__key__in=[role for role in roles if role == "operator"]))
+"""
+
+
 def create_fake_users():
-    code = f"""
+    code = GIVE + f"""
 import json
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 from django.core.cache import cache
 from allauth.mfa.totp.internal.auth import TOTP, generate_totp_secret
 FAKE = {FAKE!r}
@@ -329,7 +364,7 @@ User = get_user_model()
 secrets = {{}}
 for name, (roles, two_factor) in FAKE.items():
     user = User.objects.create_user(name + "@example.org", {PASSWORD!r})
-    user.groups.set(Group.objects.filter(role__key__in=roles))
+    give(user, roles)
     if two_factor:
         secrets[name] = generate_totp_secret()
         TOTP.activate(user, secrets[name])
@@ -535,20 +570,22 @@ def check_access(host, operator, secrets_by_name):
     board = Browser(host)
     board.log_in(email_of("fake-board-no2fa"))
     final, visited = board.follow("/admin/")
-    check("A Board member without 2FA is sent to set it up", "/accounts/2fa/" in visited[-1], str(visited))
+    check("A Board member is refused the admin page, which is Operators' only", final.status == 403, str(visited))
     final, visited = board.follow("/admin/accounts/user/")
-    check("...and can't reach the user list either", "/accounts/2fa/" in visited[-1], str(visited))
+    check("...and can't reach the user list either", final.status == 403, str(visited))
+    check("...and is told on the home page to set up 2FA", "/accounts/2fa/" in board.get("/").text)
 
     treasurer = Browser(host)
     treasurer.log_in(email_of("fake-treasurer"))
     treasurer.enter_code(totp(secrets_by_name["fake-treasurer"]))
-    check("A Treasurer with 2FA can open the admin page", treasurer.get("/admin/").status == 200)
-    for path in ("/admin/accounts/user/", "/admin/auth/group/", "/admin/mfa/authenticator/"):
-        status = treasurer.get(path).status
-        check(f"A Treasurer can't see {path}", status == 403, str(status))
+    final, _ = treasurer.follow("/admin/")
+    check("A Treasurer with 2FA is refused the admin page too", final.status == 403, str(final.status))
+    for path in ("/admin/accounts/user/", "/admin/mfa/authenticator/"):
+        final, _ = treasurer.follow(path)
+        check(f"A Treasurer can't see {path}", final.status == 403, str(final.status))
 
     check("An Operator with 2FA can see the user list", operator.get("/admin/accounts/user/").status == 200)
-    check("An Operator can see groups", operator.get("/admin/auth/group/").status == 200)
+    check("There's no page for groups, as Operator is the one", operator.get("/admin/auth/group/").status == 404)
     check("An Operator can see 2FA records", operator.get("/admin/mfa/authenticator/").status == 200)
     page = operator.get("/admin/mfa/authenticator/")
     match = re.search(r"/admin/mfa/authenticator/(\d+)/change/", page.text)
@@ -681,7 +718,9 @@ def check_login_service(host, secrets_by_name):
     claims = verified_claims(host, tool, tokens["id_token"])
     check("The signature checks out against the published key", "refused" not in claims, str(claims))
     check("It says who it is", claims.get("email") == email_of("fake-tool-member"), str(claims.get("email")))
-    check("It passes on the person's groups", claims.get("groups") == ["member"], str(claims.get("groups")))
+    member_keys = sorted([f"{root_key()}:member", "member"])
+    check("It passes on the person's keys", claims.get("groups") == member_keys, str(claims.get("groups")))
+    check("...the same ones the worker sends", claims.get("groups") == keys_of(email_of("fake-tool-member")), str(claims.get("groups")))
     check("It includes the tool's nonce", claims.get("nonce") == "nonce-from-the-tool")
 
     header, payload, signature = tokens["id_token"].split(".")
@@ -692,7 +731,7 @@ def check_login_service(host, secrets_by_name):
     check("An altered statement fails the signature check", "refused" in refused, str(refused))
 
     info = tool_request(host, "/identity/o/api/userinfo", bearer=tokens["access_token"])
-    check("The tool can ask who someone is", info.status == 200 and json.loads(info.text).get("groups") == ["member"], info.text[:200])
+    check("The tool can ask who someone is", info.status == 200 and json.loads(info.text).get("groups") == member_keys, info.text[:200])
     in_url = tool_request(host, f"/identity/o/api/userinfo?access_token={tokens['access_token']}")
     check("A token in the address is refused", in_url.status == 401, str(in_url.status))
     used = exchange(host, tool, back["code"])
@@ -728,18 +767,14 @@ def check_login_service(host, secrets_by_name):
     if back and back.get("code"):
         answer = exchange(host, tool, back["code"])
         claims = verified_claims(host, tool, json.loads(answer.text)["id_token"])
-        check("Their own groups come through", claims.get("groups") == ["treasurer"], str(claims.get("groups")))
+        groups = claims.get("groups") or []
+        check("Their own keys come through", {"board", "treasurer", f"{root_key()}:treasurer"} <= set(groups), str(groups))
+        check("...the same ones the worker sends", groups == keys_of(email_of("fake-tool-2fa")), str(groups))
 
-    in_core(
-        f"""
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
-get_user_model().objects.get(email={email_of("fake-tool-member")!r}).groups.add(Group.objects.get(role__key="developer"))
-"""
-    )
+    give(email_of("fake-tool-member"), ["member", "lead"], wait=False)
     back = sent_back(member.get(authorize_path(tool["client_id"])))
     claims = verified_claims(host, tool, json.loads(exchange(host, tool, back["code"]).text)["id_token"])
-    check("A group change shows at the next login", claims.get("groups") == ["developer", "member"], str(claims.get("groups")))
+    check("A new position shows at the next login", claims.get("groups") == sorted([f"{FAKE_TEAM}:lead", *member_keys]), str(claims.get("groups")))
 
     leaving = Browser(host)
     leaving.log_in(email_of("fake-tool-off"))
@@ -797,14 +832,21 @@ class Person:
         self.host = host
         self.app = Browser(host)
         self.git = Browser(git_host(host))
+        self.email = None
 
     def log_in_to_core(self, email, code_secret=None):
+        self.email = email
         self.app.log_in(email)
         if code_secret:
             self.app.enter_code(totp(code_secret))
 
     def sign_in_to_git(self):
-        return self.open_git(f"/user/oauth2/{org_of(self.host)}")
+        """Forgejo puts them on the installation's Owners and board teams as they sign in.
+        Their other teams come from the worker, which core asks a few seconds later."""
+        reached = self.open_git(f"/user/oauth2/{org_of(self.host)}")
+        if self.email:
+            wait_for(lambda: not core_db("select count(*) from accounts_accesssync s join accounts_user u on s.user_id = u.id where u.email = ? and s.pending = 1", self.email)[0][0], 40)
+        return reached
 
     def open_git(self, path):
         """Open a page and follow where it goes, across both hostnames. Returns the
@@ -865,9 +907,25 @@ def button_page(host):
     return Browser(git_host(host), cookies={"sallskap_stay": "1"}).get("/user/login")
 
 
+# The teams these checks look at: the installation's own, and the fake team's. A made-up
+# installation loaded beside them can add others, such as a seat on an extended board.
+OUR_TEAMS = {"Owners", "board", "members", FAKE_TEAM, f"{FAKE_TEAM}.lead"}
+LEAD_TEAMS = [FAKE_TEAM, f"{FAKE_TEAM}.lead", "members"]
+
+
 def team_names(host, token):
     status, teams = forgejo_api(host, token, "GET", "/user/teams")
-    return sorted(team["name"] for team in teams) if status == 200 else f"status {status}"
+    return sorted(team["name"] for team in teams if team["name"] in OUR_TEAMS) if status == 200 else f"status {status}"
+
+
+def team_id(host, name):
+    teams = forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{org_of(host)}/teams?limit=50")[1]
+    return next(team["id"] for team in teams if team["name"] == name)
+
+
+def give_repo(host, token, team, repo):
+    """What a lead does with a new repo: gives it to their team, or opens it to members."""
+    return forgejo_api(host, token, "PUT", f"/teams/{team_id(host, team)}/repos/{org_of(host)}/{repo}")[0]
 
 
 def run_git(*args, cwd=None):
@@ -879,16 +937,21 @@ def repo_url(host, username, secret, repo):
     return f"https://{username}:{secret}@{git_host(host)}/{org_of(host)}/{repo}.git"
 
 
-def set_groups(email, roles, wait=True):
-    in_core(
-        f"""
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
-get_user_model().objects.get(email={email!r}).groups.set(Group.objects.filter(role__key__in={roles!r}))
-"""
-    )
+def give(email, roles, wait=True):
+    """Their ties and groups become `roles`, as the fake people's are set up: see GIVE."""
+    in_core(GIVE + f"\nfrom django.contrib.auth import get_user_model\ngive(get_user_model().objects.get(email={email!r}), {roles!r})\n")
     if wait:
         wait_for_sync()
+
+
+def root_key():
+    return tomllib.loads(CONFIG.read_text())["association"]["key"]
+
+
+def keys_of(email):
+    """What core sends tools about someone, to hold the login response to."""
+    code = f"import json; from django.contrib.auth import get_user_model; from structure.access import for_tools; print(json.dumps(for_tools(get_user_model().objects.get(email={email!r}))))"
+    return json.loads(in_core(code).splitlines()[-1])
 
 
 def forgejo_tokens():
@@ -1089,7 +1152,7 @@ def check_forgejo_password_door(host, person, username, token):
 
 
 def check_forgejo_groups(host, secrets_by_name):
-    section("Forgejo: groups decide teams")
+    section("Forgejo: keys decide teams")
     people = {}
 
     def signed_in(name, code=False):
@@ -1102,11 +1165,16 @@ def check_forgejo_groups(host, secrets_by_name):
         return person, token
 
     _, token = signed_in("fake-git-dev")
-    check("Developer: on the developers team", team_names(host, token) == ["developers"], str(team_names(host, token)))
-    check("Developer: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    check("A team's lead: on its team and its leads' team, and the members'", team_names(host, token) == LEAD_TEAMS, str(team_names(host, token)))
+    check("A team's lead: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    made = forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{org_of(host)}/teams?limit=50")[1]
+    made = {team["name"]: team for team in made}
+    check("Core made the team, which writes", made.get(FAKE_TEAM, {}).get("permission") == "write" and not made[FAKE_TEAM]["can_create_org_repo"], str(made.get(FAKE_TEAM)))
+    check("...and its leads' team, which administers and makes repos", made.get(f"{FAKE_TEAM}.lead", {}).get("permission") == "admin" and made[f"{FAKE_TEAM}.lead"]["can_create_org_repo"], str(made.get(f"{FAKE_TEAM}.lead")))
+    check("...and the members' team, which reads what's opened to it", made.get("members", {}).get("permission") == "read" and not made["members"]["includes_all_repositories"], str(made.get("members")))
 
     _, token = signed_in("fake-git-board", code=True)
-    check("Board: on the board team", team_names(host, token) == ["board"], str(team_names(host, token)))
+    check("Board: on the board team, and the members'", team_names(host, token) == ["board", "members"], str(team_names(host, token)))
     check("Board: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
 
     _, token = signed_in("fake-git-operator", code=True)
@@ -1114,26 +1182,26 @@ def check_forgejo_groups(host, secrets_by_name):
     check("Operator: a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
 
     _, token = signed_in("fake-git-member")
-    check("Member: on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("Member: on the members' team only", team_names(host, token) == ["members"], str(team_names(host, token)))
     check("Member: not a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
 
-    section("Forgejo: changing someone's groups")
+    section("Forgejo: changing someone's ties")
     moving, token = signed_in("fake-git-moving", code=True)
-    check("They start on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("They start on the members' team only", team_names(host, token) == ["members"], str(team_names(host, token)))
 
     def next_login(roles):
-        set_groups(email_of("fake-git-moving"), roles)
+        give(email_of("fake-git-moving"), roles)
         moving.new_git_session()
         moving.sign_in_to_git()
 
-    next_login(["developer"])
-    check("Adding them to Developer puts them on the team at next login", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    next_login(["member", "lead"])
+    check("Leading the team puts them on its teams", team_names(host, token) == LEAD_TEAMS, str(team_names(host, token)))
     next_login(["member"])
-    check("Removing them takes them off the team at next login", team_names(host, token) == [], str(team_names(host, token)))
+    check("Ending it takes them off", team_names(host, token) == ["members"], str(team_names(host, token)))
     next_login(["operator"])
     check("Adding them to Operator makes them an admin and owner", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True and team_names(host, token) == ["Owners"], str(team_names(host, token)))
     next_login(["member"])
-    check("Removing them takes both away", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False and team_names(host, token) == [], str(team_names(host, token)))
+    check("Removing them takes both away", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False and team_names(host, token) == ["members"], str(team_names(host, token)))
     return people
 
 
@@ -1142,14 +1210,16 @@ def check_forgejo_git(host, people):
     org = org_of(host)
     developer = people["fake-git-dev"][1]
     status, _ = forgejo_api(host, developer, "POST", f"/orgs/{org}/repos", {"name": "fake-repo", "private": True})
-    check("A Developer can create a repo in the organisation", status == 201, str(status))
+    check("A team's lead can create a repo in the organisation", status == 201, str(status))
+    check("...and give it to their team", give_repo(host, developer, FAKE_TEAM, "fake-repo") == 204)
+    check("...and to its leads", give_repo(host, developer, f"{FAKE_TEAM}.lead", "fake-repo") == 204)
     form = people["fake-git-dev"][0].git.get("/repo/create").text
     check("The new repo form starts on private", bool(re.search(r'<input[^>]*name="private"[^>]*checked', form)))
 
     # Forgejo's API answers this refusal with a 500, so what counts is that no repo appears.
     status, _ = forgejo_api(host, developer, "POST", "/user/repos", {"name": "fake-personal"})
     exists = forgejo_api(host, developer, "GET", "/repos/fake-git-dev/fake-personal")[0]
-    check("A Developer can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
+    check("A team's lead can't create a personal repo", status != 201 and exists == 404, f"{status} {exists}")
     owners = re.findall(r'data-value="\d+"[^>]*>.*?<span[^>]*>\s*([^<\s]+)', form, re.S)
     check("The new repo form only offers the organisation", org in owners and "fake-git-dev" not in owners, str(owners))
     member = people["fake-git-member"][1]
@@ -1168,9 +1238,9 @@ def check_forgejo_git(host, people):
         for args in (("init", "-q", "-b", "main"), ("add", "."), ("-c", "user.name=Fake", "-c", "user.email=fake@example.org", "commit", "-q", "-m", "first")):
             run_git(*args, cwd=work)
         pushed = run_git("push", "-q", repo_url(host, "fake-git-dev", developer, "fake-repo"), "main", cwd=work)
-        check("A Developer can push with a token", pushed.returncode == 0, pushed.stderr[:300])
+        check("A team's lead can push with a token", pushed.returncode == 0, pushed.stderr[:300])
         cloned = run_git("clone", "-q", repo_url(host, "fake-git-dev", developer, "fake-repo"), str(Path(tmp, "dev")))
-        check("A Developer can clone it", cloned.returncode == 0 and Path(tmp, "dev", "file.txt").exists(), cloned.stderr[:300])
+        check("A team's lead can clone it", cloned.returncode == 0 and Path(tmp, "dev", "file.txt").exists(), cloned.stderr[:300])
 
         board = people["fake-git-board"][1]
         cloned = run_git("clone", "-q", repo_url(host, "fake-git-board", board, "fake-repo"), str(Path(tmp, "board")))
@@ -1184,6 +1254,11 @@ def check_forgejo_git(host, people):
 
         cloned = run_git("clone", "-q", repo_url(host, "fake-git-member", member, "fake-repo"), str(Path(tmp, "member")))
         check("A Member can't clone it", cloned.returncode != 0, cloned.stdout)
+        check("The lead opens it to members", give_repo(host, developer, "members", "fake-repo") == 204)
+        cloned = run_git("clone", "-q", repo_url(host, "fake-git-member", member, "fake-repo"), str(Path(tmp, "member")))
+        check("...and then a Member can clone it", cloned.returncode == 0, cloned.stderr[:300])
+        pushed = run_git("push", "-q", repo_url(host, "fake-git-member", member, "fake-repo"), "main:member-branch", cwd=work)
+        check("...but not push to it", pushed.returncode != 0, pushed.stdout)
         cloned = run_git("ls-remote", f"https://{git_host(host)}/{org}/fake-repo.git")
         check("Someone not logged in can't reach it", cloned.returncode != 0, cloned.stdout)
 
@@ -1192,7 +1267,7 @@ def check_forgejo_git(host, people):
         leaving.sign_in_to_git()
         token = leaving.make_token()
         check("Before leaving the team, they can push", run_git("push", "-q", repo_url(host, "fake-git-leaving", token, "fake-repo"), "main:leaving-branch", cwd=work).returncode == 0)
-        set_groups(email_of("fake-git-leaving"), ["member"])
+        give(email_of("fake-git-leaving"), ["member"])
         leaving.new_git_session()
         leaving.sign_in_to_git()
         pushed = run_git("push", "-q", repo_url(host, "fake-git-leaving", token, "fake-repo"), "main:leaving-branch-2", cwd=work)
@@ -1282,7 +1357,7 @@ def verify_forgejo(host, state):
     keeper = Person(host)
     keeper.git.cookies = dict(state["cookies"])
     check("A session is still signed in", keeper.in_git())
-    check("A token still works", team_names(host, state["token"]) == ["developers"], str(team_names(host, state["token"])))
+    check("A token still works", team_names(host, state["token"]) == LEAD_TEAMS, str(team_names(host, state["token"])))
     fresh = Person(host)
     fresh.app.cookies = dict(state["core_cookies"])
     fresh.sign_in_to_git()
@@ -1332,6 +1407,12 @@ def cleanup_forgejo():
         for repo in repos:
             if repo["name"].startswith("fake-"):
                 print(f"Fake repo {repo['name']}:", forgejo_api(host, token, "DELETE", f"/repos/{org}/{repo['name']}")[0])
+        teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams?limit=50")[1] or []
+        for team in teams:
+            if team["name"].removesuffix(".lead") in (FAKE_TEAM, FAKE_PROJECT):
+                print(f"Fake team {team['name']}:", forgejo_api(host, token, "DELETE", f"/teams/{team['id']}")[0])
+        if forgejo_api(host, token, "GET", f"/orgs/{FAKE_ASSOCIATION}")[0] == 200:
+            print("Fake organisation:", forgejo_api(host, token, "DELETE", f"/orgs/{FAKE_ASSOCIATION}")[0])
     listed = in_forgejo("forgejo", "admin", "user", "list").stdout
     for name in re.findall(r"^\d+\s+(fake-\S+)", listed, re.M):
         # Deleting someone leaves their Forgejo 2FA behind, which Forgejo's own check then
@@ -1625,8 +1706,8 @@ def check_vault_single_login(host, secrets_by_name):
 
 
 def check_vault_groups(host, secrets_by_name):
-    section("Vaultwarden: groups decide who gets in")
-    for name in ("fake-vault-member", "fake-vault-dev", "fake-vault-treasurer"):
+    section("Vaultwarden: keys decide who gets in")
+    for name in ("fake-vault-member", "fake-vault-dev"):
         person = VaultPerson(host)
         person.log_in_to_core(email_of(name), secrets_by_name.get(name))
         reached, answer = person.click_sign_in()
@@ -1643,22 +1724,24 @@ def check_vault_groups(host, secrets_by_name):
 
     operator = vault_person(host, "fake-vault-operator", secrets_by_name)
     check("An Operator gets in", operator.in_vault())
+    treasurer = vault_person(host, "fake-vault-treasurer", secrets_by_name)
+    check("The treasurer gets in, as a board role on the association", treasurer.in_vault())
 
     moving = VaultPerson(host)
     moving.log_in_to_core(email_of("fake-vault-moving"), secrets_by_name["fake-vault-moving"])
     reached, answer = moving.click_sign_in()
-    check("Someone outside the groups is refused", answer.status == 403, f"{reached} {answer.status}")
-    set_groups(email_of("fake-vault-moving"), ["board"])
+    check("Someone without the keys is refused", answer.status == 403, f"{reached} {answer.status}")
+    give(email_of("fake-vault-moving"), ["board"])
     status, _ = moving.sign_in()
-    check("Joining Board gets them in at the next sign-in", status == 200, str(status))
+    check("Joining the board gets them in at the next sign-in", status == 200, str(status))
     moving.set_master_password()
     account = vault_account(email_of("fake-vault-moving"))
-    set_groups(email_of("fake-vault-moving"), ["member"])
+    give(email_of("fake-vault-moving"), ["member"])
     moving.click_sign_in()
-    check("Leaving Board stops the next sign-in", moving.code is None)
-    set_groups(email_of("fake-vault-moving"), ["operator"])
+    check("Leaving the board stops the next sign-in", moving.code is None)
+    give(email_of("fake-vault-moving"), ["operator"])
     status, _ = moving.sign_in()
-    check("Coming back in another allowed group works", status == 200, str(status))
+    check("Coming back as an Operator works", status == 200, str(status))
     check("...with the same account", vault_account(email_of("fake-vault-moving")) == account)
     return operator
 
@@ -1828,11 +1911,11 @@ def check_vault_sessions(host, secrets_by_name):
     # worker would otherwise hide this, and end the session for good before it's reached.
     worker("stop")
     try:
-        set_groups(email, ["member"], wait=False)
+        give(email, ["member"], wait=False)
         status, _ = person.refresh()
-        check("With the worker stopped, leaving the groups ends it at the next refresh, which is every page load", status != 200, str(status))
+        check("With the worker stopped, leaving the board ends it at the next refresh, which is every page load", status != 200, str(status))
         check("...but a token used by hand keeps working, which is what the worker is for", person.api("GET", "/api/sync")[0] == 200)
-        set_groups(email, ["board"], wait=False)
+        give(email, ["board"], wait=False)
         check("...and only core was stopping it", person.refresh()[0] == 200)
 
         in_core(f"from django.contrib.auth import get_user_model as g; g().objects.filter(email={email!r}).update(is_active=False)")
@@ -2208,22 +2291,22 @@ def core_db_git(query):
 
 
 def check_git_groups_now(host, operator, secrets_by_name):
-    section("Forgejo: joining a group")
+    section("Forgejo: joining the board")
     joiner, token = git_person(host, "fake-sync-joiner", secrets_by_name)
-    check("Control: a Member is on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("Control: a Member is on the members' team only", team_names(host, token) == ["members"], str(team_names(host, token)))
     email = email_of("fake-sync-joiner")
-    set_groups(email, ["board"], wait=False)
-    took = wait_for(lambda: team_names(host, token) == ["board"])
-    check("Joining Board puts them on the team, with no new sign-in", took is not None)
+    give(email, ["board"], wait=False)
+    took = wait_for(lambda: team_names(host, token) == ["board", "members"])
+    check("Joining the board puts them on its team, with no new sign-in", took is not None)
     print(f"  info  It took {took} seconds.")
 
-    section("Forgejo: a group that requires 2FA waits for it")
+    section("Forgejo: a key that requires 2FA waits for it")
     email = email_of("fake-sync-no2fa")
     _, token = git_person(host, "fake-sync-no2fa", secrets_by_name)
-    check("Control: a Developer is on their team and isn't an admin", team_names(host, token) == ["developers"] and forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
-    set_groups(email, ["developer", "operator"])
+    check("Control: a team's lead is on its teams and isn't an admin", team_names(host, token) == LEAD_TEAMS and forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
+    give(email, ["lead", "operator"])
     check("Joining Operator with no 2FA doesn't make them a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
-    check("...or an owner", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    check("...or an owner", team_names(host, token) == LEAD_TEAMS, str(team_names(host, token)))
     in_core(
         f"""
 from django.contrib.auth import get_user_model
@@ -2232,43 +2315,47 @@ TOTP.activate(get_user_model().objects.get(email={email!r}), generate_totp_secre
 """
     )
     took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
-    check("Setting up 2FA does both, with no new sign-in", took is not None and "Owners" in team_names(host, token), str(team_names(host, token)))
+    waiting = core_db("select pending, attempts, retry_at, requested_at, tools from accounts_accesssync s join accounts_user u on u.id = s.user_id where u.email = ?", email)
+    check("Setting up 2FA does both, with no new sign-in", took is not None and "Owners" in team_names(host, token), f"{team_names(host, token)} {waiting}")
 
-    section("Forgejo: leaving a group, including repos they created")
+    section("Forgejo: leaving a team, including repos they created")
     org = org_of(host)
     colleague, colleague_token = git_person(host, "fake-sync-colleague", secrets_by_name)
     creator, token = git_person(host, "fake-sync-creator", secrets_by_name)
     repo = "fake-sync-repo"
-    check("A Developer creates a repo", make_repo(host, token, repo))
+    check("A team's lead creates a repo", make_repo(host, token, repo))
     check("Control: Forgejo made them a collaborator", "fake-sync-creator" in collaborators(host, repo), str(collaborators(host, repo)))
     check("Control: they can push to it", can_push(host, "fake-sync-creator", token, repo, "before"))
-    check("Control: so can a colleague", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-before"))
+    check("They give it to their team", give_repo(host, token, FAKE_TEAM, repo) == 204)
+    check("Control: so a colleague can push to it", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-before"))
 
-    set_groups(email_of("fake-sync-creator"), ["member"], wait=False)
+    give(email_of("fake-sync-creator"), ["member"], wait=False)
     took = wait_for(lambda: forgejo_api(host, token, "GET", f"/repos/{org}/{repo}")[0] == 404)
-    check("Leaving the group takes the repo they created away, with no new sign-in", took is not None)
+    check("Leaving the team takes the repo they created away, with no new sign-in", took is not None)
     print(f"  info  It took {took} seconds.")
     wait_for_sync()
-    check("They're on no team", team_names(host, token) == [], str(team_names(host, token)))
+    check("They're on the members' team only", team_names(host, token) == ["members"], str(team_names(host, token)))
     check("They aren't a collaborator on it", "fake-sync-creator" not in collaborators(host, repo), str(collaborators(host, repo)))
     check("They can't push", not can_push(host, "fake-sync-creator", token, repo, "after"))
     check("They can't clone", not can_clone(host, "fake-sync-creator", token, repo))
     check("Their account still works, for public repos", forgejo_api(host, token, "GET", "/user")[0] == 200)
     check("A colleague on the team isn't affected", can_push(host, "fake-sync-colleague", colleague_token, repo, "colleague-after"))
 
+    # An ordinary member holds no team, whatever a made-up installation loaded beside this
+    # gives the board, such as a seat on an extended board.
     mover, token = git_person(host, "fake-sync-moved", secrets_by_name)
     moved_repo = "fake-sync-moved-repo"
-    check("A Developer who's about to join Board creates a repo", make_repo(host, token, moved_repo))
-    set_groups(email_of("fake-sync-moved"), ["board"])
-    check("On joining Board instead, they can read it", can_clone(host, "fake-sync-moved", token, moved_repo))
+    check("A team's lead creates a repo, and opens it to members", make_repo(host, token, moved_repo) and give_repo(host, token, "members", moved_repo) == 204)
+    give(email_of("fake-sync-moved"), ["member"])
+    check("Once just a member, they can read it", can_clone(host, "fake-sync-moved", token, moved_repo))
     check("...but no longer write to it", not can_push(host, "fake-sync-moved", token, moved_repo, "after"))
     check("...as they aren't a collaborator", "fake-sync-moved" not in collaborators(host, moved_repo), str(collaborators(host, moved_repo)))
 
     admin, token = git_person(host, "fake-sync-admin", secrets_by_name)
     check("Control: an Operator is a Forgejo admin", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is True)
-    set_groups(email_of("fake-sync-admin"), ["member"])
+    give(email_of("fake-sync-admin"), ["member"])
     check("Leaving Operator ends that, with no new sign-in", forgejo_api(host, token, "GET", "/user")[1].get("is_admin") is False)
-    check("...and takes them off the owners", team_names(host, token) == [], str(team_names(host, token)))
+    check("...and takes them off the owners", team_names(host, token) == ["members"], str(team_names(host, token)))
 
 
 def check_git_offboarding(host, operator, secrets_by_name):
@@ -2279,6 +2366,7 @@ def check_git_offboarding(host, operator, secrets_by_name):
     repo = "fake-sync-leaver-repo"
     raw = f"/{org}/{repo}/raw/branch/main/secret.txt"
     check("They create a repo", make_repo(host, token, repo))
+    check("...and give it to their team", give_repo(host, token, FAKE_TEAM, repo) == 204)
     check("Control: their token reaches the API", forgejo_api(host, token, "GET", "/user")[0] == 200)
     check("Control: their token works with Git", can_clone(host, "fake-sync-leaver", token, repo))
     check("Control: their open session shows the settings page", leaver.in_git())
@@ -2308,8 +2396,7 @@ def check_git_offboarding(host, operator, secrets_by_name):
     check("They can't log in to core", not fresh.app.logged_in())
     account = git_account(host, email)
     check("Forgejo has them blocked", account["prohibit_login"] is True, str(account["prohibit_login"]))
-    developers = next(t for t in forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{org}/teams")[1] if t["name"] == "developers")
-    check("They're off the team", forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/teams/{developers['id']}/members/fake-sync-leaver")[0] == 404)
+    check("They're off their teams", all(forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/teams/{team_id(host, name)}/members/fake-sync-leaver")[0] == 404 for name in LEAD_TEAMS))
     check("They aren't a collaborator on what they created", "fake-sync-leaver" not in collaborators(host, repo), str(collaborators(host, repo)))
 
     status = admin_page_set_active(operator, email, True)
@@ -2317,7 +2404,7 @@ def check_git_offboarding(host, operator, secrets_by_name):
     took = wait_for(lambda: forgejo_api(host, token, "GET", "/user")[0] == 200)
     check("...and so does their token", took is not None)
     wait_for_sync()
-    check("...and they're back on the team", team_names(host, token) == ["developers"], str(team_names(host, token)))
+    check("...and they're back on their teams", team_names(host, token) == LEAD_TEAMS, str(team_names(host, token)))
     check("...but not back as a collaborator, as the team is what gives them access", "fake-sync-leaver" not in collaborators(host, repo), str(collaborators(host, repo)))
     fresh = Person(host)
     fresh.log_in_to_core(email)
@@ -2422,7 +2509,7 @@ def follow_ups(email):
 
 
 def check_vault_offboarding(host, operator, secrets_by_name):
-    section("Vaultwarden: leaving a group")
+    section("Vaultwarden: leaving the board")
     clear_vault_limits()
     owner = vault_person(host, "fake-vsync-owner", secrets_by_name)
     owner_email = email_of("fake-vsync-owner")
@@ -2438,9 +2525,9 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     check("Control: they're in the organisation", org in joined, str(joined))
     check("Control: their token reaches the API", removed.in_vault())
     check("Control: it can be refreshed", removed.refresh()[0] == 200)
-    set_groups(email, ["member"], wait=False)
+    give(email, ["member"], wait=False)
     took = wait_for(lambda: not removed.in_vault())
-    check("Leaving the groups ends their token, even used by hand", took is not None)
+    check("Leaving the board ends their token, even used by hand", took is not None)
     print(f"  info  It took {took} seconds.")
     wait_for_sync()
     check("...and refreshing it", removed.refresh()[0] != 200)
@@ -2448,20 +2535,20 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     reached, answer = removed.click_sign_in()
     check("Signing in again shows them they have no access", answer.status == 403 and removed.code is None, f"{reached} {answer.status}")
     check("A follow-up asks for the shared passwords to change", len(follow_ups(email)) == 1 and org_name in follow_ups(email)[0][0], str(follow_ups(email)))
-    set_groups(email, ["board"])
+    give(email, ["board"])
     check("Coming back turns them on again", vault_enabled_flag(email) is True)
     status, _ = removed.sign_in()
     check("...and they can sign in", status == 200, str(status))
     check("...to the same account", vault_account(email) == account)
     check("...and asking again doesn't repeat the follow-up", len(follow_ups(email)) == 1, str(follow_ups(email)))
     # With that one still open. A second note mustn't get in the way of turning them off.
-    set_groups(email, ["member"], wait=False)
+    give(email, ["member"], wait=False)
     took = wait_for(lambda: not removed.in_vault())
     check("Leaving again ends their token again", took is not None)
     wait_for_sync()
     check("...with Vaultwarden turning them off", vault_enabled_flag(email) is False)
     check("...and still the one follow-up", len(follow_ups(email)) == 1, str(follow_ups(email)))
-    set_groups(email, ["board"])
+    give(email, ["board"])
 
     section("Vaultwarden: offboarding")
     clear_vault_limits()
@@ -2500,13 +2587,14 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     board = Browser(host)
     board.log_in(owner_email)
     board.enter_code(totp(secrets_by_name["fake-vsync-owner"], 1))  # each code works once, and they've just used this one
-    index = board.get("/admin/").text
-    check("Board sees it on the admin page", f"{email} could see them" in html.unescape(index))
-    check("...and in its list", org_name in board.get("/admin/accounts/followup/").text)
+    index = operator.get("/admin/").text
+    check("Operators see it on the admin page", f"{email} could see them" in html.unescape(index))
+    check("...and in its list", org_name in operator.get("/admin/accounts/followup/").text)
+    check("The board doesn't, as the admin page is Operators' only", board.follow("/admin/accounts/followup/")[0].status == 403)
     member = Browser(host)
     member.log_in(email_of("fake-vsync-member"))
     check("A Member doesn't", member.get("/admin/accounts/followup/").status != 200)
-    check("Nobody can add one by hand", board.get("/admin/accounts/followup/add/").status == 403)
+    check("Nobody can add one by hand", operator.get("/admin/accounts/followup/add/").status == 403)
 
     # What a person does: the owner changes the entry and removes them from the organisation.
     status, _ = owner.api("PUT", f"/api/ciphers/{entry}", {"type": 2, "name": VAULT_KEY, "organizationId": org, "encryptedFor": owner_id, "secureNote": {"type": 0}, "notes": VAULT_KEY.replace("bm90LXJlYWw=", "Y2hhbmdlZA==", 1)})
@@ -2514,15 +2602,15 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     status, _ = owner.api("DELETE", f"/api/organizations/{org}/users/{member_id}")
     check("...and remove them from the organisation, though their account is off", status == 200, str(status))
     pk = core_db("select id from accounts_followup where about = ?", email)[0][0]
-    page = board.get("/admin/accounts/followup/")
+    page = operator.get("/admin/accounts/followup/")
     token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text)
-    done = board.send("POST", "/admin/accounts/followup/", [("csrfmiddlewaretoken", token.group(1) if token else ""), ("action", "mark_done"), ("_selected_action", str(pk))])
-    check("...and mark the follow-up done", done.status == 302, str(done.status))
+    done = operator.send("POST", "/admin/accounts/followup/", [("csrfmiddlewaretoken", token.group(1) if token else ""), ("action", "mark_done"), ("_selected_action", str(pk))])
+    check("An Operator marks the follow-up done", done.status == 302, str(done.status))
     closed = follow_ups(email)[0]
-    board_pk = core_db("select id from accounts_user where email = ?", owner_email)[0][0]
-    check("It records when and who", closed[1] is not None and closed[2] == board_pk, str(closed))
-    check("...and it's no longer shown as to do", f"{email} could see them" not in html.unescape(board.get("/admin/").text))
-    check("...while another that's still open is", f"{email_of('fake-vsync-removed')} could see them" in html.unescape(board.get("/admin/").text))
+    operator_pk = core_db("select id from accounts_user where email = ?", email_of("fake-operator"))[0][0]
+    check("It records when and who", closed[1] is not None and closed[2] == operator_pk, str(closed))
+    check("...and it's no longer shown as to do", f"{email} could see them" not in html.unescape(operator.get("/admin/").text))
+    check("...while another that's still open is", f"{email_of('fake-vsync-removed')} could see them" in html.unescape(operator.get("/admin/").text))
 
     status = admin_page_set_active(operator, email, True)
     wait_for_sync()
@@ -2540,13 +2628,13 @@ def check_vault_offboarding(host, operator, secrets_by_name):
     email = email_of("fake-vsync-solo")
     solo = vault_person(host, "fake-vsync-solo", secrets_by_name)
     vault_org(solo, email, "Fake solo organisation")
-    set_groups(email, ["member"])
+    give(email, ["member"])
     text = " ".join(item[0] for item in follow_ups(email))
     check("Losing an organisation's only owner says so", "only owner" in text and "Fake solo organisation" in text, text)
     email = email_of("fake-vsync-co")
     co = vault_person(host, "fake-vsync-co", secrets_by_name)
     vault_member(owner, org, email, kind=0)
-    set_groups(email, ["member"])
+    give(email, ["member"])
     text = " ".join(item[0] for item in follow_ups(email))
     check("One owner of two leaving doesn't", text and "only owner" not in text, text)
 
@@ -2565,11 +2653,11 @@ user.save()
     wait_for_sync()
     check("Control: Vaultwarden keeps their old address, and they're still in", vault_account(old_address) is not None and renamed.in_vault())
     in_core(
-        f"""
+        GIVE
+        + f"""
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 user = get_user_model().objects.create_user({old_address!r}, {PASSWORD!r})
-user.groups.set(Group.objects.filter(role__key="board"))
+give(user, ["board"])
 user.is_active = False
 user.save()
 """
@@ -2773,6 +2861,80 @@ def public_vault_status(host, token):
     return person.api("GET", "/api/sync")[0]
 
 
+TREE = f"""
+from django.contrib.auth import get_user_model
+from structure.models import Membership, Position, Unit
+
+User = get_user_model()
+
+
+def person(name):
+    return User.objects.get(email=name + "@example.org").person
+
+
+def association():
+    found = Unit.objects.filter(key={FAKE_ASSOCIATION!r}).first()
+    return found or Unit.objects.create(kind="association", key={FAKE_ASSOCIATION!r}, name="Fake association", parent=Unit.objects.root())
+
+
+def chair(name):
+    who = person(name)
+    if not Membership.objects.current().filter(person=who, association=association()).exists():
+        Membership.objects.create(person=who, association=association())
+    for last in Position.objects.current().filter(unit=association(), role="chair"):
+        last.end_on()  # the handover, today
+    Position.objects.create(person=who, unit=association(), role="chair")
+
+
+def lead_a_project(name):
+    project = Unit.objects.create(kind="team", key={FAKE_PROJECT!r}, name="Fake project", parent=Unit.objects.root())
+    Position.objects.create(person=person(name), unit=project, role="lead")
+
+
+def archive_the_project():
+    Unit.objects.get(key={FAKE_PROJECT!r}).archive()
+"""
+
+
+def owners_of(host, org):
+    token = sync_env()["FORGEJO_ADMIN_TOKEN"]
+    status, teams = forgejo_api(host, token, "GET", f"/orgs/{org}/teams")
+    owners = next((team for team in teams if team["name"] == "Owners"), None) if status == 200 else None
+    return sorted(member["login"] for member in forgejo_api(host, token, "GET", f"/teams/{owners['id']}/members")[1]) if owners else []
+
+
+def check_git_tree(host, secrets_by_name):
+    """structure.md §5: an association inside the installation's gets its own organisation,
+    its chair owns it, and an archived project's people lose its repos."""
+    section("Forgejo: an association and its chair")
+    _, first = git_person(host, "fake-tree-chair", secrets_by_name)
+    _, second = git_person(host, "fake-tree-next", secrets_by_name)
+    in_core(TREE + "chair('fake-tree-chair')")
+    took = wait_for(lambda: "fake-tree-chair" in owners_of(host, FAKE_ASSOCIATION))
+    check("A chair of an association inside it owns its own organisation, with no new sign-in", took is not None, str(owners_of(host, FAKE_ASSOCIATION)))
+    print(f"  info  It took {took} seconds.")
+    made = forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/orgs/{FAKE_ASSOCIATION}")[1] or {}
+    check("...which core made, and marked as its own", (made.get("description") or "").startswith("Kept in step with core."), str(made.get("description")))
+    check("...and they read its members' repos", "members" in [t["name"] for t in forgejo_api(host, first, "GET", "/user/teams")[1] if t["organization"]["username"] == FAKE_ASSOCIATION])
+    in_core(TREE + "chair('fake-tree-next')")
+    took = wait_for(lambda: owners_of(host, FAKE_ASSOCIATION) == sorted(["fake-tree-next", FORGEJO_SERVICE_USER]))
+    check("A new chair gets the organisation's admin, and the last one loses it", took is not None, str(owners_of(host, FAKE_ASSOCIATION)))
+    print(f"  info  It took {took} seconds.")
+
+    section("Forgejo: an archived project")
+    lead, token = git_person(host, "fake-tree-lead", secrets_by_name)
+    in_core(TREE + "lead_a_project('fake-tree-lead')")
+    wait_for_sync()
+    repo = "fake-project-repo"
+    check("A project's lead creates a repo", make_repo(host, token, repo))
+    check("...and gives it to the project", give_repo(host, token, FAKE_PROJECT, repo) == 204)
+    in_core(TREE + "archive_the_project()")
+    took = wait_for(lambda: forgejo_api(host, token, "GET", f"/repos/{org_of(host)}/{repo}")[0] == 404)
+    check("Archiving the project takes its repos away from its people within seconds", took is not None)
+    print(f"  info  It took {took} seconds.")
+    check("...and the project's team stays, with its repo", repo in [r["name"] for r in forgejo_api(host, sync_env()["FORGEJO_ADMIN_TOKEN"], "GET", f"/teams/{team_id(host, FAKE_PROJECT)}/repos")[1]])
+
+
 def check_access_table(host, operator, secrets_by_name):
     """Both tools together, as some of this takes core itself down."""
     check_sync_exposure(host)
@@ -2782,6 +2944,8 @@ def check_access_table(host, operator, secrets_by_name):
     check_git_groups_now(host, operator, secrets_by_name)
     clear_limits()
     check_git_offboarding(host, operator, secrets_by_name)
+    clear_limits()
+    check_git_tree(host, secrets_by_name)
     clear_limits()
     check_worker_down(host, operator, secrets_by_name)
     clear_limits()
@@ -3336,12 +3500,21 @@ def cleanup():
         f"""
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.db.models import Q
 from accounts.models import FollowUp
+from structure.models import Membership, Person, Position, Unit, _erase
+units = Unit.objects.filter(key__in={[FAKE_TEAM, FAKE_PROJECT, FAKE_ASSOCIATION]!r})
+fake = list(Person.objects.filter(Q(emails__address__startswith="fake-") | Q(user__email__in={FAKE_OTHER!r}) | Q(positions__unit__in=units) | Q(memberships__association__in=units)).distinct().values_list("pk", flat=True))
+print(_erase(Position.objects.filter(person__in=fake, seat_rule__isnull=False)))  # seats first, as they point at their source
+print(_erase(Position.objects.filter(Q(person__in=fake) | Q(unit__in=units))))
+print(_erase(Membership.objects.filter(Q(person__in=fake) | Q(association__in=units))))
+print(units.delete())
 print(FollowUp.objects.filter(about__startswith="fake-", about__endswith="@example.org").delete())
 print(FollowUp.objects.filter(about__startswith="A deleted account").delete())
 print(get_user_model().objects.filter(email__startswith="fake-", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__startswith="nobody", email__endswith="@example.org").delete())
 print(get_user_model().objects.filter(email__in={FAKE_OTHER!r}).delete())
+print(_erase(Person.objects.filter(pk__in=fake, user__isnull=True)))  # whose account went during the checks
 cache.clear()
 """
     )
@@ -3352,9 +3525,11 @@ cache.clear()
     kit("tool", "remove", FAKE_TOOL)
     print(f"Fake tool left: {FAKE_TOOL in kit('tool', 'list').stdout}")
     remaining = in_core(
-        'from django.contrib.auth import get_user_model; print(get_user_model().objects.filter(email__endswith="@example.org").count())'
+        'from django.contrib.auth import get_user_model; print(get_user_model().objects.filter(email__startswith="fake-").count())'
     )
     print(f"Fake users left: {remaining}")
+    people = in_core('from structure.models import Person; print(Person.objects.filter(emails__address__startswith="fake-").count())')
+    print(f"Fake people left: {people}")
 
 
 def main():

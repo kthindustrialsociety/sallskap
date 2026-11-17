@@ -22,6 +22,15 @@ A section is never edited once its release is tagged. A mistake is put right in 
   ```
 
   The key is short, lowercase letters, digits and single hyphens, such as your association's usual abbreviation. Tools will know your association by it, so **it can never change.** If you forgot, the update says so: add them, then run `kit update --finish`.
+- **Write down who is in each group before you update.** Access now comes from memberships and positions, and Operator is the only group. The update removes the Board, Treasurer, Events, Developer and Member groups, and any group made by hand, along with who was in them. Afterwards, record those people in the admin page, under People:
+  - a membership of your association for each member;
+  - the board's positions on your association, chair included;
+  - a team for what Events and Developer were for, with its lead and participants.
+
+  Until you do, they lose what the groups gave them: the vault, Forgejo's board team, and the admin page. Operators keep everything.
+- **The admin page is for Operators only now.** Board members no longer reach it, and the vault's follow-ups go to Operators. The board's own pages come in a later release.
+- **If Git is on, refresh Forgejo's sign-in after updating,** so it maps your association's chair and vice chair the way core does: run `kit tool remove forgejo`, then `kit enable git`. Signing in to Forgejo doesn't work between the two. Forgejo's old developers team is left as it was, and nobody is added to it any more: give its people a team in core, then delete it in Forgejo.
+- **A tool you limited with `kit tool add --group`** to developer, events or a group made by hand lets nobody in now. Remove it with `kit tool remove`, then add it again with the keys you want, such as `board` or `website:lead`. The vault needs nothing: it already uses `board` and `operator`.
 
 ### Tool versions
 
@@ -30,24 +39,31 @@ A section is never edited once its release is tagged. A mistake is put right in 
 ### Changes
 
 - feat: units, the tree of associations and teams (structure.md §1).
-  - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. Operators add teams, projects and associations inside it in the admin page, under Units. Board can see them.
+  - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. Operators add teams, projects and associations inside it in the admin page, under Units.
   - A unit's key is fixed once set and never reused. A project is archived by hand, which archives everything inside it.
-  - Nothing is visible to members yet, and nobody's access changes.
+  - Nothing is visible to members yet.
   - `kit init` now asks for the association's name and key.
 - feat: people, and the ties between them and units (structure.md §2 and §3).
   - Every account becomes a person, with its name and its address, marked verified. Accounts themselves don't change, so neither does anything the tools see.
-  - Operators add people, memberships, positions and reasons in the admin page, under People, and Board can see them. Ties are ended, never deleted, so the record of who held what is kept.
+  - Operators add people, memberships, positions and reasons in the admin page, under People. Ties are ended, never deleted, so the record of who held what is kept.
   - Only members hold board roles or lead teams, and membership of an association counts for every association above it.
   - When an account's address is changed, the old one stays on its person, unverified, so it can be given to someone else, such as a role's shared address.
-  - Nobody's access changes yet: the groups stay as they are until access is worked out from positions.
 - feat: authority, and grants (structure.md §4).
   - One check decides what each role can do, and in which units, from current positions and grants. Nothing but grants uses it yet: the admin page's changes, the member pages and the CLI move to it later.
-  - Operators give and end grants in the admin page, under Grants, and Board can see them. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
-  - **Two-factor authentication is required for anyone with a board role in any association,** from the day the position is recorded, as well as for the Board, Treasurer and Operator groups as before. Someone given a board role is asked to set it up before the admin page or any tool lets them in.
+  - Operators give and end grants in the admin page, under Grants. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
+  - **Two-factor authentication is required for anyone with a board role in any association,** from the day the position is recorded, as well as for Operators as before. Someone given a board role is asked to set it up before any tool lets them in.
 - feat: seat rules, for posts that come with another (structure.md §4).
-  - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. Operators set and end rules in the admin page, under Seat rules, and Board can see them. A rule is only accepted from someone who could appoint in that unit.
+  - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. Operators set and end rules in the admin page, under Seat rules. A rule is only accepted from someone who could appoint in that unit.
   - Core gives each seat itself, as a position, from the day the position it comes from starts, and ends it when that position or the rule ends. A seat gives what its role gives, grants and two-factor authentication included, and stays in the record when it ends. It can't be set, changed or ended by hand.
-  - Nobody's access in the tools changes yet, as for every other position.
+- feat: keys to the tools, worked out from memberships and positions (structure.md §5).
+  - Tools are told keys: `<unit>:<role>` for each position, seats included, and `<association>:member` for each association someone is a member of, counting upwards. `member`, `board` (a board role on your association), `treasurer` (its treasurer) and `operator` are the same in every installation, for modules to use. Only current ties in units that aren't archived count, and keys from roles that need two-factor authentication wait until it's set up.
+  - A change to a membership, a position, a seat or the tree reaches the tools within seconds, so archiving a project ends its people's access at once. Ties that start or end on a day with no change, such as a board taking office on 1 July, are picked up just after midnight.
+  - The worker takes the newest change each time, so one made while it goes over everyone, as it does after a restart, goes next rather than after the people it had already picked up.
+  - Operator is the only group. The admin page is for Operators only, and each account's page there shows its keys.
+  - `kit tool add --group` takes any key, such as `robotics:chair` or `website:lead`.
+  - Forgejo: each association gets an organisation, yours being the one named after your domain. A team gets a Forgejo team its people write to, and `<team>.lead`, from which its leads administer the team's repos and create new ones. Each organisation has a `members` team, which reads the repos a lead opens to it, and its association's chair and vice chair own it. Core makes these when someone first needs them, and leaves anything made by hand alone. See modules/git/README.md.
+  - The unit key `custom` is no longer reserved.
+  - `tests/live_check.py` gives its fake people memberships and positions instead of groups.
 - fix: `tests/live_check.py` turns off its fake people's own Forgejo 2FA before removing them. Removing them left the 2FA behind, so on a test server Forgejo's own check warned of one more orphaned 2FA record after every run. A test server with those warnings can clear them once with `docker exec sallskap-forgejo-1 forgejo doctor check --run check-db-consistency --fix`.
 
 ## 0.7.2 (2026-11-10)

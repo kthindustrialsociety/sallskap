@@ -37,9 +37,11 @@ class Command(BaseCommand):
         self.stdout.write(f"Telling these tools about changes: {', '.join(c.tool for c in connectors) or 'none yet'}")
         sync.request_for_everyone()
         next_pass = timezone.now() + EVERYONE_EVERY
+        day = timezone.localdate()
         while True:
             close_old_connections()
             ALIVE.touch()
+            day = sync.new_day(day)  # just after midnight: ties starting or ending today
             worked = sync.run_once(connectors, tick=ALIVE.touch)
             if once and not worked:
                 return

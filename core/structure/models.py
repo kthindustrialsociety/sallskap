@@ -17,9 +17,6 @@ from django.utils.translation import gettext_lazy as _
 # Lowercase letters, digits and single hyphens, from a letter to a letter or digit, at
 # most 40 characters: what every tool accepts as a name. kit/kit.py checks the same.
 KEY = r"^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$"
-# Tools already see groups made by hand as custom:<name> (User.group_keys), so a unit
-# called custom would give keys such as custom:lead that look like one of those.
-RESERVED_KEYS = {"custom"}
 
 
 def validate_key(key):
@@ -28,8 +25,6 @@ def validate_key(key):
             _("%(key)s isn't a valid key. Use lowercase letters, digits and single hyphens, starting with a letter and ending with a letter or digit, at most 40 characters."),
             params={"key": repr(key)},
         )
-    if key in RESERVED_KEYS:
-        raise ValidationError(_("The key %(key)s is reserved."), params={"key": key})
 
 
 colour = RegexValidator(r"^#[0-9a-fA-F]{6}$", _("Write a colour as # and six hex digits, such as #1a5fb4."))
@@ -96,7 +91,7 @@ class Unit(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(kind__in=["association", "team"]), name="unit_kind_is_known"),
             models.CheckConstraint(
-                condition=models.Q(key__regex=KEY) & ~models.Q(key__contains="--") & ~models.Q(key__in=RESERVED_KEYS),
+                condition=models.Q(key__regex=KEY) & ~models.Q(key__contains="--"),
                 name="unit_key_is_valid",
             ),
             # Exactly one root: at most one unit with no parent, and it's an association.
@@ -236,9 +231,12 @@ class Unit(models.Model):
                 problems = self.membership_problems() + SeatRule.problems_after_moving()
                 if problems:  # rolls the move back
                     raise ValidationError(problems)
+                from .access import in_units, tell_tools
                 from .seats import after_tree_changed
 
                 after_tree_changed(SeatRule.objects.filter(each_association_under=True))  # associations moved in or out of reach
+                # What they're members of, and where a tool puts their teams, can change.
+                tell_tools(in_units(Unit.objects.filter(path__startswith=self.path)))
 
     # ---- Archiving and deleting --------------------------------------------------
 
@@ -248,14 +246,18 @@ class Unit(models.Model):
             raise ValidationError(_("Only teams are archived. %(unit)s is an association.") % {"unit": self})
         from .seats import after_tree_changed
 
+        from .access import in_units, tell_tools
+
         now = timezone.now()
         with transaction.atomic():
             Unit.objects.filter(path__startswith=self.path, archived_at__isnull=True).update(archived_at=now)
             self.archived_at = self.archived_at or now
             after_tree_changed(SeatRule.objects.filter(held_in__path__startswith=self.path))  # a position in an archived team gives no seat
+            tell_tools(in_units(Unit.objects.filter(path__startswith=self.path)))  # their keys from here end now
 
     def unarchive(self):
         """Brings back this team alone. The ones under it stay archived until brought back too."""
+        from .access import in_units, tell_tools
         from .seats import after_tree_changed
 
         if self.parent and self.parent.archived:
@@ -264,6 +266,7 @@ class Unit(models.Model):
             Unit.objects.filter(pk=self.pk).update(archived_at=None)
             self.archived_at = None
             after_tree_changed(SeatRule.objects.filter(models.Q(held_in=self) | models.Q(unit=self)))
+            tell_tools(in_units(Unit.objects.filter(pk=self.pk)))
 
     def deletion_problem(self):
         """Why this unit can't be deleted, or None. A unit is deleted only if nothing
@@ -387,11 +390,18 @@ class Person(models.Model):
         return address.address if address else _("Person %(id)s") % {"id": self.pk}
 
     def save(self, *args, **kwargs):
+        stored = Person.objects.filter(pk=self.pk).values("user").first() if self.pk else None
         super().save(*args, **kwargs)
         user = self.user
         if user is not None and user.name != self.name:  # the tools read the account's name
             user.name = self.name
             user.save(update_fields=["name"])
+        if stored is not None and stored["user"] != self.user_id:  # ties moved to or from an account
+            from accounts import sync
+            from django.contrib.auth import get_user_model
+
+            for account in get_user_model().objects.filter(pk__in=[stored["user"], self.user_id]):
+                sync.request_for(account)
 
     def deletion_problem(self):
         if self.user_id:
@@ -468,6 +478,9 @@ class Person(models.Model):
         kept.name = kept.name or gone.name
         kept.save()
         _erase(Person.objects.filter(pk=gone.pk))
+        from .access import tell_tools
+
+        tell_tools(Person.objects.filter(pk=kept.pk))  # their ties moved over
         return kept
 
 
@@ -706,6 +719,11 @@ class Membership(Tie):
             problems += self._positions_resting_on_it()
         return problems
 
+    def after_save(self):
+        from .access import tell_tools
+
+        tell_tools(Person.objects.filter(pk=self.person_id))
+
     def _positions_resting_on_it(self):
         """A membership can't end while a board role or lead rests on it."""
         problems = []
@@ -823,6 +841,9 @@ class Position(Tie):
                 chair.end_on(self.start)
 
     def after_save(self):
+        from .access import tell_tools
+
+        tell_tools(Person.objects.filter(pk=self.person_id))  # seats too: they give keys like any position
         if not self.is_seat():
             from .seats import after_position_saved
 

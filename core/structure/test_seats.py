@@ -734,11 +734,11 @@ class AdminPage(Federation):
         self.assertEqual({s.end for s in seats()}, {TODAY})
         self.assertEqual(self.client.post(reverse("admin:structure_seatrule_delete", args=[r.pk]), {"post": "yes"}).status_code, 403)
 
-    def test_board_sees_rules_and_cannot_set_them(self):
+    def test_the_board_cannot_reach_rules_until_its_own_pages(self):
         self.a_rule()
         self.enter("board")
-        self.assertEqual(self.client.get(reverse("admin:structure_seatrule_changelist")).status_code, 200)
-        self.assertEqual(self.client.post(reverse("admin:structure_seatrule_add"), self.form()).status_code, 403)
+        self.assertEqual(self.client.get(reverse("admin:structure_seatrule_changelist"), follow=True).status_code, 403)
+        self.assertEqual(self.client.post(reverse("admin:structure_seatrule_add"), self.form(), follow=True).status_code, 403)
         self.assertEqual(SeatRule.objects.count(), 1)
 
     def test_a_seat_is_shown_and_never_changed(self):

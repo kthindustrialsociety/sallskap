@@ -683,11 +683,11 @@ class AdminPage(Tree):
         self.assertEqual(Person.objects.filter(name="Bo").count(), 1)
         self.assertTrue(Person.objects.get(name="Bo").is_member(self.robotics))
 
-    def test_board_sees_people_but_cannot_change_them(self):
+    def test_the_board_cannot_reach_people_until_its_own_pages(self):
         self.enter("board")
-        self.assertEqual(self.client.get(reverse("admin:structure_person_changelist")).status_code, 200)
-        self.assertEqual(self.client.get(reverse("admin:structure_position_changelist")).status_code, 200)
-        response = self.client.post(reverse("admin:structure_person_add"), {"name": "Bo", "emails-TOTAL_FORMS": "0", "emails-INITIAL_FORMS": "0"})
+        self.assertEqual(self.client.get(reverse("admin:structure_person_changelist"), follow=True).status_code, 403)
+        self.assertEqual(self.client.get(reverse("admin:structure_position_changelist"), follow=True).status_code, 403)
+        response = self.client.post(reverse("admin:structure_person_add"), {"name": "Bo", "emails-TOTAL_FORMS": "0", "emails-INITIAL_FORMS": "0"}, follow=True)
         self.assertEqual(response.status_code, 403)
 
     def test_a_member_sees_nothing(self):
