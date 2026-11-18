@@ -315,8 +315,9 @@ class _Builder:
             EmailAddress.objects.create(person=person, address=who.email, verified_at=timezone.now())
         # As if added when their first tie started, as they would have been, so that the 30
         # days after someone is added don't keep anyone with nothing left (deleting.py).
-        first = min(tie.start for tie in (*who.memberships, *who.positions, *who.reasons))
-        Person.objects.filter(pk=person.pk).update(created_at=timezone.make_aware(datetime.combine(first, time(12))))
+        first = min((tie.start for tie in (*who.memberships, *who.positions, *who.reasons)), default=None)
+        if first is not None:  # someone with no ties is added today
+            Person.objects.filter(pk=person.pk).update(created_at=timezone.make_aware(datetime.combine(first, time(12))))
         self.people[who.email] = person
         return person
 

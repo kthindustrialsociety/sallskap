@@ -24,20 +24,20 @@ from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 from django.utils.translation import gettext as _
 
-from .models import AuditEntry, Grant, Membership, Person, Position, Reason, SeatRule, _erase, _today
+from .models import AuditEntry, EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, _erase, _today
 
 logger = logging.getLogger(__name__)
 
 GRACE = timedelta(days=30)
 # What a run's row counts, in this order.
 COUNTS = ("people", "addresses", "memberships", "reasons", "positions_kept", "grants_given", "seat_rules_made", "failed")
-# Each kind of tie, by the field that says when it ends. Sign-ups and subscriptions join
-# these when they're built.
-TIES = ((Membership, "end"), (Position, "end"), (Reason, "expires"))
+# Each kind of tie a person can have. Sign-ups and subscriptions join these when they're built.
+TIES = (Membership, Position, Reason)
 
 
-def _ending_after(model, end, day):
+def _ending_after(model, day):
     """Ties of this kind that still hold after `day`: open, or ending later."""
+    end = model.end_field
     return model.objects.filter(Q(**{f"{end}__isnull": True}) | Q(**{f"{end}__gt": day}))
 
 
@@ -47,8 +47,8 @@ def due(today=None):
     since = today - GRACE  # whatever ended by this day has been over for 30 days
     added_since = timezone.make_aware(datetime.combine(since + timedelta(days=1), time.min))
     people = Person.objects.filter(user__isnull=True).exclude(created_at__gte=added_since)
-    for model, end in TIES:
-        people = people.filter(~Exists(_ending_after(model, end, since).filter(person=OuterRef("pk"))))
+    for model in TIES:
+        people = people.filter(~Exists(_ending_after(model, since).filter(person=OuterRef("pk"))))
     return people.order_by("pk")
 
 
@@ -60,21 +60,19 @@ def forget(person, today=None):
     today = today or _today()
     if person.user_id is not None:
         raise ValidationError(_("%(person)s has an account, so they aren't deleted.") % {"person": person})
-    for model, end in TIES:
-        if _ending_after(model, end, today).filter(person=person).exists():
+    for model in TIES:
+        if _ending_after(model, today).filter(person=person).exists():
             raise ValidationError(_("%(person)s still has a tie or a reason, today or later, so they aren't deleted.") % {"person": person})
-    counts = Counter(
-        people=1,
-        addresses=person.emails.count(),
-        memberships=Membership.objects.filter(person=person).count(),
-        reasons=Reason.objects.filter(person=person).count(),
-    )
+    counts = Counter(people=1)
+    # A name is all that's kept. Someone who gave none is shown as since deleted, as their
+    # address, the only other thing that told them apart, goes.
     counts["positions_kept"] = Position.objects.filter(person=person).update(person=None, kept_name=person.name)
     counts["grants_given"] = Grant.objects.filter(given_by=person).update(given_by=None)
     counts["seat_rules_made"] = SeatRule.objects.filter(made_by=person).update(made_by=None)
-    _erase(Membership.objects.filter(person=person))
-    _erase(Reason.objects.filter(person=person))
-    person.delete()  # with their addresses. It refuses if anything else still points at them
+    counts["memberships"] = _erase(Membership.objects.filter(person=person))[0]
+    counts["reasons"] = _erase(Reason.objects.filter(person=person))[0]
+    deleted = person.delete()[1]  # with their addresses. It refuses if anything else still points at them
+    counts["addresses"] = deleted.get(EmailAddress._meta.label, 0)
     return counts
 
 
@@ -89,6 +87,8 @@ def delete_people(today=None, people=None, via=AuditEntry.Via.CORE):
     if people is not None:
         found = found.filter(pk__in=people)
     counts = Counter(dict.fromkeys(COUNTS, 0))
+    # Core's database takes its write lock as a transaction begins (settings.py), so who's
+    # found here can't change before the run is over.
     with transaction.atomic():
         for person in list(found):
             try:

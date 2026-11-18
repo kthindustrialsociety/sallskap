@@ -385,6 +385,9 @@ def _today():
     return timezone.localdate()
 
 
+# How someone deleted with nothing left is shown where a person was (structure.md §3).
+SINCE_DELETED = _("someone since deleted")
+
 # Set while seats.py saves a seat: Position.save refuses one saved from anywhere else.
 _seating = ContextVar("seating", default=False)
 
@@ -828,7 +831,7 @@ class Position(Tie):
         """Who holds it, or held it: once they're deleted, the name kept on it."""
         if self.person_id is not None:
             return str(self.person)
-        return self.kept_name or str(_("someone since deleted"))
+        return self.kept_name or str(SINCE_DELETED)
 
     def membership_problem(self, on, excluding=None):
         """Why this person can't hold this role here on that day, as a non-member, or None.
@@ -877,7 +880,7 @@ class Position(Tie):
             if stored is None:  # a new chair ends an open one that started before
                 others = others.exclude(start__lt=self.start, end__isnull=True)
             if others.exists():
-                problems.append(_("%(unit)s has one chair at a time, and %(other)s is chair then.") % {"unit": unit, "other": others.first().person})
+                problems.append(_("%(unit)s has one chair at a time, and %(other)s is chair then.") % {"unit": unit, "other": others.first().holder()})
         return problems
 
     def is_seat(self):

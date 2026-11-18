@@ -295,6 +295,11 @@ class Departed(Left):
         with self.assertRaises(ValidationError):
             SeatRule(unit=self.dev, role=Role.PARTICIPANT, from_roles=[Role.TREASURER], held_in=self.robotics, start=TODAY).save()
 
+    def test_a_chair_overlapping_hers_is_refused_by_her_name(self):
+        deleting.delete_people(TODAY)
+        with self.assertRaisesMessage(ValidationError, "and Bodil Example is chair then"):
+            Position(person=self.cleo, unit=self.robotics, role=Role.CHAIR, start=ENDED - timedelta(days=10)).save()
+
     def test_the_tree_can_still_change_around_her_record(self):
         deleting.delete_people(TODAY)
         actions.archive_unit(self.alva, unit=self.dev, via=SERVER)
@@ -458,6 +463,9 @@ class AdminPage(Left):
         self.client.force_login(operator)
         positions = self.client.get(reverse("admin:structure_position_changelist"))
         self.assertContains(positions, "Bodil Example")
+        page = self.client.get(reverse("admin:structure_position_changelist") + "?o=0").content.decode()  # by who holds it, the first column
+        self.assertLess(page.index("Alva Example"), page.index("Bodil Example"))  # in place by the name shown
+        self.assertLess(page.index("Bodil Example"), page.index("Cleo Example"))
         self.assertContains(self.client.get(reverse("admin:structure_position_change", args=[self.chair.pk])), "Bodil Example")
         self.assertContains(self.client.get(reverse("admin:structure_grant_change", args=[self.grant.pk])), "someone since deleted")
         self.assertContains(self.client.get(reverse("admin:structure_seatrule_change", args=[self.seats.pk])), "someone since deleted")

@@ -8,10 +8,11 @@ from django.apps import apps
 from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models.functions import Coalesce
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import gettext
 
-from .models import AuditEntry, EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, Unit, path_and_above
+from .models import SINCE_DELETED, AuditEntry, EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, Unit, path_and_above
 
 
 class Shown:
@@ -204,14 +205,14 @@ class PositionAdmin(TieAdmin):
     def get_fields(self, request, obj=None):
         return (*self.fields, "seat_rule", "seat_from") if obj is not None and obj.is_seat() else self.fields
 
-    @admin.display(description=_("held by"), ordering="person__name")
+    @admin.display(description=_("held by"), ordering=Coalesce("person__name", "kept_name"))
     def holder(self, obj):
         return obj.holder()
 
 
 def _since_deleted(person):
     """Who gave a grant or made a rule, once they may have been deleted (structure.md §3)."""
-    return str(person) if person is not None else gettext("someone since deleted")
+    return str(person) if person is not None else str(SINCE_DELETED)
 
 
 @admin.register(Reason)
@@ -338,7 +339,7 @@ class AuditEntryAdmin(ShownAdmin):
             return str(found)
         if kept is not None:  # they were merged into another, as the merge's own row says
             return gettext("%(person)s, merged since") % {"person": kept}
-        return gettext("someone since deleted")
+        return str(SINCE_DELETED)
 
     @admin.display(description=_("what"))
     def what(self, obj):
