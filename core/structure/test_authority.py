@@ -633,45 +633,25 @@ class MadeUp(TestCase):
 
 
 class AdminPage(Federation):
+    """Grants are given and ended through the actions (test_actions.py). The admin page
+    shows them, to operators alone."""
+
     client_class = CaddyClient
 
     def enter(self, group):
         user, _ = make_user(f"{group}-admin@example.org", [group], two_factor=True)
         self.client.force_login(user)
 
-    def form(self, **fields):
-        return {
-            "permission": "send_mailings", "role": "lead", "held_in": self.u["ops"].pk, "unit": self.u["rob"].pk,
-            "start": "2026-01-01", "end": "", "given_by": self.people["chair@root"].pk, **fields,
-        }
-
-    def test_an_operator_gives_a_grant(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_grant_add"), self.form())
-        self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
-        self.assertEqual(Grant.objects.get().given_by, self.people["chair@root"])
-
-    def test_the_form_refuses_a_giver_without_authority_there(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_grant_add"), self.form(given_by=self.people["treasurer@root"].pk))
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(Grant.objects.exists())
-
-    def test_the_form_offers_only_what_can_be_granted(self):
-        self.enter("operator")
-        page = self.client.get(reverse("admin:structure_grant_add")).content.decode()
-        self.assertIn('value="manage_finances"', page)
-        self.assertNotIn('value="appoint"', page)
-
-    def test_an_operator_ends_a_grant_and_cannot_delete_it(self):
+    def test_an_operator_sees_a_grant_and_cannot_give_end_or_delete_one(self):
         self.enter("operator")
         g = grant(P.SEND_MAILINGS, Role.LEAD, self.u["ops"], self.u["rob"], self.people["chair@root"])
+        self.assertEqual(self.client.get(reverse("admin:structure_grant_change", args=[g.pk])).status_code, 200)
+        self.assertEqual(self.client.get(reverse("admin:structure_grant_add")).status_code, 403)
         self.client.post(reverse("admin:structure_grant_changelist"), {"action": "end_today", "_selected_action": [g.pk]})
-        self.assertEqual(Grant.objects.get().end, TODAY)
+        self.assertIsNone(Grant.objects.get().end)
         self.assertEqual(self.client.post(reverse("admin:structure_grant_delete", args=[g.pk]), {"post": "yes"}).status_code, 403)
 
     def test_the_board_cannot_reach_grants_until_its_own_pages(self):
         self.enter("board")
         self.assertEqual(self.client.get(reverse("admin:structure_grant_changelist"), follow=True).status_code, 403)
-        self.assertEqual(self.client.post(reverse("admin:structure_grant_add"), self.form(), follow=True).status_code, 403)
         self.assertFalse(Grant.objects.exists())
