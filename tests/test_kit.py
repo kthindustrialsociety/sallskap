@@ -119,19 +119,20 @@ class ParseConfig(unittest.TestCase):
         config = kit.parse_config(CONFIG)
         self.assertEqual((config.name, config.key), ("Example Society", "example"))
 
-    def test_name_and_key_can_be_missing_until_core_starts(self):
-        config = kit.parse_config('[association]\ndomain = "a.org"\n')
-        self.assertEqual((config.name, config.key), (None, None))
+    def test_needs_the_associations_name_and_key(self):
+        for given in ("", 'name = "Example"\n', 'key = "example"\n'):
+            with self.subTest(given=given), self.assertRaisesRegex(kit.KitError, "name and key under \\[association\\]"):
+                kit.parse_config(f'[association]\n{given}domain = "a.org"\n')
 
     def test_refuses_a_bad_key(self):
         for key in ('"Example"', '"1example"', '"example-"', '"ex--ample"', f'"{"x" * 41}"', "7"):
             with self.subTest(key=key), self.assertRaisesRegex(kit.KitError, "isn't valid"):
-                kit.parse_config(f'[association]\nkey = {key}\ndomain = "a.org"\n')
+                kit.parse_config(f'[association]\nname = "Example"\nkey = {key}\ndomain = "a.org"\n')
 
     def test_refuses_a_name_on_more_than_one_line(self):
         for name in ('"two\\nlines"', '""', '"   "', f'"{"x" * 101}"', "7"):
             with self.subTest(name=name), self.assertRaisesRegex(kit.KitError, "name must be"):
-                kit.parse_config(f'[association]\nname = {name}\ndomain = "a.org"\n')
+                kit.parse_config(f'[association]\nname = {name}\nkey = "example"\ndomain = "a.org"\n')
 
     def test_reports_toml_errors_plainly(self):
         with self.assertRaisesRegex(kit.KitError, "syntax error"):
@@ -410,14 +411,6 @@ class Core(unittest.TestCase):
         self.assertEqual(json.loads(root.read_text()), {"name": "Example Society", "key": "example"})
         self.assertEqual(root.stat().st_mode & 0o777, 0o644)  # core runs as its own user
 
-    def test_without_name_and_key_core_gets_neither(self):
-        old = kit.parse_config('[association]\ndomain = "example.org"\n')
-        kit.prepare_core(self.paths, old)  # the public sites need core's settings file, and carry on
-        self.assertFalse((self.paths.core_dir / "root.json").exists())
-        self.assertNotIn("SALLSKAP_ROOT_VERSION", self.paths.core_env.read_text())
-        with self.assertRaisesRegex(kit.KitError, "name and key under \\[association\\]"):
-            kit.require_name_and_key(self.paths, old)
-
     def test_a_new_name_changes_cores_settings_so_it_starts_again(self):
         kit.prepare_core(self.paths, self.config)
         before = self.paths.core_env.read_text()
@@ -431,7 +424,7 @@ class Core(unittest.TestCase):
         before = self.paths.core_env.read_text()
         changed = kit.parse_config(CONFIG.replace('key = "example"', 'key = "other"'))
         with self.assertRaisesRegex(kit.KitError, "a key can't change"):
-            kit.require_name_and_key(self.paths, changed)
+            kit.refuse_a_changed_key(self.paths, changed)
         kit.prepare_core(self.paths, changed)
         self.assertEqual(json.loads((self.paths.core_dir / "root.json").read_text())["key"], "example")
         self.assertEqual(self.paths.core_env.read_text().split("SALLSKAP_ROOT_VERSION")[0], before.split("SALLSKAP_ROOT_VERSION")[0])
@@ -552,12 +545,6 @@ class Docker(unittest.TestCase):
     def test_apply_starts_caddy_then_waits_for_core(self):
         self.run_kit("apply")
         self.assertEqual(self.starts(), [["up", "-d", "caddy"], ["up", "-d", "--wait", "core"], ["up", "-d", "--wait", "sync"]])
-
-    def test_apply_without_name_and_key_starts_the_sites_and_not_core(self):
-        self.paths.config.write_text('[association]\ndomain = "example.org"\n')
-        code, _ = self.run_kit("apply")
-        self.assertEqual(code, 1)
-        self.assertEqual(self.starts(), [["up", "-d", "caddy"]])
 
     def test_apply_only_rebuilds_when_asked(self):
         builds = lambda: [call for call in self.calls if call[-2:] == ["build", "core"]]  # noqa: E731
@@ -724,7 +711,7 @@ class Modules(unittest.TestCase):
         self.assertIn("isn't a valid module name", out)
 
     def test_setting_a_module_adds_the_table_and_keeps_comments(self):
-        text = kit.set_module("# keep\n[association]\ndomain = \"a.org\"\n", "demo", True)
+        text = kit.set_module("# keep\n[association]\nname = \"Example\"\nkey = \"example\"\ndomain = \"a.org\"\n", "demo", True)
         self.assertIn("# keep", text)
         self.assertTrue(tomllib.loads(text)["modules"]["demo"])
 

@@ -56,7 +56,7 @@ NEEDS_NAME_AND_KEY = (
     "The config file needs the association's name and key under [association], such as\n\n"
     '  name = "Example Society"\n  key  = "example"\n\n'
     "The key is short, lowercase, and fixed for good: tools know the association by it. "
-    "Add both to {config}, then run this again."
+    "Add both, then run this again."
 )
 
 
@@ -142,8 +142,8 @@ class Config:
     sites: tuple[Site, ...] = field(default_factory=tuple)
     modules: tuple[str, ...] = ()
     backup_target: str | None = None
-    name: str | None = None  # needed before core starts: see require_name_and_key
-    key: str | None = None
+    name: str = ""  # the association's, from the config, which needs both
+    key: str = ""
 
     def hostnames(self) -> list[str]:
         return [n for s in self.sites for n in (s.domain, *s.redirects)]
@@ -199,7 +199,9 @@ def parse_config(text: str) -> Config:
     if primary is None:
         raise KitError("The config file needs a domain under [association].")
     primary = _check_hostname(primary, "Primary domain")
-    root_name, root_key = _check_name_and_key(raw["association"].get("name"), raw["association"].get("key"))
+    if raw["association"].get("name") is None or raw["association"].get("key") is None:
+        raise KitError(NEEDS_NAME_AND_KEY)
+    root_name, root_key = _check_name_and_key(raw["association"]["name"], raw["association"]["key"])
 
     sites = []
     for entry in raw.get("website", {}).get("sites", []):
@@ -251,25 +253,20 @@ def parse_config(text: str) -> Config:
     return config
 
 
-def _check_name_and_key(name, key) -> tuple[str | None, str | None]:
-    if name is not None:
-        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100 or any(ord(c) < 32 for c in name):
-            raise KitError("Under [association], name must be the association's name, on one line, at most 100 characters.")
-        name = name.strip()
-    if key is not None:
-        if not isinstance(key, str) or not UNIT_KEY.fullmatch(key) or "--" in key:
-            raise KitError(
-                f"Under [association], the key {key!r} isn't valid. Use lowercase letters, digits and single hyphens, "
-                "starting with a letter and ending with a letter or digit, at most 40 characters, such as \"example\"."
-            )
-    return name, key
+def _check_name_and_key(name, key) -> tuple[str, str]:
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100 or any(ord(c) < 32 for c in name):
+        raise KitError("Under [association], name must be the association's name, on one line, at most 100 characters.")
+    if not isinstance(key, str) or not UNIT_KEY.fullmatch(key) or "--" in key:
+        raise KitError(
+            f"Under [association], the key {key!r} isn't valid. Use lowercase letters, digits and single hyphens, "
+            "starting with a letter and ending with a letter or digit, at most 40 characters, such as \"example\"."
+        )
+    return name.strip(), key
 
 
-def require_name_and_key(paths: Paths, config: Config) -> None:
-    """Before core starts. Older configs have neither, and a key can't change, as tools
-    know the association by it. Core refuses a changed key too, but only as it starts."""
-    if not config.name or not config.key:
-        raise KitError(NEEDS_NAME_AND_KEY.format(config=paths.config))
+def refuse_a_changed_key(paths: Paths, config: Config) -> None:
+    """Before core starts: a key can't change, as tools know the association by it. Core
+    refuses a changed key too, but only as it starts."""
     given = _root_given_to_core(paths)
     if given and given.get("key") != config.key:
         raise KitError(
@@ -460,16 +457,15 @@ def prepare_core(paths: Paths, config: Config) -> None:
     a new signing key would make every tool stop trusting the login service.
 
     Core creates the association's root unit from the config's name and key, which it
-    reads from root.json as it starts. They're left out until the config has both and
-    the key is unchanged: apply refuses to start core before then (require_name_and_key),
-    while the public sites carry on."""
+    reads from root.json as it starts. They're left out if the key has changed: apply
+    refuses to start core then (refuse_a_changed_key), while the public sites carry on."""
     current = _read_env(paths.core_env)
     key = current.get("DJANGO_SECRET_KEY") or secrets.token_urlsafe(50)
     signing_key = current.get("OIDC_SIGNING_KEY") or _new_signing_key()
     text = f"SALLSKAP_DOMAIN={config.domain}\nDJANGO_SECRET_KEY={key}\nOIDC_SIGNING_KEY={signing_key}\n"
     root = None
     with contextlib.suppress(KitError):
-        require_name_and_key(paths, config)
+        refuse_a_changed_key(paths, config)
         root = json.dumps({"name": config.name, "key": config.key}, ensure_ascii=False) + "\n"
         # Core only reads root.json as it starts. With this in its settings, a new name
         # changes them, so Compose starts core again, and the name follows at once.
@@ -546,7 +542,7 @@ def apply(paths: Paths, build: bool = False) -> None:
     still have to hear about changes."""
     print("Starting the web server.")
     apply_web(paths)
-    require_name_and_key(paths, load_config(paths))
+    refuse_a_changed_key(paths, load_config(paths))
     if build or not _have_image(core_image()):
         print("Building the login service. The first time, this takes a minute or two.")
         subprocess.run(_compose("build", "core"), check=True)

@@ -464,6 +464,18 @@ class Finishing(UpdateBase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.state()["result"], "done")
 
+    def test_a_config_without_name_and_key_fails_the_update_until_they_are_added(self):
+        """As "Before you update" promises for an update from 0.7.2."""
+        good = self.paths.config.read_text()
+        self.paths.config.write_text('[association]\ndomain = "example.org"\n[modules]\ngit = true\n')
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 1)
+        self.assertIn("name and key under [association]", out)
+        self.assertIn("kit update --finish", out)
+        self.paths.config.write_text(good)
+        code, out = self.kit("update", "--finish")
+        self.assertEqual(code, 0, out)
+
     def test_failing_to_start_names_what_failed_and_shows_its_log(self):
         self.apply.side_effect = subprocess.CalledProcessError(1, ["docker", "compose", "up"])
         self.unhealthy = True
