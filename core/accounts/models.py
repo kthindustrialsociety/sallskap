@@ -1,12 +1,12 @@
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
-from django.contrib.auth.models import Group, PermissionsMixin
+from django.contrib.auth.models import PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Lower
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from .roles import OPERATOR
+from . import roles
 
 
 def normalize_email(email):
@@ -78,7 +78,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     @property
     def is_operator(self):
         """Operator is the one group (structure.md §4). Everything else comes from ties."""
-        return self.groups.filter(role__key=OPERATOR).exists()
+        return self.groups.filter(name=roles.NAME).exists()
 
     def tool_username(self):
         """The part of the email before the @. Tools like Forgejo allow one account per
@@ -123,17 +123,6 @@ class ToolAccess(models.Model):
 
     def __str__(self):
         return f"{self.tool}: {', '.join(self.group_keys)}"
-
-
-class GroupRole(models.Model):
-    """Ties the Operator group to its key, which never changes, so the rules in roles.py
-    still apply if the association renames the group."""
-
-    group = models.OneToOneField(Group, on_delete=models.CASCADE, related_name="role")
-    key = models.SlugField(unique=True)
-
-    def __str__(self):
-        return self.key
 
 
 class AccessSync(models.Model):

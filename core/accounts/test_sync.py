@@ -50,7 +50,7 @@ class Asking(Base):
 
     def setUp(self):
         self.user, _ = make_user(groups=["member", "operator"])
-        self.operators = Group.objects.get(role__key="operator")
+        self.operators = Group.objects.get(name="Operator")
         AccessSync.objects.all().delete()
 
     def test_turning_off_an_account(self):
@@ -87,25 +87,6 @@ class Asking(Base):
 
     def test_setting_their_groups(self):
         self.user.groups.set([])
-        self.assertTrue(waiting(self.user))
-
-    def test_changing_a_groups_members_from_the_other_side(self):
-        group = self.operators
-        group.user_set.remove(self.user)
-        self.assertTrue(waiting(self.user))
-        AccessSync.objects.all().delete()
-        group.user_set.add(self.user)
-        self.assertTrue(waiting(self.user))
-
-    def test_clearing_a_groups_members(self):
-        self.operators.user_set.clear()
-        self.assertTrue(waiting(self.user))
-
-    def test_deleting_a_group(self):
-        group = Group.objects.create(name="Temporary")
-        self.user.groups.add(group)
-        AccessSync.objects.all().delete()
-        group.delete()
         self.assertTrue(waiting(self.user))
 
     def test_changing_who_may_use_a_tool_asks_for_everyone(self):
@@ -269,12 +250,12 @@ class Working(Base):
 
     def test_a_key_that_requires_2fa_waits_for_it(self):
         """Core wouldn't let them through to a tool, so telling it directly would get around that."""
-        self.user.groups.add(Group.objects.get(role__key="operator"))
+        self.user.groups.add(Group.objects.get(name="Operator"))
         sync.run_once([self.connector])
         self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member"))
 
     def test_setting_up_2fa_lets_it_through(self):
-        self.user.groups.add(Group.objects.get(role__key="operator"))
+        self.user.groups.add(Group.objects.get(name="Operator"))
         sync.run_once([self.connector])
         TOTP.activate(self.user, generate_totp_secret())
         self.assertTrue(waiting(self.user))
@@ -282,7 +263,7 @@ class Working(Base):
         self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member", "operator"))
 
     def test_losing_2fa_takes_it_away_again(self):
-        self.user.groups.add(Group.objects.get(role__key="operator"))
+        self.user.groups.add(Group.objects.get(name="Operator"))
         TOTP.activate(self.user, generate_totp_secret())
         sync.run_once([self.connector])
         self.assertEqual(self.connector.seen[-1].groups, ("example:member", "member", "operator"))
@@ -294,7 +275,7 @@ class Working(Base):
     def test_keys_that_dont_require_2fa_dont_wait(self):
         from structure.models import Position, Unit
 
-        self.user.groups.add(Group.objects.get(role__key="operator"))
+        self.user.groups.add(Group.objects.get(name="Operator"))
         website = Unit.objects.create(kind=Unit.Kind.TEAM, key="website", name="Website", parent=Unit.objects.root())
         Position.objects.create(person=self.user.person, unit=website, role="lead")
         sync.run_once([self.connector])

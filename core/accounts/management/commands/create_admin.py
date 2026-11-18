@@ -10,7 +10,7 @@ from structure.models import AuditEntry
 
 from accounts.links import password_link
 from accounts.models import normalize_email
-from accounts.roles import OPERATOR
+from accounts.roles import NAME
 
 
 class Command(BaseCommand):
@@ -35,7 +35,7 @@ class Command(BaseCommand):
             changes = {} if found else {"email": None}
             if not (found and found.is_operator):
                 changes["operator"] = [False, True]
-            user.groups.add(Group.objects.get(role__key=OPERATOR))
+            user.groups.add(Group.objects.get(name=NAME))
             if not user.is_active:
                 changes["is_active"] = [False, True]
                 user.is_active = True

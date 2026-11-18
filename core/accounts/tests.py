@@ -57,7 +57,7 @@ def give(user, *roles):
 
     for role in roles:
         if role == "operator":
-            user.groups.add(Group.objects.get(role__key="operator"))
+            user.groups.add(Group.objects.get(name="Operator"))
             continue
         if not user.person.is_member(root()):
             Membership.objects.create(person=user.person, association=root(), start=date(2020, 1, 1))
@@ -326,12 +326,12 @@ class ClosedRoutes(Base):
 class Groups(Base):
     def snapshot(self):
         return sorted(
-            (group.pk, group.name, group.role.key, sorted(group.permissions.values_list("pk", flat=True)))
+            (group.pk, group.name, sorted(group.permissions.values_list("pk", flat=True)))
             for group in Group.objects.all()
         )
 
     def test_operator_is_the_one_group_and_exists_automatically(self):
-        self.assertEqual(list(Group.objects.values_list("name", "role__key")), [("Operator", "operator")])
+        self.assertEqual(list(Group.objects.values_list("name", flat=True)), ["Operator"])
 
     def test_running_setup_again_changes_nothing(self):
         before = self.snapshot()
@@ -340,20 +340,9 @@ class Groups(Base):
 
     def test_setup_repairs_changed_permissions(self):
         before = self.snapshot()
-        Group.objects.get(role__key="operator").permissions.clear()
+        Group.objects.get(name="Operator").permissions.clear()
         call_command("migrate", verbosity=0)
         self.assertEqual(self.snapshot(), before)
-
-    def test_renaming_the_group_keeps_its_rules_and_its_name(self):
-        Group.objects.filter(role__key="operator").update(name="Drift")
-        call_command("migrate", verbosity=0)
-        self.assertEqual(Group.objects.get(role__key="operator").name, "Drift")
-        self.assertFalse(Group.objects.filter(name="Operator").exists())
-
-        user, _ = make_user(groups=["operator"])
-        self.assertTrue(user.requires_2fa)
-        self.assertTrue(user.is_staff)
-        self.assertTrue(user.has_perm("accounts.change_user"))
 
 
 class Admin(Base):
@@ -431,13 +420,13 @@ class Admin(Base):
         for url in (reverse("admin:accounts_user_changelist"), change, reverse("admin:accounts_user_add"), reverse("admin:mfa_authenticator_changelist")):
             with self.subTest(url):
                 self.assertEqual(self.client.get(url, follow=True).status_code, 403)
-        operators = Group.objects.get(role__key="operator")
+        operators = Group.objects.get(name="Operator")
         self.assertEqual(self.client.post(change, self.user_form(other, groups=[operators.pk]), follow=True).status_code, 403)
         self.assertFalse(other.is_operator)
 
     def test_board_cannot_make_itself_an_operator(self):
         me = self.enter(["board"])
-        operators = Group.objects.get(role__key="operator")
+        operators = Group.objects.get(name="Operator")
         change = reverse("admin:accounts_user_change", args=[me.pk])
         self.assertEqual(self.client.post(change, self.user_form(me, groups=[operators.pk]), follow=True).status_code, 403)
         self.assertFalse(me.is_operator)
@@ -456,7 +445,7 @@ class Admin(Base):
     def test_operator_makes_someone_an_operator(self):
         other, _ = make_user("other@example.org")
         self.enter(["operator"])
-        operators = Group.objects.get(role__key="operator")
+        operators = Group.objects.get(name="Operator")
         response = self.client.post(reverse("admin:accounts_user_change", args=[other.pk]), self.user_form(other, groups=[operators.pk]))
         self.assertEqual(response.status_code, 302)
         self.assertTrue(other.is_operator)
@@ -599,7 +588,7 @@ class Admin(Base):
     def test_becoming_an_operator_requires_2fa_at_the_next_click(self):
         me = self.enter([], two_factor=False)
         self.assertEqual(self.get_admin().status_code, 403)
-        me.groups.add(Group.objects.get(role__key="operator"))
+        me.groups.add(Group.objects.get(name="Operator"))
         self.assert_sent_to_2fa_setup(reverse("admin:index"))
 
     def test_turning_off_2fa_ends_admin_access_at_the_next_click(self):

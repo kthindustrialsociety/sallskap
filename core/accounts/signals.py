@@ -3,8 +3,7 @@ Changes to ties and the tree mark them in structure/access.py."""
 
 from allauth.idp.oidc.models import Client
 from allauth.mfa.models import Authenticator
-from django.contrib.auth.models import Group
-from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
+from django.db.models.signals import m2m_changed, post_delete, post_save
 
 from . import sync
 from .models import ToolAccess, User
@@ -20,29 +19,11 @@ def user_deleted(sender, instance, **kwargs):
     sync.request_for_deleted(instance)
 
 
-def groups_changed(sender, instance, action, reverse, pk_set, **kwargs):
-    if not reverse:  # someone's groups were changed: instance is the person
-        if action in ("post_add", "post_remove", "post_clear"):
-            sync.request_for(instance)
-        return
-    # A group's members were changed: instance is the group. Clearing it doesn't say who was in it.
-    if action == "pre_clear":
-        instance._members_before = list(instance.user_set.all())
-    elif action == "post_clear":
-        for user in instance._members_before:
-            sync.request_for(user)
-    elif action in ("post_add", "post_remove"):
-        for user in User.objects.filter(pk__in=pk_set):
-            sync.request_for(user)
-
-
-def group_deleting(sender, instance, **kwargs):
-    instance._members_before = list(instance.user_set.all())
-
-
-def group_deleted(sender, instance, **kwargs):
-    for user in instance._members_before:
-        sync.request_for(user)
+def groups_changed(sender, instance, action, reverse, **kwargs):
+    """Someone's groups, changed from their account's side, the only one there is: there's
+    no page for groups, and nothing deletes Operator."""
+    if not reverse and action in ("post_add", "post_remove", "post_clear"):
+        sync.request_for(instance)
 
 
 def two_factor_changed(sender, instance, **kwargs):
@@ -58,8 +39,6 @@ def connect():
     post_save.connect(user_saved, sender=User)
     post_delete.connect(user_deleted, sender=User)
     m2m_changed.connect(groups_changed, sender=User.groups.through)
-    pre_delete.connect(group_deleting, sender=Group)
-    post_delete.connect(group_deleted, sender=Group)
     post_save.connect(two_factor_changed, sender=Authenticator)
     post_delete.connect(two_factor_changed, sender=Authenticator)
     post_save.connect(tool_rules_changed, sender=Client)

@@ -22,7 +22,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
   ```
 
   The key is short, lowercase letters, digits and single hyphens, such as your association's usual abbreviation. Tools will know your association by it, so **it can never change.** If you forgot, the update says so: add them, then run `kit update --finish`.
-- **Write down who is in each group before you update.** Access now comes from memberships and positions, and Operator is the only group. The update removes the Board, Treasurer, Events, Developer and Member groups, and any group made by hand, along with who was in them. Until they're recorded, they lose what the groups gave them: the vault, Forgejo's board team, and the admin page. Operators keep everything. What has to be recorded:
+- **Write down who is in each group before you update.** Access now comes from memberships and positions, and Operator is the only group. The update removes the Board, Treasurer, Events, Developer and Member groups, and any group made by hand, along with who was in them. Until they're recorded, they lose what the groups gave them: the vault, Forgejo's board team, and the admin page. Operators keep everything, if the group is still called Operator: if you renamed it, name it Operator again first. What has to be recorded:
   - a membership of your association for each member;
   - the board's positions on your association, chair included;
   - a team for what Events and Developer were for, with its lead and participants.

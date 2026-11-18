@@ -11,7 +11,7 @@ from django.contrib.auth.models import Group
 from django.test import TestCase
 
 from accounts import sync
-from accounts.models import AccessSync, GroupRole, ToolAccess
+from accounts.models import AccessSync, ToolAccess
 from accounts.test_login_service import make_tool
 
 from . import examples
@@ -114,7 +114,7 @@ class Tree(TestCase):
         if tie == "nothing":
             return
         if tie == "operator":
-            user.groups.add(Group.objects.get(role__key="operator"))
+            user.groups.add(Group.objects.get(name="Operator"))
             return
         what, where = tie.split("@")
         start, end = LONG_AGO, None
@@ -388,62 +388,12 @@ class SameKeys(Tree):
         self.assertEqual(tree["drone-race-2027"].name, "Drone-Race-2027")
 
 
-# ---- The groups that went ----------------------------------------------------------------
-
-
-# Every group there was before A5, and what's left of it after the migration.
-GROUPS = """
-Board        gone
-Treasurer    gone
-Events       gone
-Developer    gone
-Member       gone
-Operator     kept
-Photography  gone
-"""
+# ---- Groups ----------------------------------------------------------------------------
 
 
 class Groups(TestCase):
     def test_operator_is_the_one_group(self):
-        self.assertEqual(list(Group.objects.values_list("role__key", flat=True)), ["operator"])
-
-    def test_the_migration_keeps_operator_and_its_people_and_removes_the_rest(self):
-        import importlib
-
-        from django.apps import apps
-
-        migration = importlib.import_module("accounts.migrations.0004_operator_is_the_one_group")
-        operator = User.objects.create_user("op@example.org")
-        operator.groups.add(Group.objects.get(role__key="operator"))
-        someone = User.objects.create_user("someone@example.org")
-        tool = make_tool()
-        ToolAccess.objects.create(tool=tool, group_keys=["board", "custom:Photography", "operator"])
-        for line in GROUPS.strip().splitlines():
-            name, _ = line.split()
-            if name != "Operator":
-                group = Group.objects.create(name=name)
-                if name != "Photography":  # one made by hand
-                    GroupRole.objects.create(group=group, key=name.lower())
-                someone.groups.add(group)
-                operator.groups.add(group)
-        migration.remove_groups(apps, None)
-        left = {name: ("kept" if Group.objects.filter(name=name).exists() else "gone") for name, _ in (line.split() for line in GROUPS.strip().splitlines())}
-        self.assertEqual(left, dict(line.split() for line in GROUPS.strip().splitlines()))
-        self.assertEqual(list(operator.groups.values_list("name", flat=True)), ["Operator"])
-        self.assertFalse(someone.groups.exists())
-        self.assertEqual(keys(operator), ["operator"])
-        self.assertEqual(keys(someone), [])
-        # A unit called custom could give custom:<role> keys, so the old group's key goes from tools' lists.
-        self.assertEqual(ToolAccess.objects.get(tool=tool).group_keys, ["board", "operator"])
-
-    def test_a_renamed_operator_group_is_kept(self):
-        Group.objects.filter(role__key="operator").update(name="Drift")
-        import importlib
-
-        from django.apps import apps
-
-        importlib.import_module("accounts.migrations.0004_operator_is_the_one_group").remove_groups(apps, None)
-        self.assertEqual(list(Group.objects.values_list("name", flat=True)), ["Drift"])
+        self.assertEqual(list(Group.objects.values_list("name", flat=True)), ["Operator"])
 
 
 # ---- The made-up installations ---------------------------------------------------------

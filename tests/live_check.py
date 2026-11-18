@@ -349,7 +349,7 @@ def give(user, roles):
         membership.end_on()
     for unit, role in wanted:
         Position.objects.create(person=person, unit_id=unit, role=role)
-    user.groups.set(Group.objects.filter(role__key__in=[role for role in roles if role == "operator"]))
+    user.groups.set(Group.objects.filter(name__in=["Operator"] if "operator" in roles else []))
 """
 
 
@@ -1862,7 +1862,7 @@ from allauth.mfa.totp.internal.auth import TOTP
 User = get_user_model()
 User.objects.get(email={email_of("fake-vault-reused")!r}).delete()
 user = User.objects.create_user({email_of("fake-vault-reused")!r}, {PASSWORD!r})
-user.groups.set(Group.objects.filter(role__key__in=["operator"]))
+user.groups.set(Group.objects.filter(name="Operator"))
 TOTP.activate(user, {secrets_by_name["fake-vault-reused"]!r})
 """
     )
