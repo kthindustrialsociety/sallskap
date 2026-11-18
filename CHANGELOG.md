@@ -33,6 +33,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
 - **The admin page is for Operators only now.** Board members no longer reach it, and the vault's follow-ups go to Operators. The board's own pages come in a later release.
 - **If Git is on, refresh Forgejo's sign-in after updating,** so it maps your association's chair and vice chair the way core does: run `kit tool remove forgejo`, then `kit enable git`. Signing in to Forgejo doesn't work between the two. Forgejo's old developers team is left as it was, and nobody is added to it any more: give its people a team in core, then delete it in Forgejo.
 - **If you push backups to a target with `[backup] target`,** the first backup after updating forgets the old ones there, as the server does, keeping 7 daily, 4 weekly and 6 monthly. Anything older than about six months goes. The server forgot those long ago, so if you want to keep one, copy the target itself somewhere else before updating. A pulled copy, from `kit backup export`, is yours to keep: keep the newest, and none older than six months, as each holds every backup.
+- **Core now deletes people it has no reason to keep,** every night just after midnight: someone with no account, no membership or position that's current or starts later, and no reason that hasn't expired, 30 days after the last of those ended. Their ended positions stay, under their name and nothing else, as your association's record of who held what. Updating from 0.7.2 deletes nobody, as everyone is still an account. From then on, deleting an account deletes its person too, the night after, once nothing holds them. Deleted people stay in your backups until those age out: see [docs/restore.md](docs/restore.md). An operator can see who would go with `docker compose exec core python manage.py delete_people --dry-run`, run in `/opt/sallskap`.
 - **A tool you limited with `kit tool add --group`** to developer, events or a group made by hand lets nobody in now. Remove it with `kit tool remove`, then add it again with the keys you want, such as `board` or `website:lead`. The vault needs nothing: it already uses `board` and `operator`.
 
 ### Tool versions
@@ -74,6 +75,11 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - The admin page shows the tree, people and their ties, and changes none of them. Operators merge two people there, which the log records.
   - `kit chair <email>` records your association's chair, and makes them a member of it if they aren't one. It's how a new installation records its first chair.
 - fix: a backup target set with `[backup] target` now forgets old backups after each copy, as the server does, keeping 7 daily, 4 weekly and 6 monthly. It kept every backup for ever, and with them everyone since deleted.
+- feat: deleting people with nothing left (structure.md §3).
+  - Every night just after midnight, core deletes everyone with no account, no membership or position that's current or starts later, and no reason that hasn't expired, 30 days after the last of those ended, or after they were added if they never had one. Each night works out afresh who that is, so a night missed costs nothing, and someone a restore brings back goes again the next night.
+  - Their ended positions stay, seats included, under their name and nothing else, and can't be changed. Grants and seat rules they gave stay as they were, and show their giver as since deleted. Their addresses, memberships and reasons go. The tools are told nothing: someone without an account has nothing in them.
+  - The audit log gets one row for each night that deleted anyone, counting what went and naming nobody.
+  - `manage.py delete_people --dry-run` says who would go today; without `--dry-run`, it deletes them now.
 
 
 ## 0.7.2 (2026-11-10)
