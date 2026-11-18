@@ -282,7 +282,7 @@ All feature apps are always installed and switched on or off in the admin with *
 **Interfaces:** every action is one function in core with one permission check, reached in three ways ([structure.md](structure.md) §7 and §8):
 - **Command line and scripts:** a JSON API, and a CLI that anyone can run on their own computer, limited to what their positions allow.
 - **Board, leads and members:** server-rendered pages (Django templates, optionally htmx); no JavaScript build step.
-- **Operators:** Django admin, as a back office. Its permissions can't be limited to one association or team, so the board of an association inside another uses the pages or the CLI.
+- **Operators:** Django admin, as a back office for accounts, two-factor authentication and follow-ups. It shows the associations, teams, people and the audit log, and changes none of them: operators have no say over members, so the board uses the pages or the CLI.
 - **Public:** `pages` or the association's own site with widgets.
 - **Language:** Swedish and English.
 
@@ -381,7 +381,7 @@ A **test restore every semester** is part of the handover checklist, onto a thro
 - Access: 1–2 operators have root on the server, which is also how they get into tools if core is down. Developers and incubator teams deploy only through Git, never with a shell on the server.
 - Databases are never exposed to the internet; everything goes through Caddy.
 - Backups are encrypted. Keys are kept in the password vault and one offline copy.
-- An audit log records admin actions on members and finances.
+- An audit log records every action, whichever way in it came through, and operators' changes to accounts. It names nobody, so it outlives no one's deletion ([structure.md](structure.md) §7).
 - `SECURITY.md` in the repo explains how to report vulnerabilities.
 
 ## 13. Server requirements and cost

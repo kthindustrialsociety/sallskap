@@ -30,7 +30,7 @@ Example Federation              association, the root
 - **Nothing is created or moved under an archived unit,** an association sits only under an association, and a unit can't end up under itself.
 - **A unit is deleted only if nothing ever pointed at it:** no units under it, and no ties (§3), grants or seat rules (§4), current or ended. Otherwise it's archived.
 - **A team can involve other associations.** The unit it sits under owns it and appoints its lead. It also has a list of the other associations taking part.
-- **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. Either side's head (§4) can end the arrangement.
+- **A service can be run for another association,** such as one association running another's website. The team sits under the association doing the work, with a "run for" link to the one it serves. It's set up one level up, like a move (§4), and either side's chair or vice chair can end the arrangement.
 
 ## 2. People
 
@@ -39,7 +39,7 @@ One `Person` row for **everyone the association holds data about:** members, boa
 - **Kept to a minimum:** a name and email addresses, and nothing else. There's no language setting: pages follow the browser's language, and mail goes out in the installation's. What an association asks of its members goes in member fields, on the membership (§3).
 - **Emails are in their own table,** each marked verified or not. A verified address belongs to one person only. The same address can be on several people unverified, which is how a sign-up with a member's address gets its own row instead of joining theirs.
 - **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. The account's login address is always one of its person's verified addresses. When it changes, the old one stays on the person unverified, so it can go to someone else, such as a role's shared address. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change. Their addresses are marked verified, as they were typed in by an operator and already used to log in. An operator's typo becomes a verified address too, so check addresses when adding an account.
-- **Two rows are merged only on a verified email,** or by hand. An unverified email never joins someone to an existing person. When an address is verified and another person already holds it verified, the two become one: addresses, ties and reasons move over, and the emptied row is deleted. Two people who both have an account are never merged, as one of their `sub`s would vanish. If only one has an account, that's the person kept.
+- **Two rows are merged only on a verified email,** or by hand, by an operator, which the audit log records (§7). An unverified email never joins someone to an existing person. When an address is verified and another person already holds it verified, the two become one: addresses, ties and reasons move over, and the emptied row is deleted. Two people who both have an account are never merged, as one of their `sub`s would vanish. If only one has an account, that's the person kept.
 - **There's no general contact list.** People are seen through what ties them to a unit, so a chair sees their own members and the people signed up for their own events. One privacy role can search everyone, to answer GDPR requests.
 - **Visitors aren't people in this model.** Page statistics come from the web server's logs, counted, and never linked to anyone.
 
@@ -88,27 +88,27 @@ The keys never change and are never shown. What people see comes from the dictio
 - **The head of a unit** is the `chair` or `vice_chair` of an association, or the `lead` of a team. Heads appoint the heads of the units directly under them and approve what's proposed there. So Development's lead appoints the lead of UAVs, and UAVs' lead approves a new project inside it. Anyone with authority higher up can do the same.
   - A chair or vice chair appoints every role in their association and everything inside it, their own association's next chair included, and can end any of those positions.
   - A lead appoints the leads and participants of the teams under theirs, and their own team's participants. A co-lead of their own team is appointed by the head above, like the lead.
-- **Moving, archiving and deleting a unit are decided one level up,** by whoever has authority over the unit above it, as for appointing its head. So a lead changes their own team and creates projects inside it, and the head above archives it. Creating a unit is decided by whoever has authority over the unit it goes into, which is how a lead approves a proposal there.
-- **Associations taking part in a team, or served by it, get no say over it,** except that the head of the association it's run for can end that arrangement (§1).
-- **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator with a command on the server, which the audit log records.
-- **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members: it never passes the check below.
+- **Moving, archiving and deleting a unit are decided one level up,** by whoever has authority over the unit above it, as for appointing its head. So a lead changes their own team and creates projects inside it, and the head above archives it. Bringing a team back from the archive and setting up a service for another association (§1) are decided there too. A move is decided by whoever has authority over the nearest unit above both its old and its new place. Creating a unit is decided by whoever has authority over the unit it goes into, which is how a lead approves a proposal there.
+- **Associations taking part in a team, or served by it, get no say over it,** except that the chair or vice chair of the association it's run for can end that arrangement (§1).
+- **The root's chair** is recorded by the outgoing chair or vice chair, or by an operator on the server with `kit chair <email>`, which the audit log records (§7). For a new installation, that's how the first chair is recorded: it also makes them a member of the root if they aren't one, as nobody else can yet.
+- **Operator isn't a role in the tree.** It's about running the server, so it stays a group given by hand, as now. It gives account recovery and server settings, and no say over members: it never passes the check below. So the admin page shows the tree and changes none of it (§7).
 - **Two-factor authentication** is required for anyone holding a board role (`chair`, `vice_chair`, `treasurer`, `secretary`, `board_member`) anywhere, and for operators. It's required from the day the position is recorded, even if it starts later, so a newly elected board sets it up before taking office.
 
 ### Permissions
 
-Every action asks one question: **can this person do this, in this unit, today?** The answer comes from a fixed list of permissions, worked out from the person's current positions and the grants to them. Each one is checked on the unit the action is about.
+Every action asks one question: **can this person do this, in this unit, today?** The answer comes from a fixed list of permissions, worked out from the person's current positions and the grants to them. Each one is checked on the unit the action is about, on the day it's done. So a board elected in spring is recorded by the board it replaces, and an appointment that starts later is checked when it's recorded, not when it starts.
 
 | Permission | What it covers | Can be granted |
 |---|---|---|
 | `see_members` | See an association's members, or a team's participants | Yes |
-| `manage_memberships` | Add, change and end memberships, in an association | Yes |
+| `manage_memberships` | Add, change and end memberships, in an association, and the reasons data is held on people there (§3) | Yes |
 | `manage_events` | Events and their sign-ups | Yes |
 | `send_mailings` | Mailings | Yes |
 | `manage_documents` | Documents and minutes | Yes |
 | `manage_finances` | Fees and treasury | Yes |
 | `manage_participants` | Add and end participants, in a team | No |
 | `appoint` | Start and end positions of any role, heads included | No |
-| `manage_units` | Change this unit, and create, move, archive, bring back and delete the units inside it | No |
+| `manage_units` | Change this unit, and create, move, archive, bring back and delete the units inside it, and set them up as services for another association | No |
 | `give_grants` | Give and end grants covering this unit | No |
 | `end_service` | End a team's "run for" arrangement (§1) | No |
 
@@ -202,15 +202,23 @@ Access is **worked out from current memberships and positions,** never set by ha
 
 ## 7. One set of actions, three ways in
 
-Every change, such as creating a team, appointing a lead or opening an event, is **one action in core:** a function with one permission check, the rule in §4. Every action is recorded in the audit log, with who did it and through which way in.
+Every change, such as creating a team, appointing a lead or opening an event, is **one action in core:** a function with one permission check, the rule in §4. Every action is recorded in the audit log, with who did it and through which way in. Units, ties, grants and seat rules change only through actions, and a test checks that nothing else in core writes them.
 
 | Way in | For | Notes |
 |---|---|---|
 | **The API,** at `app.<domain>/api/v1/` | The CLI, scripts and CI | JSON over HTTPS. Versioned, so old CLIs keep working across a release |
 | **Member pages** | Chairs, leads and members in a browser | Server-rendered, as §9 of the spec says |
-| **The admin page** | Operators: a back office | Django's admin can only give permissions across the whole installation, so it's for operators, not for the board of an association inside another |
+| **The admin page** | Operators: a back office | Accounts, two-factor authentication, follow-ups, and merging two people. It shows the tree, people, ties, grants, seat rules and the audit log, and changes none of them, as operators never pass the check in §4 |
 
-There's no action that only one way in can do. A test checks that every action has its API endpoint and its check.
+There's no action that only one way in can do. A test checks that every action has its API endpoint and its check. Two commands on the server sit outside the actions, as they're about running the server: `kit admin`, which makes someone an operator, and `kit chair`, which records the root's chair (§4).
+
+### The audit log
+
+- **One row for each action,** saying when, which action, through which way in, who did it (their account and person), the unit the check asked about, what changed, and each field it set, before and after.
+- **Operators' own changes are recorded too:** accounts, Operator, removing someone's two-factor authentication, follow-ups and merges, and `kit admin` and `kit chair` on the server. So are the changes core makes itself, such as merging two people when an address is verified, or deleting people with nothing left (§3), which are counted. Seats aren't recorded on their own: the action that started or ended them is the record, and they follow from their rule and the position they come from.
+- **It names nobody.** People are known by an id, never by name or address. A tie's row leads to its person through the tie, so once a membership or a reason is deleted (§3), nothing in the log leads to them. A reason's source, and an account's name and address, are recorded as changed, without their values.
+- **It's only ever added to.** Nothing in core changes or deletes a row, and the admin page lets nobody do so, operators included. Someone with root on the server can still change the database, as with everything else there.
+- **Operators read it** in the admin page. A refused attempt changes nothing, so it isn't recorded.
 
 ## 8. The CLI
 
