@@ -36,7 +36,7 @@ Example Federation              association, the root
 
 One `Person` row for **everyone the association holds data about:** members, board, people signed up for an event, subscribers, applicants, alumni and partner contacts.
 
-- **Kept to a minimum:** a name and email addresses, and nothing else. There's no language setting: pages follow the browser's language, and mail goes out in the installation's. What an association asks of its members goes in member fields, on the membership (§3).
+- **Kept to a minimum:** a name and email addresses, and nothing else. There's no language setting: the kit is in English. What an association asks of its members goes in member fields, on the membership (§3).
 - **Emails are in their own table,** each marked verified or not. A verified address belongs to one person only. The same address can be on several people unverified, which is how a sign-up with a member's address gets its own row instead of joining theirs.
 - **A login account is optional,** and linked to the person. People who only sign up for events or subscribe never need one. The account's login address is always one of its person's verified addresses. When it changes, the old one stays on the person unverified, so it can go to someone else, such as a role's shared address. Today's accounts each become a person with an account, and keep the same `sub`, so the tools see no change. Their addresses are marked verified, as they were typed in by an operator and already used to log in. An operator's typo becomes a verified address too, so check addresses when adding an account.
 - **Two rows are merged only on a verified email,** or by hand, by an operator, which the audit log records (§7). An unverified email never joins someone to an existing person. When an address is verified and another person already holds it verified, the two become one: addresses, ties and reasons move over, and the emptied row is deleted. Two people who both have an account are never merged, as one of their `sub`s would vanish. If only one has an account, that's the person kept.
@@ -81,7 +81,7 @@ A position's **role** is one of a fixed set of keys that the kit understands. Ea
 | `participant` | team | Take part, and get the team's access in the tools |
 | custom title | either | Nothing beyond what its role key gives: a custom title sits on top of one of the keys above, such as "Head of PR" on `board_member` |
 
-The keys never change and are never shown. What people see comes from the dictionary below.
+The keys never change and are never shown. People see the kit's plain words for them, the same in every installation: Chair, Vice chair, Treasurer, Secretary, Board member, Lead and Participant, and for the rest Member, Association and Team. A custom title is shown beside the word for its role.
 
 - **Authority is scoped.** You can manage a unit if a position you hold covers it, as the table says, or a grant does. Only the chair and vice chair reach into the associations inside theirs. Every other board role stops at its association's edge. So the root's treasurer has no say in Robotics, unless a chair gives them one.
 - **Only what's current counts:** a position or grant (below) that has started and not yet ended, held in a unit that isn't archived. A board elected in spring has no say until its positions start.
@@ -153,16 +153,6 @@ A rule names the role it gives here, the roles it comes from, and where those ar
 - **When an association moves in under a rule's named unit,** its holders' seats start that day, and when it moves out, they end. If it moves back later, new seats start that day, so the gap stays in the record. A new association's holders get theirs as they're appointed.
 - **A position in a team that's archived gives no seat** from the day it's archived, and a new one from the day the team is brought back, as a project that's over gives nothing. Seats in an archived team stay there like any other position there, giving nothing, and no new ones are added.
 - **A seat that would never start isn't made,** and one already recorded that no longer would ends on its start day, as positions are never deleted.
-
-### The dictionary
-
-Every installation has its own **dictionary:** the word shown for each role key, unit kind and tie, in Swedish and English, singular and plural.
-
-- **The kit ships plain words:** Chair, Vice chair, Treasurer, Secretary, Board member, Lead, Participant, Member, Association and Team. An installation can replace any of them: `sk words set treasurer "Head of Treasury" --sv "Kassör"`.
-- **A unit can override words for itself alone,** not for the units below it. So a federation can call its own chair President while the associations inside it keep Chair: `sk words set chair "President" --unit example-federation`.
-- **It changes words only.** What a role can do comes from its key, so renaming `lead` to "Officer" changes nobody's access.
-- **Custom titles** are still free text on a single position, such as "Head of PR", shown beside the word for its role.
-- **The kinds of unit have words too,** such as Society for an association, or Committee for a team.
 
 ### Proposing a new unit
 

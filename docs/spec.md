@@ -284,7 +284,7 @@ All feature apps are always installed and switched on or off in the admin with *
 - **Board, leads and members:** server-rendered pages (Django templates, optionally htmx); no JavaScript build step.
 - **Operators:** Django admin, as a back office for accounts, two-factor authentication and follow-ups. It shows the associations, teams, people and the audit log, and changes none of them: operators have no say over members, so the board uses the pages or the CLI.
 - **Public:** `pages` or the association's own site with widgets.
-- **Language:** Swedish and English.
+- **Language:** English. Swedish, or any other language, waits until an association asks for it.
 
 ## 10. Installation and operations
 

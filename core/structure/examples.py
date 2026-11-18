@@ -1,6 +1,6 @@
 """The two made-up installations, for core's tests, the test server and later the
-public demo. They grow with each segment: units, people, grants and seat rules now,
-then words. Nothing calls this on a real installation. The test server loads
+public demo. They grow with each segment: units, people, grants and seat rules so
+far. Nothing calls this on a real installation. The test server loads
 one with tests/load_example.py.
 
 They're built as an installation would be: the first chair is recorded as `kit chair`
