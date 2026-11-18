@@ -40,12 +40,6 @@ class UnitQuerySet(models.QuerySet):
     def root(self):
         return self.get(parent=None)
 
-    def delete(self):
-        # One at a time, so each is checked: see check_can_delete.
-        for unit in self:
-            unit.check_can_delete()
-        return super().delete()
-
 
 class Unit(models.Model):
     class Kind(models.TextChoices):
@@ -128,10 +122,6 @@ class Unit(models.Model):
         return self.ancestors().filter(kind=Unit.Kind.ASSOCIATION).last()
 
     # ---- Rules -------------------------------------------------------------------
-
-    def clean(self):
-        super().clean()
-        self.check_rules()
 
     def check_rules(self):
         """Everything in structure.md §1 that one unit's fields can break. Raises a
@@ -295,13 +285,8 @@ class Unit(models.Model):
         today, as the tree keeps no history."""
         today = _today()
         moved = models.Q(unit__path__startswith=self.path) | models.Q(person__memberships__association__path__startswith=self.path)
-        held = Tie.overlapping(Position.objects.filter(moved, role__in=Position.NEEDS_MEMBERSHIP), today, None).distinct().select_related("person", "unit")
+        held = Position.objects.filter(moved, role__in=Position.NEEDS_MEMBERSHIP).overlapping(today).distinct().select_related("person", "unit")
         return [problem for position in held if (problem := position.membership_problem(since=max(position.start, today)))]
-
-    def check_can_delete(self):
-        problem = self.deletion_problem()
-        if problem:
-            raise ValidationError(problem)
 
     def check_leads_without(self, removed):
         """Before associations are taken off this team's list: a lead who is a member only
@@ -309,32 +294,26 @@ class Unit(models.Model):
         today = _today()
         remaining = [association for association in self.taking_part.all() if association.pk not in removed]
         needed = [self.association(), *remaining]
-        leads = Tie.overlapping(Position.objects.filter(unit=self, role=Position.Role.LEAD), today, None).select_related("person")
+        leads = Position.objects.filter(unit=self, role=Position.Role.LEAD).overlapping(today).select_related("person")
         for position in leads:
             if position.membership_problem(since=max(position.start, today), needed=needed):
                 raise ValidationError(_("%(person)s leads %(team)s as a member of an association taken off its list. Hand over the lead first.") % {"person": position.person, "team": self})
 
     def delete(self, *args, **kwargs):
-        self.check_can_delete()
+        if problem := self.deletion_problem():
+            raise ValidationError(problem)
         return super().delete(*args, **kwargs)
 
 
 @receiver(m2m_changed, sender=Unit.taking_part.through)
 def _check_taking_part(sender, instance, action, reverse, pk_set, **kwargs):
+    """From the team's side, as add_taking_part and end_taking_part do."""
+    if reverse and action.startswith("pre_"):
+        raise ValidationError(_("Which associations take part is changed on the team."))
     if action == "pre_add":
-        added = Unit.objects.filter(pk__in=pk_set)
-        if reverse:  # an association being added to teams
-            for team in added:
-                Unit.check_taking_part(team.kind, team.parent, [instance])
-        else:
-            Unit.check_taking_part(instance.kind, instance.parent, added)
+        Unit.check_taking_part(instance.kind, instance.parent, Unit.objects.filter(pk__in=pk_set))
     elif action in ("pre_remove", "pre_clear"):
-        if reverse:  # an association taken off teams' lists
-            teams = Unit.objects.filter(pk__in=pk_set) if action == "pre_remove" else instance.teams_taking_part.all()
-            for team in teams:
-                team.check_leads_without({instance.pk})
-        else:
-            instance.check_leads_without(set(pk_set) if action == "pre_remove" else set(instance.taking_part.values_list("pk", flat=True)))
+        instance.check_leads_without(set(pk_set) if action == "pre_remove" else set(instance.taking_part.values_list("pk", flat=True)))
 
 
 def ensure_root(using="default", apps=None, **kwargs):
@@ -514,7 +493,7 @@ class Person(models.Model):
             EmailAddress.objects.filter(pk=twin.pk).update(verified_at=verified_at)
 
         for membership in gone.memberships.all():
-            twins = list(Membership.overlapping(kept.memberships.filter(association=membership.association_id), membership.start, membership.end))
+            twins = list(kept.memberships.filter(association=membership.association_id).overlapping(membership.start, membership.end))
             if twins:
                 rows = [membership, *twins]
                 membership.start = min(row.start for row in rows)
@@ -567,11 +546,6 @@ class EmailAddress(models.Model):
     def __str__(self):
         return self.address
 
-    def clean(self):
-        self.address = normalize_address(self.address)
-        super().clean()
-        self.check_rules()
-
     def check_rules(self):
         stored = EmailAddress.objects.filter(pk=self.pk).first() if self.pk else None
         if stored and (stored.address != self.address or stored.person_id != self.person_id):
@@ -583,15 +557,6 @@ class EmailAddress(models.Model):
         self.address = normalize_address(self.address)
         self.check_rules()
         super().save(*args, **kwargs)
-
-    def is_login_address(self):
-        user = self.person.user if self.person_id else None
-        return user is not None and user.email == self.address
-
-    def delete(self, *args, **kwargs):
-        if self.is_login_address():
-            raise ValidationError(_("%(address)s is how they log in. Change the account's address first.") % {"address": self.address})
-        return super().delete(*args, **kwargs)
 
     @transaction.atomic
     def verify(self):
@@ -653,20 +618,25 @@ def link_account(user, old_address=None):
 
 
 class TieQuerySet(models.QuerySet):
-    start_field, end_field = "start", "end"
+    def overlapping(self, start, end=None):
+        """Those that hold on some day from `start`, and before `end` if given."""
+        end_field = self.model.end_field
+        held = self.filter(start__lt=end) if end is not None else self
+        return held.filter(models.Q(**{f"{end_field}__isnull": True}) | models.Q(**{f"{end_field}__gt": start}))
 
     def current(self, on=None):
         on = on or _today()
-        return self.filter(**{f"{self.start_field}__lte": on}).filter(
-            models.Q(**{f"{self.end_field}__isnull": True}) | models.Q(**{f"{self.end_field}__gt": on})
-        )
+        return self.filter(start__lte=on).overlapping(on)
 
     def delete(self):
         raise ValidationError(_("Ties are never deleted, so the record is kept. End it instead."))
 
 
-class ReasonQuerySet(TieQuerySet):
-    end_field = "expires"
+class PositionQuerySet(TieQuerySet):
+    def held(self, on=None):
+        """Current on that day, in a unit not archived by then: what gives authority and keys."""
+        on = on or _today()
+        return self.current(on).filter(models.Q(unit__archived_at__isnull=True) | models.Q(unit__archived_at__date__gt=on))
 
 
 class Tie(models.Model):
@@ -678,7 +648,8 @@ class Tie(models.Model):
 
     objects = TieQuerySet.as_manager()
     end_field = "end"
-    unit_field = None  # set by each kind of tie
+    # What can't change once set: who it's for, where, and what it is. Each kind says.
+    fixed_fields = ()
 
     class Meta:
         abstract = True
@@ -700,21 +671,6 @@ class Tie(models.Model):
     def delete(self, *args, **kwargs):
         raise ValidationError(_("Ties are never deleted, so the record is kept. End it instead."))
 
-    @staticmethod
-    def overlapping(queryset, start, end):
-        if end is not None:
-            queryset = queryset.filter(start__lt=end)
-        return queryset.filter(models.Q(end__isnull=True) | models.Q(end__gt=start))
-
-    def identity(self):
-        """Who it's for and where: fixed once set, and needed before the rules can be checked."""
-        return ("person_id", f"{self.unit_field}_id")
-
-    def clean(self):
-        super().clean()
-        if all(getattr(self, name) for name in self.identity()):  # a form shows a missing one by itself
-            self.check_rules()
-
     def check_rules(self):
         problems = self.problems()
         if problems:
@@ -727,12 +683,9 @@ class Tie(models.Model):
             problems.append(_("It can't end before it starts."))
         stored = type(self).objects.filter(pk=self.pk).first() if self.pk else None
         if stored is not None:
-            fixed = (*self.identity(), *self.fixed_fields)
-            if any(getattr(stored, name) != getattr(self, name) for name in fixed):
+            if any(getattr(stored, name) != getattr(self, name) for name in self.fixed_fields):
                 problems.append(_("Who it's for, where, and which role can't change once set: end it and add a new one."))
         return problems
-
-    fixed_fields = ()
 
     def save(self, *args, **kwargs):
         self.clean_fields()
@@ -758,7 +711,7 @@ class Membership(Tie):
     association = models.ForeignKey(Unit, verbose_name=_("association"), on_delete=models.PROTECT, related_name="memberships")
     kind = models.CharField(_("kind"), max_length=20, choices=Kind.choices, default=Kind.ORDINARY)
 
-    unit_field = "association"
+    fixed_fields = ("person_id", "association_id")
 
     class Meta:
         verbose_name = _("membership")
@@ -776,7 +729,7 @@ class Membership(Tie):
         problems = super().problems()
         if self.association.kind != Unit.Kind.ASSOCIATION:
             problems.append(_("%(unit)s is a team. Membership is only of associations: in teams, people hold positions.") % {"unit": self.association})
-        if self.start and Tie.overlapping(Membership.objects.filter(person=self.person_id, association=self.association_id).exclude(pk=self.pk), self.start, self.end).exists():
+        if self.start and Membership.objects.filter(person=self.person_id, association=self.association_id).exclude(pk=self.pk).overlapping(self.start, self.end).exists():
             problems.append(_("%(person)s is already a member of %(unit)s at that time.") % {"person": self.person, "unit": self.association})
         stored = Membership.objects.filter(pk=self.pk).first() if self.pk else None
         if stored is not None and self.start:
@@ -799,7 +752,7 @@ class Membership(Tie):
     def _positions_resting_on_it(self, lost):
         """A membership covers no less while a board role or lead rests on it, from `lost` on."""
         problems = []
-        held = Tie.overlapping(Position.objects.filter(person=self.person_id, role__in=Position.NEEDS_MEMBERSHIP), lost, None)
+        held = Position.objects.filter(person=self.person_id, role__in=Position.NEEDS_MEMBERSHIP).overlapping(lost)
         for position in held.select_related("person", "unit"):
             if position.membership_problem(since=max(lost, position.start), instead=self):
                 problems.append(_("%(person)s is %(role)s of %(unit)s, which needs this membership. End or hand over that position first.") % {"person": self.person, "role": position.get_role_display(), "unit": position.unit})
@@ -839,8 +792,8 @@ class Position(Tie):
     seat_since = models.DateField(_("in reach from"), null=True, blank=True, editable=False)
     seat_until = models.DateField(_("out of reach from"), null=True, blank=True, editable=False)
 
-    unit_field = "unit"
-    fixed_fields = ("role", "seat_rule_id", "seat_from_id")
+    fixed_fields = ("person_id", "unit_id", "role", "seat_rule_id", "seat_from_id")
+    objects = PositionQuerySet.as_manager()
 
     class Meta:
         verbose_name = _("position")
@@ -921,7 +874,7 @@ class Position(Tie):
         if not problems and gained and (problem := self.membership_problem(since=gained)):
             problems.append(problem)
         if self.role == self.Role.CHAIR and self.start:
-            others = Tie.overlapping(Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR).exclude(pk=self.pk), self.start, self.end)
+            others = Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR).exclude(pk=self.pk).overlapping(self.start, self.end)
             if stored is None:  # a new chair ends an open one that started before
                 others = others.exclude(start__lt=self.start, end__isnull=True)
             if others.exists():
@@ -977,10 +930,8 @@ class Reason(Tie):
     legal_basis = models.CharField(_("legal basis"), max_length=20, choices=Basis.choices)
     expires = models.DateField(_("expires"), help_text=_("The first day it no longer holds. Ending it sets this to today."))
 
-    objects = ReasonQuerySet.as_manager()
     end_field = "expires"
-    unit_field = "unit"
-    fixed_fields = ("kind",)
+    fixed_fields = ("person_id", "unit_id", "kind")
 
     class Meta:
         verbose_name = _("reason")
@@ -1039,7 +990,7 @@ class Grant(Tie):
         help_text=_("A chair or vice chair with authority over the unit it covers, on the day it starts."),
     )
 
-    fixed_fields = ("permission", "role", "include_below")
+    fixed_fields = ("held_in_id", "unit_id", "given_by_id", "permission", "role", "include_below")
 
     class Meta:
         verbose_name = _("grant")
@@ -1056,9 +1007,6 @@ class Grant(Tie):
             "role": self.get_role_display(), "held_in": self.held_in, "permission": self.get_permission_display(),
             "where": where % {"unit": self.unit},
         }
-
-    def identity(self):
-        return ("held_in_id", "unit_id", "given_by_id")
 
     def problems(self):
         from .authority import ONLY_IN, can
@@ -1112,7 +1060,7 @@ class SeatRule(Tie):
         help_text=_("Someone who could appoint in the unit with the seats, on the day it starts."),
     )
 
-    fixed_fields = ("role", "from_roles", "each_association_under")
+    fixed_fields = ("unit_id", "held_in_id", "made_by_id", "role", "from_roles", "each_association_under")
 
     class Meta:
         verbose_name = _("seat rule")
@@ -1136,9 +1084,6 @@ class SeatRule(Tie):
         return _("%(role)s of %(unit)s, for %(source)s") % {
             "role": self.get_role_display(), "unit": self.unit, "source": source % {"roles": roles, "unit": self.held_in},
         }
-
-    def identity(self):
-        return ("unit_id", "held_in_id", "made_by_id")
 
     def save(self, *args, **kwargs):
         if isinstance(self.from_roles, list):  # in the kit's order, each once, so a rule reads the same however it was given
@@ -1198,7 +1143,7 @@ class SeatRule(Tie):
     def problems_after_moving():
         """After a move: any rule that's not ended whose seats would need a membership their
         holders needn't have."""
-        rules = SeatRule.objects.filter(models.Q(end__isnull=True) | models.Q(end__gt=_today())).select_related("unit", "held_in")
+        rules = SeatRule.objects.overlapping(_today()).select_related("unit", "held_in")
         return [problem for rule in rules if (problem := rule.membership_problem())]
 
     def problems(self):
@@ -1231,7 +1176,7 @@ class SeatRule(Tie):
         if self.role in roles and self.reaches(unit):
             problems.append(_("A seat can't come from the same role in the same unit."))
         if self.start:
-            alike = Tie.overlapping(SeatRule.objects.filter(unit=unit, role=self.role).exclude(pk=self.pk), self.start, self.end)
+            alike = SeatRule.objects.filter(unit=unit, role=self.role).exclude(pk=self.pk).overlapping(self.start, self.end)
             if any(set(other.from_roles) & set(roles) and self.shares_places(other) for other in alike.select_related("held_in")):
                 problems.append(_("Another seat rule already gives this seat for one of these roles, held in the same place, at that time."))
         if not problems and self.start and (stored is None or stored.start != self.start):

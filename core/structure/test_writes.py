@@ -39,7 +39,7 @@ ALLOWED = {
     ("structure/deleting.py", "delete_people"): "the job that finds who has nothing left, and forgets each of them",
     ("accounts/sync.py", "new_day"): "the worker runs that job just after midnight",
     ("structure/management/commands/delete_people.py", "Command.handle"): "an operator running it by hand, on the server",
-    ("structure/examples.py", "_Builder.delete_departed"): "a made-up installation's people with nothing left, on a test server only",
+    ("structure/examples.py", "_Builder.build"): "a made-up installation's people with nothing left, on a test server only",
 }
 
 

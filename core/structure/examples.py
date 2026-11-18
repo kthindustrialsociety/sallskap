@@ -387,12 +387,9 @@ class _Builder:
         for spec in _all(self.example.units):  # last, as nothing new goes into an archived team
             if spec.archived:
                 actions.archive_unit(self.actor(), unit=self.units[spec.key], via=SERVER)
-        self.delete_departed()
-        return self.units
-
-    def delete_departed(self):
-        """Made-up people with nothing left, as core would delete them that night, and nobody else."""
+        # Made-up people with nothing left, as core would delete them that night, and nobody else.
         delete_people(people=[person.pk for person in self.people.values()], via=SERVER)
+        return self.units
 
 
 @transaction.atomic

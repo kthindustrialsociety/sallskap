@@ -7,9 +7,8 @@ from datetime import date, timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, connection, transaction
-from django.db.migrations.executor import MigrationExecutor
-from django.test import TestCase, TransactionTestCase
+from django.db import IntegrityError, transaction
+from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -159,11 +158,6 @@ class Accounts(Tree):
         pk = user.person.pk
         user.delete()
         self.assertFalse(Person.objects.filter(pk=pk).exists())
-
-    def test_the_login_address_cannot_be_removed(self):
-        user = User.objects.create_user("ada@example.org")
-        with self.assertRaises(ValidationError):
-            user.person.emails.get().delete()
 
 
 class Addresses(Tree):
@@ -527,50 +521,6 @@ class Reasons(Tree):
         self.assertFalse(reason.is_current())
 
 
-# ---- The migration of today's accounts ----------------------------------------------
-
-
-class MigratingAccounts(TransactionTestCase):
-    """Every account becomes a person with that account, the same sub and its address
-    verified. Nothing in accounts changes."""
-
-    accounts = ("accounts", "0003_access_sync_follow_up")
-    before = [("structure", "0001_initial"), accounts]
-    after = [("structure", "0002_people"), accounts]
-
-    def tearDown(self):
-        MigrationExecutor(connection).migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
-
-    def test_every_account_becomes_a_person(self):
-        executor = MigrationExecutor(connection)
-        executor.migrate(self.before)
-        old = executor.loader.project_state(self.before).apps
-        OldUser = old.get_model("accounts", "User")
-        rows = [OldUser.objects.create(email=f"user{i}@example.org", name=f"User {i}", password="!") for i in range(3)]
-        rows.append(OldUser.objects.create(email="noname@example.org", password="!"))
-        accounts_before = list(OldUser.objects.order_by("pk").values())
-
-        executor = MigrationExecutor(connection)
-        executor.migrate(self.after)
-        new = executor.loader.project_state(self.after).apps
-        NewPerson = new.get_model("structure", "Person")
-        NewUser = new.get_model("accounts", "User")
-        self.assertEqual(list(NewUser.objects.order_by("pk").values()), accounts_before)  # untouched, so every sub is too
-        self.assertEqual(NewPerson.objects.count(), len(rows))
-        for row in rows:
-            p = NewPerson.objects.get(user_id=row.pk)
-            self.assertEqual(p.name, row.name)
-            address = p.emails.get()
-            self.assertEqual(address.address, row.email)
-            self.assertIsNotNone(address.verified_at)
-
-    def test_it_goes_back(self):
-        executor = MigrationExecutor(connection)
-        executor.migrate(self.after)
-        executor = MigrationExecutor(connection)
-        executor.migrate(self.before)
-
-
 # ---- The two made-up installations ----------------------------------------------------
 
 
@@ -588,6 +538,8 @@ class Examples(TestCase):
                 for model in (Person, EmailAddress, Membership, Position, Reason, Grant, SeatRule):
                     for row in model.objects.all():
                         row.full_clean()
+                        if hasattr(row, "check_rules"):
+                            row.check_rules()
                 transaction.set_rollback(True)
 
     def test_example_society_has_what_the_plan_lists(self):

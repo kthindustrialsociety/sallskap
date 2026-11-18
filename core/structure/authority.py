@@ -10,7 +10,7 @@ from operator import or_
 
 from django.db.models import Q
 
-from .models import GRANTABLE, Grant, Permission, Position, Tie, Unit, _today
+from .models import GRANTABLE, Grant, Permission, Position, Unit, _today
 
 P = Permission
 R = Position.Role
@@ -50,8 +50,7 @@ ONLY_IN = {
 def _reach(person, permission, on):
     """(scope, unit) for each position or grant giving the person this permission on that
     day. A position in a unit archived by then gives nothing, and nor does a grant to it."""
-    not_archived = Q(unit__archived_at__isnull=True) | Q(unit__archived_at__date__gt=on)
-    positions = list(Position.objects.current(on).filter(not_archived, person=person).select_related("unit"))
+    positions = list(Position.objects.held(on).filter(person=person).select_related("unit"))
     for position in positions:
         for given, scope in ROLES[position.role]:
             if given == permission:
@@ -100,4 +99,4 @@ def requires_2fa(user):
     if user.pk is None:
         return False
     board_roles = Position.objects.filter(person__user=user, role__in=Position.BOARD_ROLES)
-    return Tie.overlapping(board_roles, _today(), None).exists()  # not ended by today
+    return board_roles.overlapping(_today()).exists()  # not ended by today
