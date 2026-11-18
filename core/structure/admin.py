@@ -191,15 +191,27 @@ class SeatFilter(admin.SimpleListFilter):
 
 @admin.register(Position)
 class PositionAdmin(TieAdmin):
-    """A seat is shown with its rule and the position it comes from."""
+    """A seat is shown with its rule and the position it comes from. A position kept after
+    its holder was deleted shows the name kept on it (structure.md §3)."""
 
-    list_display = ("person", "role", "title", "unit", "start", "end", "current")
+    list_display = ("holder", "role", "title", "unit", "start", "end", "current")
     list_filter = (CurrentFilter, SeatFilter, "role", "unit")
-    fields = ("person", "unit", "role", "title", "start", "end", "appointed_by", "minutes")
+    fields = ("holder", "unit", "role", "title", "start", "end", "appointed_by", "minutes")
+    readonly_fields = ("holder",)
     list_select_related = ("person", "unit")
+    search_fields = (*TieAdmin.search_fields, "kept_name")
 
     def get_fields(self, request, obj=None):
         return (*self.fields, "seat_rule", "seat_from") if obj is not None and obj.is_seat() else self.fields
+
+    @admin.display(description=_("held by"), ordering="person__name")
+    def holder(self, obj):
+        return obj.holder()
+
+
+def _since_deleted(person):
+    """Who gave a grant or made a rule, once they may have been deleted (structure.md §3)."""
+    return str(person) if person is not None else gettext("someone since deleted")
 
 
 @admin.register(Reason)
@@ -216,9 +228,14 @@ class GrantAdmin(TieAdmin):
 
     list_display = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "current")
     list_filter = (CurrentFilter, "permission", "role")
-    fields = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "given_by")
+    fields = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "giver")
+    readonly_fields = ("giver",)
     list_select_related = ("held_in", "unit")
     search_fields = ("held_in__name", "unit__name", "given_by__name")
+
+    @admin.display(description=_("given by"))
+    def giver(self, obj):
+        return _since_deleted(obj.given_by)
 
 
 @admin.register(SeatRule)
@@ -227,14 +244,18 @@ class SeatRuleAdmin(TieAdmin):
 
     list_display = ("__str__", "start", "end", "current")
     list_filter = (CurrentFilter, "role")
-    fields = ("unit", "role", "roles_shown", "held_in", "each_association_under", "start", "end", "made_by")
-    readonly_fields = ("roles_shown",)
+    fields = ("unit", "role", "roles_shown", "held_in", "each_association_under", "start", "end", "maker")
+    readonly_fields = ("roles_shown", "maker")
     list_select_related = ("unit", "held_in")
     search_fields = ("unit__name", "held_in__name", "made_by__name")
 
     @admin.display(description=_("for the roles"))
     def roles_shown(self, obj):
         return ", ".join(obj.role_labels())
+
+    @admin.display(description=_("made by"))
+    def maker(self, obj):
+        return _since_deleted(obj.made_by)
 
 
 # ---- The audit log: structure.md §7 ------------------------------------------------------

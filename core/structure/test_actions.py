@@ -829,7 +829,7 @@ class MadeUp(TestCase):
                 self.assertEqual([tie for tie in ties if tie not in made], [])
                 first = [(row.action, row.actor_person) for row in rows[:2]]
                 self.assertEqual(first, [("add_membership", None), ("record_root_chair", None)])  # as kit chair does
-                rest = rows[2:]
+                rest = [row for row in rows[2:] if row.action != "delete_people"]  # core's own, last (test_deleting.py)
                 self.assertTrue(all(row.via == "server" and row.actor_person for row in rest))
                 self.assertGreaterEqual(len({row.actor_person for row in rest}), 5)  # not one all-powerful actor
                 transaction.set_rollback(True)

@@ -50,6 +50,8 @@ def _sync(rule, source, rows, today, tree=False, dates_changed=False):
 
 
 def _add(rows, rule, source, since):
+    if source.person_id is None:  # someone since deleted: their record is kept, and not added to
+        return
     seat = Position(person_id=source.person_id, unit_id=rule.unit_id, role=rule.role, seat_rule=rule, seat_from=source, seat_since=since)
     seat.start, seat.end = _dates(seat, rule, source)
     if (seat.end is None or seat.end > seat.start) and not rule.unit.archived:  # nor anything new in an archived team

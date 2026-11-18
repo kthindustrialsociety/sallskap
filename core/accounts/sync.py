@@ -27,6 +27,7 @@ from django.utils import timezone
 from django.utils.translation import gettext as _
 from structure import models as structure
 from structure.access import for_tools, keys
+from structure.deleting import delete_people
 
 from .login_service import may_use
 from .models import AccessSync, FollowUp, User
@@ -132,10 +133,17 @@ def request_for_new_days(since, today):
 
 
 def new_day(day):
-    """Returns today, having asked about the days since `day` if it has changed."""
+    """Returns today, having asked about the days since `day` if it has changed, and
+    deleted the people with nothing left (structure.md §3). That's never done as the worker
+    starts, so an update never deletes anyone by itself. If it fails, it's logged and tried
+    again the next night, and the worker goes on telling the tools."""
     today = timezone.localdate()
     if today > day:
         request_for_new_days(day, today)
+        try:
+            delete_people(today)
+        except Exception:
+            logger.exception("Couldn't delete the people with nothing left today. Trying again tomorrow.")
     return today
 
 

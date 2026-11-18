@@ -390,7 +390,8 @@ _seating = ContextVar("seating", default=False)
 
 
 def _erase(queryset):
-    """Removes rows that are otherwise never deleted: a duplicate left by a merge, or a
+    """Removes rows that are otherwise never deleted: a duplicate left by a merge, the
+    memberships and reasons of someone deleted with nothing left (deleting.py), or a
     made-up installation being replaced. Nothing else may call this."""
     return models.QuerySet.delete(queryset)
 
@@ -780,7 +781,10 @@ class Position(Tie):
     TEAM_ROLES = (Role.LEAD, Role.PARTICIPANT)
     NEEDS_MEMBERSHIP = (*BOARD_ROLES, Role.LEAD)
 
-    person = models.ForeignKey(Person, verbose_name=_("person"), on_delete=models.PROTECT, related_name="positions")
+    # Empty once its holder is deleted, with nothing left (structure.md §3): their name is
+    # then kept here, as the record of who held what, and nothing else of theirs.
+    person = models.ForeignKey(Person, verbose_name=_("person"), null=True, blank=True, on_delete=models.PROTECT, related_name="positions")
+    kept_name = models.CharField(_("held by, since deleted"), max_length=150, blank=True, editable=False)
     unit = models.ForeignKey(Unit, verbose_name=_("unit"), on_delete=models.PROTECT, related_name="positions")
     role = models.CharField(_("role"), max_length=20, choices=Role.choices)
     title = models.CharField(_("title"), max_length=100, blank=True, help_text=_("Shown beside the role, such as Head of PR. It gives nothing beyond the role."))
@@ -810,10 +814,21 @@ class Position(Tie):
                 name="seat_has_rule_and_source",
             ),
             models.UniqueConstraint(fields=["seat_rule", "seat_from"], condition=models.Q(seat_until__isnull=True), name="one_open_seat_per_rule_and_source"),
+            # Only the ended positions of someone deleted are kept without them.
+            models.CheckConstraint(condition=models.Q(person__isnull=False) | models.Q(end__isnull=False), name="kept_position_has_ended"),
         ]
 
+    # What can't change on a position kept after its holder was deleted.
+    KEPT = ("start", "end", "title", "appointed_by", "minutes", "kept_name")
+
     def __str__(self):
-        return f"{self.person}: {self.get_role_display()}, {self.unit}"
+        return f"{self.holder()}: {self.get_role_display()}, {self.unit}"
+
+    def holder(self):
+        """Who holds it, or held it: once they're deleted, the name kept on it."""
+        if self.person_id is not None:
+            return str(self.person)
+        return self.kept_name or str(_("someone since deleted"))
 
     def membership_problem(self, on, excluding=None):
         """Why this person can't hold this role here on that day, as a non-member, or None.
@@ -840,11 +855,16 @@ class Position(Tie):
         return None
 
     def problems(self):
+        stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None and self.person_id is None:
+            return [_("Say who holds the position.")]
+        if stored is not None and stored.person_id is None and not _seating.get():
+            if any(getattr(stored, name) != getattr(self, name) for name in self.KEPT):
+                return [_("This position is kept as the record of someone since deleted, so it can't change.")]
         problems = super().problems()
         unit = self.unit
         if problem := self.role_problem(self.role, unit):
             problems.append(problem)
-        stored = Position.objects.filter(pk=self.pk).first() if self.pk else None
         self._dates_changed = stored is None or (stored.start, stored.end) != (self.start, self.end)  # for after_save
         if stored is None and unit.archived:
             problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
@@ -965,8 +985,9 @@ class Grant(Tie):
     )
     unit = models.ForeignKey(Unit, verbose_name=_("covers"), on_delete=models.PROTECT, related_name="grants")
     include_below = models.BooleanField(_("and everything inside it"), default=False)
+    # Empty once the giver is deleted (structure.md §3). The grant stays as it was.
     given_by = models.ForeignKey(
-        Person, verbose_name=_("given by"), on_delete=models.PROTECT, related_name="grants_given",
+        Person, verbose_name=_("given by"), null=True, blank=True, on_delete=models.PROTECT, related_name="grants_given",
         help_text=_("A chair or vice chair with authority over the unit it covers, on the day it starts."),
     )
 
@@ -999,6 +1020,8 @@ class Grant(Tie):
         if problem := Position.role_problem(self.role, held_in):
             problems.append(problem)
         stored = Grant.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None and self.given_by_id is None:
+            problems.append(_("Say who gives the grant."))
         if stored is None:
             for unit in {held_in, self.unit}:
                 if unit.archived:
@@ -1035,8 +1058,9 @@ class SeatRule(Tie):
         _("in each association directly under it"), default=False,
         help_text=_("Such as the chair of each association directly under the root, rather than the root's own."),
     )
+    # Empty once its maker is deleted (structure.md §3). The rule stays as it was.
     made_by = models.ForeignKey(
-        Person, verbose_name=_("made by"), on_delete=models.PROTECT, related_name="seat_rules_made",
+        Person, verbose_name=_("made by"), null=True, blank=True, on_delete=models.PROTECT, related_name="seat_rules_made",
         help_text=_("Someone who could appoint in the unit with the seats, on the day it starts."),
     )
 
@@ -1145,6 +1169,8 @@ class SeatRule(Tie):
         else:
             problems += list(dict.fromkeys(problem for role in roles if (problem := Position.role_problem(role, held_in))))
         stored = SeatRule.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is None and self.made_by_id is None:
+            problems.append(_("Say who makes the seat rule."))
         if stored is None:
             for where in {unit, held_in}:
                 if where.archived:
@@ -1192,7 +1218,7 @@ class AuditEntry(models.Model):
     HIDDEN = {"structure.reason": ("source",), "accounts.user": ("email", "name")}
     # Who a tie is for is left out, so the row leads to them only through the tie. Whoever
     # gave a grant or made a rule is the actor, and the rest is worked out by core.
-    LEFT_OUT = ("id", "path", "person", "given_by", "made_by", "seat_since", "seat_until")
+    LEFT_OUT = ("id", "path", "person", "kept_name", "given_by", "made_by", "seat_since", "seat_until")
 
     at = models.DateTimeField(_("when"), default=timezone.now, db_index=True)
     action = models.CharField(_("action"), max_length=50, db_index=True)
