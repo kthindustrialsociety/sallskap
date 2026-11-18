@@ -1894,6 +1894,30 @@ class Backups(unittest.TestCase):
         self.assertEqual([c for c in self.restic_calls("init") if str(self.base / "away") in c], [])
         self.assertEqual(len(self.restic_calls("copy")), 1)
 
+    def test_a_target_forgets_old_backups_as_the_server_does(self):
+        """Or someone deleted (structure.md §3) would stay there for ever."""
+        away = str(self.base / "away")
+        self.paths.config.write_text(
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{away}"\n[modules]\ndemo = true\n'
+        )
+        self.run_kit("backup")
+        here, there = self.restic_calls("forget")
+        self.assertNotIn(away, here)
+        self.assertEqual(there[:3], ["restic", "--repo", away])
+        self.assertEqual(there[3:], here[3:])  # the same policy, tag and prune
+        self.assertEqual([c[3] for c in self.restic_calls()][-2:], ["copy", "forget"])  # after what it's sent
+
+    def test_an_updates_backup_leaves_forgetting_to_the_nightly_run_there_too(self):
+        """Everything is stopped for an update, so it does no more than it has to."""
+        away = str(self.base / "away")
+        self.paths.config.write_text(
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{away}"\n[modules]\ndemo = true\n'
+        )
+        with kit._backup_lock(self.paths):
+            kit._take_backup(self.paths, self.config(), leave_stopped=True)
+        self.assertEqual(len(self.restic_calls("copy")), 1)
+        self.assertEqual(self.restic_calls("forget"), [])
+
     def test_a_target_is_read_as_a_restic_repository_and_nothing_else(self):
         for target in ("", 42, True):
             with self.subTest(target=target):
