@@ -40,6 +40,12 @@ class UnitQuerySet(models.QuerySet):
     def root(self):
         return self.get(parent=None)
 
+    def delete(self):
+        # One at a time, so each is checked, as tests/live_check.py's cleanup deletes several.
+        for unit in self:
+            unit.check_can_delete()
+        return super().delete()
+
 
 class Unit(models.Model):
     class Kind(models.TextChoices):
@@ -299,9 +305,12 @@ class Unit(models.Model):
             if position.membership_problem(since=max(position.start, today), needed=needed):
                 raise ValidationError(_("%(person)s leads %(team)s as a member of an association taken off its list. Hand over the lead first.") % {"person": position.person, "team": self})
 
-    def delete(self, *args, **kwargs):
+    def check_can_delete(self):
         if problem := self.deletion_problem():
             raise ValidationError(problem)
+
+    def delete(self, *args, **kwargs):
+        self.check_can_delete()
         return super().delete(*args, **kwargs)
 
 
@@ -434,13 +443,10 @@ class Person(models.Model):
 
     # ---- What they're a member of ----------------------------------------------------
 
-    def is_member(self, association, on=None, excluding=None):
+    def is_member(self, association, on=None):
         """A member of `association` on that day, directly or through an association
         inside it: membership counts upwards."""
-        memberships = self.memberships.current(on).filter(association__path__startswith=association.path)
-        if excluding is not None:
-            memberships = memberships.exclude(pk=excluding)
-        return memberships.exists()
+        return self.memberships.current(on).filter(association__path__startswith=association.path).exists()
 
     def first_day_not_member(self, associations, since, until=None, instead=None):
         """The first day from `since`, and before `until` if given, on which they aren't a

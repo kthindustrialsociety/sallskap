@@ -56,7 +56,7 @@ NEEDS_NAME_AND_KEY = (
     "The config file needs the association's name and key under [association], such as\n\n"
     '  name = "Example Society"\n  key  = "example"\n\n'
     "The key is short, lowercase, and fixed for good: tools know the association by it. "
-    "Add both, then run this again."
+    "Add both to {config}, then run this again."
 )
 
 
@@ -189,7 +189,7 @@ def service_hostnames(primary: str) -> set[str]:
     return names
 
 
-def parse_config(text: str) -> Config:
+def parse_config(text: str, config: str = "the config file") -> Config:
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -200,7 +200,7 @@ def parse_config(text: str) -> Config:
         raise KitError("The config file needs a domain under [association].")
     primary = _check_hostname(primary, "Primary domain")
     if raw["association"].get("name") is None or raw["association"].get("key") is None:
-        raise KitError(NEEDS_NAME_AND_KEY)
+        raise KitError(NEEDS_NAME_AND_KEY.format(config=config))
     root_name, root_key = _check_name_and_key(raw["association"]["name"], raw["association"]["key"])
 
     sites = []
@@ -284,7 +284,7 @@ def _root_given_to_core(paths: Paths) -> dict | None:
 
 def load_config(paths: Paths) -> Config:
     try:
-        return parse_config(paths.config.read_text("utf-8"))
+        return parse_config(paths.config.read_text("utf-8"), str(paths.config))
     except FileNotFoundError:
         raise KitError(f"No config file at {paths.config}. Run the setup first.") from None
 
