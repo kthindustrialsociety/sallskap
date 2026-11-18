@@ -7,16 +7,10 @@ NAME = "Operator"
 
 # Passwords to change when someone leaves the vault.
 FOLLOW_UPS = ("accounts.view_followup", "accounts.change_followup")
-# The tree of associations and teams, until actions check authority (A6).
-UNITS = ("structure.view_unit", "structure.add_unit", "structure.change_unit", "structure.delete_unit")
-# People, their ties, grants and seat rules. None of those are ever deleted, so nobody
-# gets that permission for them.
-TIES = ("membership", "position", "reason", "grant", "seatrule")
-PEOPLE = (
-    "structure.view_person", "structure.add_person", "structure.change_person", "structure.delete_person",
-    "structure.view_emailaddress", "structure.add_emailaddress", "structure.change_emailaddress", "structure.delete_emailaddress",
-    *(f"structure.{verb}_{tie}" for tie in TIES for verb in ("view", "add", "change")),
-)
+# The tree, people, their ties, grants, seat rules and the audit log: shown, and never
+# changed in the admin page, as operators never pass can() (structure.md §4 and §7).
+# Changes go through structure/actions.py. Merging two people only needs to see them.
+SHOWN = ("unit", "person", "emailaddress", "membership", "position", "reason", "grant", "seatrule", "auditentry")
 
 PERMISSIONS = (
     "accounts.view_user",
@@ -25,8 +19,7 @@ PERMISSIONS = (
     "mfa.view_authenticator",
     "mfa.delete_authenticator",  # how someone who lost their phone starts over
     *FOLLOW_UPS,
-    *UNITS,
-    *PEOPLE,
+    *(f"structure.view_{model}" for model in SHOWN),
 )
 
 
