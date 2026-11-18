@@ -347,6 +347,7 @@ RULES = [
     ("run_for", "chair@root", lambda t: dict(team=t.u("lab"), association=t.u("chem"))),  # its own association
     ("make_seat_rule", "chair@root", lambda t: dict(unit=t.u("chem"), role=Role.CHAIR, from_roles=[Role.CHAIR], held_in=t.u("rob"))),  # never a chair
     ("end_membership", "chair@root", lambda t: dict(membership=Membership.objects.get(person=t.ids["lead@dev"]))),  # a lead rests on it
+    ("change_membership", "chair@root", lambda t: dict(membership=Membership.objects.get(person=t.ids["lead@dev"]), start=LATER)),  # and from its start
 ]
 
 
