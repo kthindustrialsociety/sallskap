@@ -22,12 +22,14 @@ A section is never edited once its release is tagged. A mistake is put right in 
   ```
 
   The key is short, lowercase letters, digits and single hyphens, such as your association's usual abbreviation. Tools will know your association by it, so **it can never change.** If you forgot, the update says so: add them, then run `kit update --finish`.
-- **Write down who is in each group before you update.** Access now comes from memberships and positions, and Operator is the only group. The update removes the Board, Treasurer, Events, Developer and Member groups, and any group made by hand, along with who was in them. Afterwards, record those people in the admin page, under People:
+- **Write down who is in each group before you update.** Access now comes from memberships and positions, and Operator is the only group. The update removes the Board, Treasurer, Events, Developer and Member groups, and any group made by hand, along with who was in them. Until they're recorded, they lose what the groups gave them: the vault, Forgejo's board team, and the admin page. Operators keep everything. What has to be recorded:
   - a membership of your association for each member;
   - the board's positions on your association, chair included;
   - a team for what Events and Developer were for, with its lead and participants.
 
-  Until you do, they lose what the groups gave them: the vault, Forgejo's board team, and the admin page. Operators keep everything.
+  Record your association's chair after updating with `kit chair <their email>`. The rest is recorded by the chair and the people they appoint, through the member pages and the command line, which come in a later release: the admin page no longer changes any of it (below).
+- **The admin page shows your association's structure and no longer changes it:** associations and teams, people and their addresses, memberships, positions, reasons, grants and seat rules. Operators run the server and have no say over members, so these changes are made by people whose positions allow them, and the member pages and command line for that come in a later release. Operators still add and change accounts, make Operators, remove someone's two-factor authentication, mark follow-ups done, and merge two people. `kit chair` records your association's chair.
+- **Django's own admin history is deleted by the update,** as it kept the names and addresses of what was changed, with no way to delete them. The new audit log records changes from the update on, naming nobody. There's nothing to do.
 - **The admin page is for Operators only now.** Board members no longer reach it, and the vault's follow-ups go to Operators. The board's own pages come in a later release.
 - **If Git is on, refresh Forgejo's sign-in after updating,** so it maps your association's chair and vice chair the way core does: run `kit tool remove forgejo`, then `kit enable git`. Signing in to Forgejo doesn't work between the two. Forgejo's old developers team is left as it was, and nobody is added to it any more: give its people a team in core, then delete it in Forgejo.
 - **A tool you limited with `kit tool add --group`** to developer, events or a group made by hand lets nobody in now. Remove it with `kit tool remove`, then add it again with the keys you want, such as `board` or `website:lead`. The vault needs nothing: it already uses `board` and `operator`.
@@ -39,21 +41,21 @@ A section is never edited once its release is tagged. A mistake is put right in 
 ### Changes
 
 - feat: units, the tree of associations and teams (structure.md §1).
-  - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. Operators add teams, projects and associations inside it in the admin page, under Units.
+  - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. The admin page shows the units inside it, under Units.
   - A unit's key is fixed once set and never reused. A project is archived by hand, which archives everything inside it.
   - Nothing is visible to members yet.
   - `kit init` now asks for the association's name and key.
 - feat: people, and the ties between them and units (structure.md §2 and §3).
   - Every account becomes a person, with its name and its address, marked verified. Accounts themselves don't change, so neither does anything the tools see.
-  - Operators add people, memberships, positions and reasons in the admin page, under People. Ties are ended, never deleted, so the record of who held what is kept.
+  - The admin page shows people, memberships, positions and reasons, under People. Ties are ended, never deleted, so the record of who held what is kept.
   - Only members hold board roles or lead teams, and membership of an association counts for every association above it.
   - When an account's address is changed, the old one stays on its person, unverified, so it can be given to someone else, such as a role's shared address.
 - feat: authority, and grants (structure.md §4).
-  - One check decides what each role can do, and in which units, from current positions and grants. Nothing but grants uses it yet: the admin page's changes, the member pages and the CLI move to it later.
-  - Operators give and end grants in the admin page, under Grants. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
+  - One check decides what each role can do, and in which units, from current positions and grants. Every change to the tree asks it (actions, below).
+  - The admin page shows grants, under Grants. A grant gives one permission, such as fees and treasury, to a role in a unit, so it passes to whoever holds that role next. Appointing people, changing units and giving grants can't be granted.
   - **Two-factor authentication is required for anyone with a board role in any association,** from the day the position is recorded, as well as for Operators as before. Someone given a board role is asked to set it up before any tool lets them in.
 - feat: seat rules, for posts that come with another (structure.md §4).
-  - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. Operators set and end rules in the admin page, under Seat rules. A rule is only accepted from someone who could appoint in that unit.
+  - A seat rule gives a role in one unit to whoever holds certain roles in another, such as a seat on a federation's board for the chair of each association inside it, or a department led by an association's vice chair. The admin page shows them, under Seat rules. A rule is only accepted from someone who could appoint in that unit.
   - Core gives each seat itself, as a position, from the day the position it comes from starts, and ends it when that position or the rule ends. A seat gives what its role gives, grants and two-factor authentication included, and stays in the record when it ends. It can't be set, changed or ended by hand.
 - feat: keys to the tools, worked out from memberships and positions (structure.md §5).
   - Tools are told keys: `<unit>:<role>` for each position, seats included, and `<association>:member` for each association someone is a member of, counting upwards. `member`, `board` (a board role on your association), `treasurer` (its treasurer) and `operator` are the same in every installation, for modules to use. Only current ties in units that aren't archived count, and keys from roles that need two-factor authentication wait until it's set up.
@@ -65,6 +67,12 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - The unit key `custom` is no longer reserved.
   - `tests/live_check.py` gives its fake people memberships and positions instead of groups.
 - fix: `tests/live_check.py` turns off its fake people's own Forgejo 2FA before removing them. Removing them left the 2FA behind, so on a test server Forgejo's own check warned of one more orphaned 2FA record after every run. A test server with those warnings can clear them once with `docker exec sallskap-forgejo-1 forgejo doctor check --run check-db-consistency --fix`.
+- feat: actions, and the audit log (structure.md §4 and §7).
+  - Every change to associations, teams, memberships, positions, reasons, grants and seat rules is an action in core, which asks once whether the person can do it, in that unit, today. Moving, archiving, bringing back and deleting a unit, and setting up a service for another association, are decided one level up. An appointment that starts later is checked when it's recorded, so the outgoing board records the next one.
+  - The audit log records each action, with who did it, where, through which way in, and what changed, and also Operators' changes to accounts and `kit admin` and `kit chair` on the server. It names nobody, so it never keeps anyone's data after they're deleted, and it's only ever added to. Operators read it in the admin page, under Audit log.
+  - The admin page shows the tree, people and their ties, and changes none of them. Operators merge two people there, which the log records.
+  - `kit chair <email>` records your association's chair, and makes them a member of it if they aren't one. It's how a new installation records its first chair.
+
 
 ## 0.7.2 (2026-11-10)
 
