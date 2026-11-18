@@ -737,6 +737,99 @@ class AfterReview(Tree):
         self.assertEqual(Person.objects.count(), 1)
 
 
+class MembersOnly(Tree):
+    """A board role or lead needs its holder to be a member for its whole time, through
+    any change to memberships, positions or the tree (structure.md §3). From today on, for
+    a move, as the tree keeps no history."""
+
+    def test_a_membership_cannot_start_after_a_position_resting_on_it(self):
+        p = person()
+        membership = member(p, self.robotics, start=date(2022, 9, 1))
+        position(p, self.robotics, Role.CHAIR, start=date(2026, 3, 1))
+        membership.start = date(2027, 1, 1)
+        with self.assertRaises(ValidationError):
+            membership.save()
+        membership.start = date(2025, 9, 1)  # still before the chair
+        membership.save()
+
+    def test_nor_after_one_that_has_ended(self):
+        p = person()
+        membership = member(p, self.robotics, start=date(2020, 9, 1))
+        position(p, self.robotics, Role.TREASURER, start=date(2021, 3, 1), end=date(2022, 3, 1))
+        membership.start = date(2023, 9, 1)
+        with self.assertRaises(ValidationError):
+            membership.save()
+
+    def test_an_appointment_needs_membership_until_it_ends(self):
+        p = person()
+        member(p, self.robotics, end=TODAY + timedelta(days=30))
+        for end in (None, TODAY + timedelta(days=31)):
+            with self.subTest(end=end), self.assertRaises(ValidationError), transaction.atomic():
+                position(p, self.robotics, Role.SECRETARY, end=end)
+        position(p, self.robotics, Role.SECRETARY, end=TODAY + timedelta(days=30))
+
+    def test_a_membership_ends_no_earlier_than_what_rests_on_it(self):
+        p = person()
+        membership = member(p, self.robotics)
+        position(p, self.uavs, Role.LEAD, end=TODAY + timedelta(days=30))
+        with self.assertRaises(ValidationError), transaction.atomic():
+            membership.end_on(TODAY + timedelta(days=20))
+        membership.refresh_from_db()
+        membership.end_on(TODAY + timedelta(days=30))
+
+    def test_two_memberships_one_after_the_other_carry_a_position(self):
+        p = person()
+        member(p, self.robotics, start=date(2020, 9, 1), end=date(2024, 9, 1))
+        member(p, self.chemistry, start=date(2024, 9, 1))
+        position(p, self.root, Role.BOARD_MEMBER, start=date(2023, 3, 1))  # the root, through either
+
+    def test_a_gap_between_them_is_refused(self):
+        p = person()
+        member(p, self.robotics, start=date(2020, 9, 1), end=date(2024, 6, 1))
+        member(p, self.chemistry, start=date(2024, 9, 1))
+        with self.assertRaises(ValidationError):
+            position(p, self.root, Role.BOARD_MEMBER, start=date(2023, 3, 1))
+
+    def test_moving_an_association_out_cannot_leave_a_board_role_above_it(self):
+        inner = unit(ASSOCIATION, "inner", self.robotics)
+        p = person()
+        member(p, inner)  # a member of Robotics through it
+        position(p, self.robotics, Role.BOARD_MEMBER)
+        inner.parent = self.root
+        with self.assertRaises(ValidationError), transaction.atomic():
+            inner.save()
+        inner.refresh_from_db()
+        self.assertEqual(inner.parent, self.robotics)
+
+    def test_a_move_checks_appointments_that_start_later(self):
+        lab = unit(TEAM, "lab", self.chemistry)
+        p = person()
+        member(p, self.robotics)
+        position(p, self.uavs, Role.LEAD, start=TODAY + timedelta(days=30))
+        self.uavs.parent = lab  # owned by Chemistry, which p isn't a member of
+        with self.assertRaises(ValidationError), transaction.atomic():
+            self.uavs.save()
+        self.uavs.refresh_from_db()
+        self.assertEqual(self.uavs.parent, self.development)
+
+    def test_a_move_leaves_the_past_alone(self):
+        lab = unit(TEAM, "lab", self.chemistry)
+        p = person()
+        member(p, self.robotics)
+        position(p, self.uavs, Role.LEAD, start=date(2023, 1, 1), end=date(2024, 1, 1))
+        self.uavs.parent = lab
+        self.uavs.save()
+
+    def test_shortening_a_position_is_never_held_up(self):
+        p = person()
+        membership = member(p, self.robotics)
+        chair = position(p, self.robotics, Role.CHAIR)
+        Membership.objects.filter(pk=membership.pk).update(start=date(2024, 1, 1))  # a gap, written past the rules
+        chair.start = date(2022, 1, 1)  # still in the gap, but shorter
+        chair.save()
+        chair.end_on()
+
+
 class TakingPartAfterReview(Tree):
     def test_an_association_a_lead_rests_on_stays_taking_part(self):
         """Checked by the admin form until A6, and by the model since, so every way holds it."""

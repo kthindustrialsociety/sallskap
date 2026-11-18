@@ -288,12 +288,15 @@ class Unit(models.Model):
             return _("A seat rule gives seats in %(unit)s, or comes from a role in it, now or before, and that record is kept.") % {"unit": self}
         return None
 
-    def membership_problems(self, below=True):
-        """For the current board roles and leads here, and with `below` in every unit
-        under it: any whose holder isn't the member the role needs, as after a move."""
-        units = Unit.objects.filter(path__startswith=self.path) if below else Unit.objects.filter(pk=self.pk)
-        held = Position.objects.current().filter(unit__in=units, role__in=Position.NEEDS_MEMBERSHIP).select_related("person", "unit")
-        return [problem for position in held if (problem := position.membership_problem(on=_today()))]
+    def membership_problems(self):
+        """After this unit moved: the board roles and leads held today or later whose holder
+        would stop being the member the role needs. A move changes what the positions in
+        it need, and what memberships of the associations in it count for. Checked from
+        today, as the tree keeps no history."""
+        today = _today()
+        moved = models.Q(unit__path__startswith=self.path) | models.Q(person__memberships__association__path__startswith=self.path)
+        held = Tie.overlapping(Position.objects.filter(moved, role__in=Position.NEEDS_MEMBERSHIP), today, None).distinct().select_related("person", "unit")
+        return [problem for position in held if (problem := position.membership_problem(since=max(position.start, today)))]
 
     def check_can_delete(self):
         problem = self.deletion_problem()
@@ -308,7 +311,7 @@ class Unit(models.Model):
         needed = [self.association(), *remaining]
         leads = Tie.overlapping(Position.objects.filter(unit=self, role=Position.Role.LEAD), today, None).select_related("person")
         for position in leads:
-            if not any(position.person.is_member(association, on=max(position.start, today)) for association in needed):
+            if position.membership_problem(since=max(position.start, today), needed=needed):
                 raise ValidationError(_("%(person)s leads %(team)s as a member of an association taken off its list. Hand over the lead first.") % {"person": position.person, "team": self})
 
     def delete(self, *args, **kwargs):
@@ -457,6 +460,24 @@ class Person(models.Model):
         if excluding is not None:
             memberships = memberships.exclude(pk=excluding)
         return memberships.exists()
+
+    def first_day_not_member(self, associations, since, until=None, instead=None):
+        """The first day from `since`, and before `until` if given, on which they aren't a
+        member of any of `associations`, counting upwards, or None if there's none.
+        `instead` is a membership about to be saved, counted as it will be."""
+        paths = tuple(association.path for association in associations)
+        memberships = [m for m in self.memberships.select_related("association") if m.pk != getattr(instead, "pk", None)]
+        counted = sorted((m for m in [*memberships, *filter(None, [instead])] if m.association.path.startswith(paths)), key=lambda m: m.start)
+        day = since
+        for start, end in ((m.start, m.end) for m in counted):  # each pushing `day` on as far as it holds
+            if until is not None and day >= until:
+                return None
+            if start > day:
+                return day
+            if end is None:
+                return None
+            day = max(day, end)
+        return day if until is None or day < until else None
 
     def member_of(self, on=None):
         """Every association they're a member of, counting upwards. Worked out from the
@@ -755,8 +776,17 @@ class Membership(Tie):
             problems.append(_("%(unit)s is a team. Membership is only of associations: in teams, people hold positions.") % {"unit": self.association})
         if self.start and Tie.overlapping(Membership.objects.filter(person=self.person_id, association=self.association_id).exclude(pk=self.pk), self.start, self.end).exists():
             problems.append(_("%(person)s is already a member of %(unit)s at that time.") % {"person": self.person, "unit": self.association})
-        if self.pk and self.end is not None:
-            problems += self._positions_resting_on_it()
+        stored = Membership.objects.filter(pk=self.pk).first() if self.pk else None
+        if stored is not None and self.start:
+            # The first day it no longer covers, if it covers less: a later start, an earlier end.
+            if self.start > stored.start:
+                lost = stored.start
+            elif self.end is not None and (stored.end is None or self.end < stored.end):
+                lost = self.end
+            else:
+                lost = None
+            if lost:
+                problems += self._positions_resting_on_it(lost)
         return problems
 
     def after_save(self):
@@ -764,12 +794,12 @@ class Membership(Tie):
 
         tell_tools(Person.objects.filter(pk=self.person_id))
 
-    def _positions_resting_on_it(self):
-        """A membership can't end while a board role or lead rests on it."""
+    def _positions_resting_on_it(self, lost):
+        """A membership covers no less while a board role or lead rests on it, from `lost` on."""
         problems = []
-        held = Position.objects.filter(person=self.person_id, role__in=Position.NEEDS_MEMBERSHIP).filter(models.Q(end__isnull=True) | models.Q(end__gt=self.end))
-        for position in held.select_related("unit"):
-            if position.membership_problem(on=max(self.end, position.start), excluding=self.pk):
+        held = Tie.overlapping(Position.objects.filter(person=self.person_id, role__in=Position.NEEDS_MEMBERSHIP), lost, None)
+        for position in held.select_related("person", "unit"):
+            if position.membership_problem(since=max(lost, position.start), instead=self):
                 problems.append(_("%(person)s is %(role)s of %(unit)s, which needs this membership. End or hand over that position first.") % {"person": self.person, "role": position.get_role_display(), "unit": position.unit})
         return problems
 
@@ -838,20 +868,23 @@ class Position(Tie):
             return str(self.person)
         return self.kept_name or str(SINCE_DELETED)
 
-    def membership_problem(self, on, excluding=None):
-        """Why this person can't hold this role here on that day, as a non-member, or None.
-        A board role needs a membership of the association, and a lead one of the
-        association owning the team or of one taking part in it."""
-        if self.role in self.BOARD_ROLES:
+    def membership_problem(self, since, needed=None, instead=None):
+        """Why this person can't hold this role here from `since` until it ends, as someone
+        who isn't a member on one of those days, or None. A board role needs a membership
+        of the association, and a lead one of the association owning the team or of one
+        taking part in it, unless `needed` says otherwise. `instead`: a membership about to
+        be saved, counted as it will be."""
+        if needed is None and self.role in self.BOARD_ROLES:
             needed = [self.unit]
-        elif self.role == self.Role.LEAD:
+        elif needed is None and self.role == self.Role.LEAD:
             needed = [self.unit.association(), *self.unit.taking_part.all()]
-        else:
+        elif needed is None:
             return None
-        if any(self.person.is_member(association, on=on, excluding=excluding) for association in needed):
+        day = self.person.first_day_not_member(needed, since, until=self.end, instead=instead)
+        if day is None:
             return None
         names = ", ".join(str(association) for association in needed)
-        return _("Only a member can be %(role)s here: %(person)s isn't a member of %(names)s on %(day)s.") % {"role": self.get_role_display(), "person": self.person, "names": names, "day": on}
+        return _("Only a member can be %(role)s here: %(person)s isn't a member of %(names)s on %(day)s.") % {"role": self.get_role_display(), "person": self.person, "names": names, "day": day}
 
     @classmethod
     def role_problem(cls, role, unit):
@@ -876,10 +909,15 @@ class Position(Tie):
         self._dates_changed = stored is None or (stored.start, stored.end) != (self.start, self.end)  # for after_save
         if stored is None and unit.archived:
             problems.append(_("%(unit)s is archived, so nobody is added to it.") % {"unit": unit})
-        if not problems and self.start and (stored is None or stored.start != self.start):
-            problem = self.membership_problem(on=self.start)
-            if problem:
-                problems.append(problem)
+        # Checked over the days it gains, so shortening one, or ending it, is never held up.
+        if stored is None or self.start < stored.start:
+            gained = self.start
+        elif stored.end is not None and (self.end is None or self.end > stored.end):
+            gained = stored.end
+        else:
+            gained = None
+        if not problems and gained and (problem := self.membership_problem(since=gained)):
+            problems.append(problem)
         if self.role == self.Role.CHAIR and self.start:
             others = Tie.overlapping(Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR).exclude(pk=self.pk), self.start, self.end)
             if stored is None:  # a new chair ends an open one that started before
