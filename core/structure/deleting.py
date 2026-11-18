@@ -20,7 +20,7 @@ from datetime import datetime, time, timedelta
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 from django.utils.translation import gettext as _
 
@@ -35,12 +35,6 @@ COUNTS = ("people", "addresses", "memberships", "reasons", "positions_kept", "gr
 TIES = (Membership, Position, Reason)
 
 
-def _ending_after(model, day):
-    """Ties of this kind that still hold after `day`: open, or ending later."""
-    end = model.end_field
-    return model.objects.filter(Q(**{f"{end}__isnull": True}) | Q(**{f"{end}__gt": day}))
-
-
 def due(today=None):
     """Everyone who on `today` has had nothing left for 30 days."""
     today = today or _today()
@@ -48,7 +42,7 @@ def due(today=None):
     added_since = timezone.make_aware(datetime.combine(since + timedelta(days=1), time.min))
     people = Person.objects.filter(user__isnull=True).exclude(created_at__gte=added_since)
     for model in TIES:
-        people = people.filter(~Exists(_ending_after(model, since).filter(person=OuterRef("pk"))))
+        people = people.filter(~Exists(model.objects.overlapping(since).filter(person=OuterRef("pk"))))
     return people.order_by("pk")
 
 
@@ -61,7 +55,7 @@ def forget(person, today=None):
     if person.user_id is not None:
         raise ValidationError(_("%(person)s has an account, so they aren't deleted.") % {"person": person})
     for model in TIES:
-        if _ending_after(model, today).filter(person=person).exists():
+        if model.objects.overlapping(today).filter(person=person).exists():
             raise ValidationError(_("%(person)s still has a tie or a reason, today or later, so they aren't deleted.") % {"person": person})
     counts = Counter(people=1)
     # A name is all that's kept. Someone who gave none is shown as since deleted, as their

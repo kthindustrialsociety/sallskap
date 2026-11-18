@@ -28,8 +28,7 @@ def keys(user, on=None):
 
 def person_keys(person, on):
     found = set()
-    not_archived = Q(unit__archived_at__isnull=True) | Q(unit__archived_at__date__gt=on)
-    held = Position.objects.current(on).filter(not_archived, person=person).values_list("unit__key", "unit__parent", "role")
+    held = Position.objects.held(on).filter(person=person).values_list("unit__key", "unit__parent", "role")
     for unit, parent, role in held:
         found.add(f"{unit}:{role}")
         if parent is None:  # the root

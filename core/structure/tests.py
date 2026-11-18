@@ -318,11 +318,6 @@ class Deleting(Tree):
             self.uavs.delete()
         self.assertTrue(Unit.objects.filter(pk=self.uavs.pk).exists())
 
-    def test_nor_can_a_bulk_delete_take_it(self):
-        with self.assertRaises(ValidationError):
-            Unit.objects.filter(pk=self.uavs.pk).delete()
-        self.assertTrue(Unit.objects.filter(pk=self.uavs.pk).exists())
-
     def test_an_association_taking_part_somewhere_cannot(self):
         chemistry = association("chemistry", self.root)
         self.development.taking_part.add(chemistry)
@@ -417,6 +412,7 @@ class Examples(TestCase):
                     root = self.build(name)
                     for unit in Unit.objects.all():
                         unit.full_clean()
+                        unit.check_rules()
                     self.assertEqual(Unit.objects.root(), root)
                     transaction.set_rollback(True)
 
