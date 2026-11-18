@@ -342,6 +342,7 @@ RULES = [
     ("archive_unit", "chair@root", lambda t: dict(unit=t.u("rob"))),  # only teams
     ("delete_unit", "chair@root", lambda t: dict(unit=t.u("uavs"))),  # people were tied to it
     ("end_position", "chair@root", lambda t: dict(position=t.seat())),  # a seat follows its rule
+    ("end_position", "chair@root", lambda t: dict(position=Position.objects.get(person=t.ids["ended"]))),  # it ended yesterday, so not again today
     ("end_taking_part", "vice_chair@rob", lambda t: dict(team=t.u("ops"), association=t.u("chem"))),  # a lead rests on it
     ("run_for", "chair@root", lambda t: dict(team=t.u("lab"), association=t.u("chem"))),  # its own association
     ("make_seat_rule", "chair@root", lambda t: dict(unit=t.u("chem"), role=Role.CHAIR, from_roles=[Role.CHAIR], held_in=t.u("rob"))),  # never a chair
@@ -387,6 +388,25 @@ class Table(Tree):
                 with self.assertRaises(ValidationError):
                     self.act(name, actor, args)
                 self.assertEqual(state(), before)
+
+    def test_an_end_already_set_only_moves_earlier(self):
+        """Ending again later would give back what the tie gave, over days already past.
+        Earlier puts a mistake right."""
+        for name in ("end_position", "end_membership", "end_reason", "end_grant", "end_seat_rule"):
+            _, actor, args, _ = first_allowed(name)
+
+            def end(day):
+                return ACTIONS[name](self.p(actor), via=SERVER, day=day, **args(self))
+
+            with self.subTest(action=name), transaction.atomic():
+                end(TODAY + timedelta(days=10))
+                before = state()
+                with self.assertRaisesMessage(ValidationError, "can only be ended earlier"):
+                    end(TODAY + timedelta(days=20))
+                self.assertEqual(state(), before)
+                tie = end(TODAY)
+                self.assertEqual(getattr(tie, tie.end_field), TODAY)
+                transaction.set_rollback(True)
 
     def test_nobody_without_a_person_acts(self):
         with self.assertRaises(NotAllowed):

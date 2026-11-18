@@ -666,7 +666,12 @@ class Tie(models.Model):
         return self.start <= on and (end is None or end > on)
 
     def end_on(self, day=None):
-        setattr(self, self.end_field, day or _today())
+        """Ends it on `day`, today if not given. An end already set only moves earlier, to
+        put a mistake right: later would give back what it gave, over days already past."""
+        day, end = day or _today(), getattr(self, self.end_field)
+        if end is not None and day > end:
+            raise ValidationError(_("It already ends on %(end)s, so it can only be ended earlier.") % {"end": end})
+        setattr(self, self.end_field, day)
         self.save()
 
     def delete(self, *args, **kwargs):
