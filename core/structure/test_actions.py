@@ -339,6 +339,7 @@ RULES = [
     ("move_unit", "chair@root", lambda t: dict(unit=t.u("root"), parent=t.u("rob"))),
     ("move_unit", "chair@root", lambda t: dict(unit=t.u("dev"), parent=t.u("uavs"))),  # into itself
     ("move_unit", "chair@root", lambda t: dict(unit=t.u("ops"), parent=None)),  # every unit but the root sits in another
+    ("create_unit", "chair@root", lambda t: dict(parent=None, kind=TEAM, key="nowhere", name="Nowhere")),  # nor is one made outside
     ("archive_unit", "chair@root", lambda t: dict(unit=t.u("rob"))),  # only teams
     ("delete_unit", "chair@root", lambda t: dict(unit=t.u("uavs"))),  # people were tied to it
     ("end_position", "chair@root", lambda t: dict(position=t.seat())),  # a seat follows its rule
@@ -738,6 +739,16 @@ class OperatorsChanges(TestCase):
         deleted = AuditEntry.objects.get(action="delete_account")
         self.assertEqual((deleted.object_id, deleted.changes["email"], deleted.changes["person_removed"]), (user.pk, None, True))
         self.assertFalse(LogEntry.objects.exists())
+
+    def test_deleting_an_account_with_no_person_says_none_was_removed(self):
+        root, _ = make_user("root@example.org", two_factor=True)
+        root.is_superuser = True
+        root.save()
+        self.client.force_login(root)
+        user, _ = make_user("bo@example.org")
+        Person.objects.filter(user=user).update(user=None)  # as a raw save could leave it
+        self.client.post(reverse("admin:accounts_user_delete", args=[user.pk]), {"post": "yes"})
+        self.assertIs(AuditEntry.objects.get(action="delete_account").changes["person_removed"], False)
 
     def test_django_keeps_no_history_of_its_own(self):
         self.client.post(reverse("admin:accounts_user_add"), {"email": "bo@example.org", "name": "Bo", "is_active": "on", "groups": []})

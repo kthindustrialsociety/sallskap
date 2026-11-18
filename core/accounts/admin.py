@@ -76,7 +76,7 @@ class UserAdmin(admin.ModelAdmin):
             pk, before = user.pk, account(user)
             person = Person.objects.filter(user=user).values_list("pk", flat=True).first()
             user.delete()
-            changes = {**AuditEntry.compare(before, {}, "accounts.user"), "person_removed": not Person.objects.filter(pk=person).exists()}
+            changes = {**AuditEntry.compare(before, {}, "accounts.user"), "person_removed": person is not None and not Person.objects.filter(pk=person).exists()}
             AuditEntry.record("delete_account", ADMIN, obj=user, object_id=pk, changes=changes, **AuditEntry.by(request.user))
 
     def save_related(self, request, form, formsets, change):

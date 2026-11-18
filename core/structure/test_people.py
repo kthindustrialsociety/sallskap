@@ -105,6 +105,15 @@ class Accounts(Tree):
         user.refresh_from_db()
         self.assertEqual(user.name, "Ada Lovelace")
 
+    def test_someone_without_a_name_is_shown_by_their_verified_address(self):
+        p = person("", "old@example.org")  # unverified, as an old login address is kept
+        EmailAddress.objects.create(person=p, address="ada@example.org", verified_at=timezone.now())
+        self.assertEqual(str(p), "ada@example.org")
+        loaded = Person.objects.prefetch_related("emails").get(pk=p.pk)
+        with self.assertNumQueries(0):  # from what a list already loaded
+            self.assertEqual(str(loaded), "ada@example.org")
+        self.assertEqual(str(person("", "only@example.org")), "only@example.org")
+
     def test_changing_the_name_tells_the_tools(self):
         user = User.objects.create_user("ada@example.org", name="Ada")
         p = user.person

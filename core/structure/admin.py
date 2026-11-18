@@ -117,7 +117,7 @@ class PersonAdmin(ShownAdmin):
 
     @admin.display(description=_("name"), ordering="name")
     def shown_name(self, obj):
-        return obj.name or next((e.address for e in obj.emails.all()), "") or str(obj)
+        return str(obj)  # from the addresses get_queryset loaded, for someone without a name
 
     @admin.display(description=_("email addresses"))
     def addresses(self, obj):
