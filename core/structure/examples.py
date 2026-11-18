@@ -6,12 +6,13 @@ one with tests/load_example.py.
 They're built as an installation would be: the first chair is recorded as `kit chair`
 does, and everything else is an action (structure/actions.py) done by the made-up person
 who did it, so loading one goes through the permission checks and fills the audit log.
-Each tie can say who recorded it; otherwise it's the root's chair at that point.
+Each tie can say who recorded it; otherwise it's the root's chair at that point. Last,
+made-up people with nothing left are deleted, as core would that night (deleting.py).
 
 Reserved names only (RFC 2606), so nothing can be mistaken for a real association."""
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -19,6 +20,7 @@ from django.db import models, transaction
 from django.utils import timezone
 
 from . import actions
+from .deleting import delete_people
 from .models import AuditEntry, EmailAddress, Grant, Membership, Permission, Person, Position, Reason, SeatRule, Unit, _erase
 from .server import record_root_chair
 
@@ -217,6 +219,10 @@ FEDERATION = Example(
         )),
         Who("Leo Example", "leo@example.org", memberships=(member("robotics", date(2025, 9, 1), by=WILMA),), positions=(holds("chemistry-website", R.LEAD, date(2026, 2, 1), by=QUINN),)),
         Who("Elsa Example", "elsa@example.org", memberships=(member("robotics", date(2025, 9, 1), by=WILMA),), positions=(holds("uavs", R.PARTICIPANT, date(2025, 10, 1), by=NILS),)),
+        # Bodil flew with UAVs before Elsa. She had no account, and nothing left once she'd
+        # left, so core has deleted her: her position stays under her name, and nothing else
+        # of hers (structure.md §3).
+        Who("Bodil Example", "bodil@example.org", account=False, memberships=(member("robotics", date(2021, 9, 1), date(2025, 6, 1), by=WILMA),), positions=(holds("uavs", R.PARTICIPANT, date(2024, 1, 15), date(2025, 6, 1), by=NILS),)),
         # Chemistry, whose chair records its members and lead.
         Who("Kim Example", KIM, memberships=(member("chemistry", date(2023, 9, 1)),), positions=(holds("chemistry", R.CHAIR, date(2026, 4, 1)),)),
         Who("Jana Example", JANA, memberships=(member("chemistry", date(2024, 9, 1), by=KIM),), positions=(holds("lab-nights", R.LEAD, date(2025, 9, 1), by=KIM),)),
@@ -257,6 +263,10 @@ def example_addresses():
     return {who.email for example in EXAMPLES.values() for who in example.people}
 
 
+def example_names():
+    return {who.name for example in EXAMPLES.values() for who in example.people}
+
+
 def _remove(root):
     """Everything an example made: the units under the root, every tie to them, and
     the made-up people with their accounts. Ties and people are otherwise never
@@ -267,11 +277,13 @@ def _remove(root):
     _erase(Grant.objects.filter(models.Q(unit__in=below) | models.Q(held_in__in=below) | models.Q(given_by__in=people)))
     # Seats first, as each points at its rule and at the position it comes from.
     rules = models.Q(unit__in=below) | models.Q(held_in__in=below) | models.Q(made_by__in=people)
-    positions = models.Q(unit__in=below) | models.Q(person__in=people)
+    deleted = models.Q(person__isnull=True, kept_name__in=example_names())  # the made-up people since deleted
+    positions = models.Q(unit__in=below) | models.Q(person__in=people) | deleted
     _erase(Position.objects.filter(models.Q(seat_rule__in=SeatRule.objects.filter(rules)) | models.Q(seat_from__in=Position.objects.filter(positions)) | positions & models.Q(seat_rule__isnull=False)))
     _erase(SeatRule.objects.filter(rules))
     for model, unit in ((Membership, "association"), (Position, "unit"), (Reason, "unit")):
         _erase(model.objects.filter(models.Q(**{f"{unit}__in": below}) | models.Q(person__in=people)))
+    _erase(Position.objects.filter(deleted))
     get_user_model().objects.filter(email__in=addresses).delete()
     _erase(Person.objects.filter(pk__in=list(people.values_list("pk", flat=True))))
     Unit.taking_part.through.objects.filter(from_unit__in=below).delete()
@@ -301,6 +313,10 @@ class _Builder:
         else:
             person = Person.objects.create(name=who.name)
             EmailAddress.objects.create(person=person, address=who.email, verified_at=timezone.now())
+        # As if added when their first tie started, as they would have been, so that the 30
+        # days after someone is added don't keep anyone with nothing left (deleting.py).
+        first = min(tie.start for tie in (*who.memberships, *who.positions, *who.reasons))
+        Person.objects.filter(pk=person.pk).update(created_at=timezone.make_aware(datetime.combine(first, time(12))))
         self.people[who.email] = person
         return person
 
@@ -370,7 +386,12 @@ class _Builder:
         for spec in _all(self.example.units):  # last, as nothing new goes into an archived team
             if spec.archived:
                 actions.archive_unit(self.actor(), unit=self.units[spec.key], via=SERVER)
+        self.delete_departed()
         return self.units
+
+    def delete_departed(self):
+        """Made-up people with nothing left, as core would delete them that night, and nobody else."""
+        delete_people(people=[person.pk for person in self.people.values()], via=SERVER)
 
 
 @transaction.atomic
@@ -382,10 +403,11 @@ def build(name, root, replace=False):
         if not replace:
             raise ValidationError(f"{root} already has units or made-up people. Use --replace to remove them first.")
         _remove(root)
-    real = Position.objects.filter(unit=root, role=R.CHAIR).exclude(person__in=Person.objects.filter(emails__address__in=example_addresses()))
+    made_up = Person.objects.filter(emails__address__in=example_addresses())
+    real = Position.objects.filter(unit=root, role=R.CHAIR).exclude(person__in=made_up).exclude(person__isnull=True, kept_name__in=example_names())
     if real.exists():
         raise ValidationError(
-            f"{root} has a chair who isn't made up, {real.first().person}. A made-up installation records its own chairs, "
+            f"{root} has a chair who isn't made up, {real.first().holder()}. A made-up installation records its own chairs, "
             "so it's only loaded where nobody real has ever held that seat. Nothing was changed."
         )
     return _Builder(EXAMPLES[name], root).build()

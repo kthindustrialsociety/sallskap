@@ -31,14 +31,16 @@ import json, sys
 from django.core.exceptions import PermissionDenied, ValidationError
 from structure.examples import EXAMPLES, build
 from structure.models import AuditEntry, Unit
-before = AuditEntry.objects.count()
+before = AuditEntry.objects.order_by("-pk").values_list("pk", flat=True).first() or 0
 try:
     units = build({name}, Unit.objects.root(), replace={replace})
 except (ValidationError, PermissionDenied, Unit.DoesNotExist) as error:
     print(" ".join(getattr(error, "messages", [str(error)])), file=sys.stderr)
     sys.exit(1)
 example = EXAMPLES[{name}]
-print(json.dumps({{"units": len(units), "people": len(example.people), "grants": len(example.grants), "seat_rules": len(example.seat_rules), "logged": AuditEntry.objects.count() - before}}))
+logged = AuditEntry.objects.filter(pk__gt=before)
+deleted = sum(row.changes.get("people", 0) for row in logged.filter(action="delete_people"))
+print(json.dumps({{"units": len(units), "people": len(example.people), "deleted": deleted, "grants": len(example.grants), "seat_rules": len(example.seat_rules), "logged": logged.count()}}))
 """
 
 
@@ -77,6 +79,8 @@ def main(argv=None):
         pages.append("Seat rules")
     print(f"Loaded Example {args.example.title()}: {', '.join(parts[:-1])} and {parts[-1]}. See them in the admin page, under {', '.join(pages[:-1])} and {pages[-1]}.")
     print(f"Each change went through core's actions, as the made-up person who made it: {loaded['logged']} rows in the admin page's Audit log.")
+    if loaded.get("deleted"):  # none in Example Society
+        print(f"{loaded['deleted']} of the people had nothing left, so core deleted them, as it would that night: their ended positions stay under their names.")
 
 
 if __name__ == "__main__":

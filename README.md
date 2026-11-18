@@ -107,7 +107,7 @@ docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \
 
 `tests/live_check.py` checks a running server from the outside, and creates fake users, so don't run it on an installation with real members.
 
-Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams, projects and their people, and **Example Federation**, with associations inside it, people in several of them, grants, seats that come with other positions, and an advisory board. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page. It records the first chair as `kit chair` does, and does everything else through core's actions as the made-up people, so the audit log shows who did what:
+Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams, projects and their people, and **Example Federation**, with associations inside it, people in several of them, grants, seats that come with other positions, an advisory board, and someone core has deleted, whose old position stays under her name. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page. It records the first chair as `kit chair` does, and does everything else through core's actions as the made-up people, so the audit log shows who did what:
 
 ```sh
 python3 tests/load_example.py society test.example.org               # the server's primary domain, to confirm
