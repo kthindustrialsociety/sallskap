@@ -351,10 +351,12 @@ The same status is shown on a page in the admin.
 Three layers, in [docs/restore.md](restore.md). Nothing in them depends on the hosting provider, so an association on any provider gets the same safety net and the same restore.
 
 1. **A nightly encrypted backup on the server,** restic over the config and every folder a module declares, kept for 7 days, 4 weeks and 6 months. Logins and the tools pause for it, so that core's copy agrees with each tool's copy; the public sites stay up. This covers a deleted repository or a wrecked database, and it's what the other two layers carry.
-2. **A copy off the server.** `kit backup export` writes every backup as one encrypted file, streaming to standard output by default, so one line over SSH takes a copy by hand, and the same line in a cron job on a machine the association trusts takes one automatically. Pulling is preferred: a server that can write to its own off-server copy can also be made to delete it. For an association with storage but no machine, `[backup] target` pushes to any restic repository (SFTP or S3-compatible) on each run.
+2. **A copy off the server.** `kit backup export` writes every backup as one encrypted file, streaming to standard output by default, so one line over SSH takes a copy by hand, and the same line in a cron job on a machine the association trusts takes one automatically. Pulling is preferred: a server that can write to its own off-server copy can also be made to delete it. For an association with storage but no machine, `[backup] target` pushes to any restic repository (SFTP or S3-compatible) on each run, and old backups there are forgotten as on the server.
 3. **An offline copy of the password,** written down, kept away from both the server and the backups. The other copy is in the vault, which is inside the backup, so only the offline one survives losing the server. Whoever holds both a backup and the password can read everything, so that should be someone who already has root; the password alone opens nothing.
 
 `kit status` warns when the last backup, or the last copy off the server, gets old.
+
+**Someone deleted (§12) stays in the backups** until they age out, six months at most on the server and on a pushed copy, and in a pulled copy for as long as it's kept, so the docs say to keep those no longer. A restore brings them back, and core deletes them again the next night.
 
 A **test restore every semester** is part of the handover checklist, onto a throwaway server, using the offline copy of the password alone. That copy holds real personal data, so deleting the server afterwards is part of the test.
 
@@ -377,7 +379,7 @@ A **test restore every semester** is part of the handover checklist, onto a thro
   - a data processing agreement (for the hosting provider)
   - retention rules (e.g. delete lapsed members after N years)
 - Members can export and delete their data from the member portal. Someone without an account, such as an event sign-up or a subscriber, does the same from the link in their emails.
-- Data on a non-member is kept only while there's a reason with an expiry, such as an upcoming event. A person with nothing left is deleted ([structure.md](structure.md) §3).
+- Data on a non-member is kept only while there's a reason with an expiry, such as an upcoming event. A person with nothing left is deleted by core itself, 30 days after the last thing holding them ended. Their ended positions are kept with their name, as the association's records, and backups hold them until they age out (§10.4, [structure.md](structure.md) §3).
 - Access: 1–2 operators have root on the server, which is also how they get into tools if core is down. Developers and incubator teams deploy only through Git, never with a shell on the server.
 - Databases are never exposed to the internet; everything goes through Caddy.
 - Backups are encrypted. Keys are kept in the password vault and one offline copy.
