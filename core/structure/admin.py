@@ -1,49 +1,34 @@
-from django import forms
+"""The operators' back office for the tree (structure.md §7). It shows units, people, ties,
+grants, seat rules and the audit log, and changes none of them: operators never pass
+can() (structure.md §4), so changes go through structure/actions.py, by people whose
+positions allow them. The one change here is merging two people, an operator's own,
+which the audit log records."""
+
+from django.apps import apps
 from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.utils.text import capfirst
 from django.utils.translation import gettext_lazy as _
-from django.utils.translation import ngettext
+from django.utils.translation import gettext
 
-from .models import EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, Unit, normalize_address, path_and_above
+from .models import AuditEntry, EmailAddress, Grant, Membership, Person, Position, Reason, SeatRule, Unit, path_and_above
 
 
-class UnitForm(forms.ModelForm):
-    class Meta:
-        model = Unit
-        fields = "__all__"
+class Shown:
+    """Seen, never changed, by anyone, superusers included."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        parent = self.fields.get("parent")
-        if parent is not None and self.instance.parent_id:  # which may be archived, with this unit
-            parent.queryset = Unit.objects.filter(models.Q(archived_at__isnull=True) | models.Q(pk=self.instance.parent_id))
+    def has_add_permission(self, request, obj=None):
+        return False
 
-    def clean(self):
-        cleaned = super().clean()
-        if "taking_part" in self.fields:
-            kind = cleaned.get("kind", self.instance.kind)
-            parent = cleaned.get("parent", self.instance.parent)
-            try:
-                Unit.check_taking_part(kind, parent, cleaned.get("taking_part") or [])
-            except ValidationError as error:
-                self.add_error("taking_part", error)
-            self._check_leads(cleaned.get("taking_part"))
-        return cleaned
+    def has_change_permission(self, request, obj=None):
+        return False
 
-    def _check_leads(self, taking_part):
-        """A lead who is a member only of an association taken off the list would be left
-        a non-member: structure.md §3."""
-        if not self.instance.pk or taking_part is None:
-            return
-        removed = set(self.instance.taking_part.all()) - set(taking_part)
-        if not removed:
-            return
-        owner = self.instance.association()
-        for position in Position.objects.current().filter(unit=self.instance, role=Position.Role.LEAD).select_related("person"):
-            if not any(position.person.is_member(a) for a in [owner, *taking_part]):
-                self.add_error("taking_part", _("%(person)s leads this team as a member of an association taken off the list. Hand over the lead first.") % {"person": position.person})
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class ShownAdmin(Shown, admin.ModelAdmin):
+    pass
 
 
 class ArchivedFilter(admin.SimpleListFilter):
@@ -60,51 +45,16 @@ class ArchivedFilter(admin.SimpleListFilter):
 
 
 @admin.register(Unit)
-class UnitAdmin(admin.ModelAdmin):
-    """The operators' back office for the tree. Who else may change units comes with
-    authority (structure.md §4), through the pages and the CLI."""
-
-    form = UnitForm
+class UnitAdmin(ShownAdmin):
     list_display = ("tree_name", "key", "kind", "end_date", "archived")
     list_filter = ("kind", ArchivedFilter)
     search_fields = ("name", "key")
     ordering = ("path",)
-    filter_horizontal = ("taking_part",)
-    actions = ("archive", "unarchive")
 
     def get_fields(self, request, obj=None):
         if obj and obj.is_root:
             return ["kind", "key", "name", "description", "primary_colour", "accent_colour"]
-        fields = ["kind", "key", "name", "description", "parent", "primary_colour", "accent_colour", "end_date", "run_for", "taking_part"]
-        return fields + ["archived_at"] if obj else fields
-
-    def get_readonly_fields(self, request, obj=None):
-        if obj is None:
-            return []
-        fixed = ["key", "archived_at"]  # archived through the actions, so the units under it follow
-        return fixed + ["kind", "name"] if obj.is_root else fixed  # the root's name comes from the config
-
-    def get_actions(self, request):
-        actions = super().get_actions(request)
-        actions.pop("delete_selected", None)  # each unit is checked on its own page
-        return actions
-
-    def has_delete_permission(self, request, obj=None):
-        if obj is not None and obj.deletion_problem():
-            return False
-        return super().has_delete_permission(request, obj)
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "parent":
-            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
-        if db_field.name == "run_for":
-            kwargs["queryset"] = Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
-
-    def formfield_for_manytomany(self, db_field, request, **kwargs):
-        if db_field.name == "taking_part":
-            kwargs["queryset"] = Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)
-        return super().formfield_for_manytomany(db_field, request, **kwargs)
+        return ["kind", "key", "name", "description", "parent", "primary_colour", "accent_colour", "end_date", "run_for", "taking_part", "archived_at"]
 
     @admin.display(description=_("name"), ordering="path")
     def tree_name(self, obj):
@@ -114,92 +64,38 @@ class UnitAdmin(admin.ModelAdmin):
     def archived(self, obj):
         return obj.archived
 
-    def _each(self, request, queryset, method, done_message):
-        done = 0
-        for unit in queryset.order_by("path"):  # from the top, so a team comes back after the one above it
-            try:
-                getattr(unit, method)()
-                done += 1
-            except ValidationError as error:
-                self.message_user(request, f"{unit}: {' '.join(error.messages)}", messages.ERROR)
-        if done:
-            self.message_user(request, done_message(done))
-
-    @admin.action(description=_("Archive, with everything inside"), permissions=["change"])
-    def archive(self, request, queryset):
-        self._each(request, queryset, "archive", lambda n: ngettext("%d unit archived.", "%d units archived.", n) % n)
-
-    @admin.action(description=_("Take out of the archive"), permissions=["change"])
-    def unarchive(self, request, queryset):
-        self._each(request, queryset, "unarchive", lambda n: ngettext("%d unit taken out of the archive.", "%d units taken out of the archive.", n) % n)
-
 
 # ---- People and ties: structure.md §2 and §3 ------------------------------------------
 
 
-class AddressForm(forms.ModelForm):
-    class Meta:
-        model = EmailAddress
-        fields = ["address"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if self.instance.pk:  # an address is fixed: add the new one and remove the old
-            self.fields["address"].disabled = True
-
-    def clean_address(self):
-        # As it's stored, so two rows that differ only in case are caught as the same.
-        return normalize_address(self.cleaned_data["address"])
-
-
-class AddressFormSet(forms.BaseInlineFormSet):
-    def clean(self):
-        super().clean()
-        for form in self.deleted_forms:
-            if form.instance.pk and form.instance.is_login_address():
-                raise ValidationError(_("%(address)s is how they log in. Change the account's address first.") % {"address": form.instance.address})
-
-
-class AddressInline(admin.TabularInline):
+class AddressInline(Shown, admin.TabularInline):
     model = EmailAddress
-    form = AddressForm
-    formset = AddressFormSet
     fields = ("address", "verified_at")
-    readonly_fields = ("verified_at",)
     extra = 0
 
 
-class TieInline(admin.TabularInline):
-    """Shown on the person's page. Each tie is changed on its own page."""
-
+class TieInline(Shown, admin.TabularInline):
     extra = 0
-    can_delete = False
     show_change_link = True
-
-    def has_add_permission(self, request, obj=None):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
 
 
 class MembershipInline(TieInline):
     model = Membership
-    fields = readonly_fields = ("association", "kind", "start", "end")
+    fields = ("association", "kind", "start", "end")
 
 
 class PositionInline(TieInline):
     model = Position
-    fields = readonly_fields = ("unit", "role", "title", "start", "end")
+    fields = ("unit", "role", "title", "start", "end")
 
 
 class ReasonInline(TieInline):
     model = Reason
-    fields = readonly_fields = ("unit", "kind", "legal_basis", "start", "expires")
+    fields = ("unit", "kind", "legal_basis", "start", "expires")
 
 
 @admin.register(Person)
-class PersonAdmin(admin.ModelAdmin):
+class PersonAdmin(ShownAdmin):
     """Everyone the association holds data about. Who else may see whom comes with
     authority (structure.md §2 and §4)."""
 
@@ -207,7 +103,6 @@ class PersonAdmin(admin.ModelAdmin):
     list_select_related = ("user",)
     search_fields = ("name", "emails__address")
     fields = ("name", "user", "created_at")
-    readonly_fields = ("user", "created_at")
     inlines = (AddressInline, MembershipInline, PositionInline, ReasonInline)
     actions = ("merge",)
 
@@ -218,19 +113,6 @@ class PersonAdmin(admin.ModelAdmin):
     def get_changelist_instance(self, request):
         self._units = {unit.path: unit for unit in Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)}  # one query for the list
         return super().get_changelist_instance(request)
-
-    def get_inlines(self, request, obj):
-        return self.inlines if obj else (AddressInline,)  # a new person has no ties yet
-
-    def get_actions(self, request):
-        actions = super().get_actions(request)
-        actions.pop("delete_selected", None)
-        return actions
-
-    def has_delete_permission(self, request, obj=None):
-        if obj is not None and obj.deletion_problem():
-            return False
-        return super().has_delete_permission(request, obj)
 
     @admin.display(description=_("name"), ordering="name")
     def shown_name(self, obj):
@@ -246,18 +128,21 @@ class PersonAdmin(admin.ModelAdmin):
         paths = sorted({path for m in obj.current_memberships for path in path_and_above(m.association.path)})
         return ", ".join(str(self._units[path]) for path in paths if path in self._units)
 
-    @admin.action(description=_("Merge the two selected into one person"), permissions=["change"])
+    def has_merge_permission(self, request):
+        return self.has_view_permission(request)
+
+    @admin.action(description=_("Merge the two selected into one person"), permissions=["merge"])
     def merge(self, request, queryset):
         people = list(queryset.order_by("pk"))
         if len(people) != 2:
-            self.message_user(request, _("Select exactly two people to merge."), messages.ERROR)
+            self.message_user(request, gettext("Select exactly two people to merge."), messages.ERROR)
             return
         try:
-            kept = Person.merge(*people)
+            kept = Person.merge(*people, via=AuditEntry.Via.ADMIN, by=request.user)
         except ValidationError as error:
             self.message_user(request, " ".join(error.messages), messages.ERROR)
             return
-        self.message_user(request, _("Merged into %(person)s.") % {"person": kept})
+        self.message_user(request, gettext("Merged into %(person)s.") % {"person": kept})
 
 
 class CurrentFilter(admin.SimpleListFilter):
@@ -275,41 +160,12 @@ class CurrentFilter(admin.SimpleListFilter):
         return queryset
 
 
-class TieAdmin(admin.ModelAdmin):
-    """Ties are ended, never deleted. Who it's for, where and which role are fixed once
-    set: end it and add a new one."""
-
-    fixed_on_change = ()
+class TieAdmin(ShownAdmin):
     search_fields = ("person__name", "person__emails__address")
-    autocomplete_fields = ("person",)
-    actions = ("end_today",)
-
-    def get_readonly_fields(self, request, obj=None):
-        return self.fixed_on_change if obj else ()
-
-    def get_actions(self, request):
-        actions = super().get_actions(request)
-        actions.pop("delete_selected", None)
-        return actions
-
-    def has_delete_permission(self, request, obj=None):
-        return False
 
     @admin.display(description=_("current"), boolean=True)
     def current(self, obj):
         return obj.is_current()
-
-    @admin.action(description=_("End today"), permissions=["change"])
-    def end_today(self, request, queryset):
-        done = 0
-        for tie in queryset.current():
-            try:
-                tie.end_on()
-                done += 1
-            except ValidationError as error:
-                self.message_user(request, f"{tie}: {' '.join(error.messages)}", messages.ERROR)
-        if done:
-            self.message_user(request, ngettext("%d ended today.", "%d ended today.", done) % done)
 
 
 @admin.register(Membership)
@@ -317,13 +173,7 @@ class MembershipAdmin(TieAdmin):
     list_display = ("person", "association", "kind", "start", "end", "current")
     list_filter = (CurrentFilter, "kind", "association")
     fields = ("person", "association", "kind", "start", "end")
-    fixed_on_change = ("person", "association")
     list_select_related = ("person", "association")
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "association":
-            kwargs["queryset"] = Unit.objects.filter(kind=Unit.Kind.ASSOCIATION)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 class SeatFilter(admin.SimpleListFilter):
@@ -341,37 +191,15 @@ class SeatFilter(admin.SimpleListFilter):
 
 @admin.register(Position)
 class PositionAdmin(TieAdmin):
-    """A seat is shown with its rule and the position it comes from, and never changed
-    here: core keeps it in step with them (seats.py)."""
+    """A seat is shown with its rule and the position it comes from."""
 
     list_display = ("person", "role", "title", "unit", "start", "end", "current")
     list_filter = (CurrentFilter, SeatFilter, "role", "unit")
     fields = ("person", "unit", "role", "title", "start", "end", "appointed_by", "minutes")
-    fixed_on_change = ("person", "unit", "role")
     list_select_related = ("person", "unit")
 
     def get_fields(self, request, obj=None):
         return (*self.fields, "seat_rule", "seat_from") if obj is not None and obj.is_seat() else self.fields
-
-    def has_change_permission(self, request, obj=None):
-        if obj is not None and obj.is_seat():  # so its page is read-only
-            return False
-        return super().has_change_permission(request, obj)
-
-    @admin.action(description=_("End today"), permissions=["change"])
-    def end_today(self, request, queryset):
-        seats = queryset.current().filter(seat_rule__isnull=False).count()
-        if seats:
-            self.message_user(request, ngettext(
-                "%d seat left as it is: it ends with its rule, or the position it comes from.",
-                "%d seats left as they are: each ends with its rule, or the position it comes from.", seats,
-            ) % seats, messages.WARNING)
-        super().end_today(request, queryset.filter(seat_rule__isnull=True))
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "unit":
-            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 @admin.register(Reason)
@@ -379,59 +207,134 @@ class ReasonAdmin(TieAdmin):
     list_display = ("person", "kind", "unit", "legal_basis", "start", "expires", "current")
     list_filter = (CurrentFilter, "kind", "legal_basis")
     fields = ("person", "kind", "unit", "source", "legal_basis", "start", "expires")
-    fixed_on_change = ("person", "unit", "kind")
     list_select_related = ("person", "unit")
 
 
 @admin.register(Grant)
 class GrantAdmin(TieAdmin):
-    """A permission given to a role in a unit (structure.md §4). Ended, never deleted."""
+    """A permission given to a role in a unit (structure.md §4)."""
 
     list_display = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "current")
     list_filter = (CurrentFilter, "permission", "role")
     fields = ("permission", "role", "held_in", "unit", "include_below", "start", "end", "given_by")
-    fixed_on_change = ("permission", "role", "held_in", "unit", "include_below", "given_by")
     list_select_related = ("held_in", "unit")
     search_fields = ("held_in__name", "unit__name", "given_by__name")
-    autocomplete_fields = ("given_by",)
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name in ("held_in", "unit"):
-            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 @admin.register(SeatRule)
 class SeatRuleAdmin(TieAdmin):
-    """Seats that come with another position (structure.md §4). Setting or ending a rule
-    sets or ends its seats at once. Ended, never deleted."""
+    """Seats that come with another position (structure.md §4)."""
 
     list_display = ("__str__", "start", "end", "current")
     list_filter = (CurrentFilter, "role")
-    fields = ("unit", "role", "from_roles", "held_in", "each_association_under", "start", "end", "made_by")
-    fixed_on_change = ("unit", "role", "roles_shown", "held_in", "each_association_under", "made_by")
+    fields = ("unit", "role", "roles_shown", "held_in", "each_association_under", "start", "end", "made_by")
+    readonly_fields = ("roles_shown",)
     list_select_related = ("unit", "held_in")
     search_fields = ("unit__name", "held_in__name", "made_by__name")
-    autocomplete_fields = ("made_by",)
-
-    def get_fields(self, request, obj=None):
-        if obj is None:
-            return self.fields
-        return ["roles_shown" if name == "from_roles" else name for name in self.fields]  # fixed once made
 
     @admin.display(description=_("for the roles"))
     def roles_shown(self, obj):
         return ", ".join(obj.role_labels())
 
-    def formfield_for_dbfield(self, db_field, request, **kwargs):
-        if db_field.name == "from_roles":
-            return forms.MultipleChoiceField(
-                label=capfirst(db_field.verbose_name), help_text=db_field.help_text,
-                choices=Position.Role.choices, widget=forms.CheckboxSelectMultiple,
-            )
-        return super().formfield_for_dbfield(db_field, request, **kwargs)
 
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name in ("unit", "held_in"):
-            kwargs["queryset"] = Unit.objects.filter(archived_at__isnull=True)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+# ---- The audit log: structure.md §7 ------------------------------------------------------
+
+# What a row's changes hold besides a field's before and after.
+LISTS = ("ended", "archived_with_it")
+
+
+def _merged_into(ids):
+    """For people merged into another since, who they are now, from the merges' rows, which
+    say who went into whom. The rows they acted in keep their old id, as the log is only
+    ever added to."""
+    into = {changes["person"][0]: changes["person"][1] for changes in AuditEntry.objects.filter(action="merge").values_list("changes", flat=True)}
+    found = {}
+    for pk in ids:
+        seen, now = set(), pk
+        while now in into and now not in seen:  # one merged, then merged again
+            seen.add(now)
+            now = into[now]
+        if now != pk:
+            found[pk] = now
+    return found
+
+
+def _model(kind):
+    try:
+        return apps.get_model(kind) if kind else None
+    except (LookupError, ValueError):
+        return None
+
+
+def _shown(value):
+    return "-" if value is None or value == "" else ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+
+
+@admin.register(AuditEntry)
+class AuditEntryAdmin(ShownAdmin):
+    """Who did what, where, and through which way in. People are shown by name while they
+    exist, looked up each time, as the log itself names nobody."""
+
+    list_display = ("at", "action", "via", "who", "unit_key", "what", "shown_changes")
+    list_filter = ("via", "action")
+    search_fields = ("unit_key", "action")
+    date_hierarchy = "at"
+    list_per_page = 50
+    fields = ("at", "action", "via", "who", "unit_key", "what", "shown_changes")
+    readonly_fields = ("who", "what", "shown_changes")
+
+    def get_changelist_instance(self, request):
+        """Everyone and everything on the page in a few queries, rather than a few for each
+        row. The names go on that request's rows."""
+        changelist = super().get_changelist_instance(request)
+        rows = changelist.result_list
+        ids = {row.actor_person for row in rows if row.actor_person}
+        people = Person.objects.prefetch_related("emails").in_bulk(ids)
+        merged = _merged_into(ids - set(people)) if ids - set(people) else {}
+        people.update(Person.objects.prefetch_related("emails").in_bulk(set(merged.values())))
+        things = {}
+        for kind in {row.object_type for row in rows if row.object_type}:
+            model = _model(kind)
+            if model is not None:
+                related = [f.name for f in model._meta.concrete_fields if f.is_relation and f.name in ("person", "unit", "association", "held_in")]
+                ids = {row.object_id for row in rows if row.object_type == kind}
+                things.update({(kind, pk): obj for pk, obj in model._default_manager.select_related(*related).in_bulk(ids).items()})
+        for row in rows:
+            row.found_person = people.get(row.actor_person), people.get(merged.get(row.actor_person))
+            row.found_thing = things.get((row.object_type, row.object_id))
+        return changelist
+
+    @admin.display(description=_("by"))
+    def who(self, obj):
+        if obj.actor_person is None:
+            return "-"
+        if hasattr(obj, "found_person"):
+            found, kept = obj.found_person
+        else:
+            found = Person.objects.filter(pk=obj.actor_person).first()
+            kept = Person.objects.filter(pk=_merged_into({obj.actor_person}).get(obj.actor_person)).first() if found is None else None
+        if found is not None:
+            return str(found)
+        if kept is not None:  # they were merged into another, as the merge's own row says
+            return gettext("%(person)s, merged since") % {"person": kept}
+        return gettext("someone since deleted")
+
+    @admin.display(description=_("what"))
+    def what(self, obj):
+        model = _model(obj.object_type)
+        if model is None:
+            return obj.object_type or "-"
+        found = obj.found_thing if hasattr(obj, "found_thing") else model._default_manager.filter(pk=obj.object_id).first()
+        return str(found) if found is not None else gettext("a %(kind)s since deleted") % {"kind": model._meta.verbose_name}
+
+    @admin.display(description=_("changes"))
+    def shown_changes(self, obj):
+        parts = []
+        for name, value in obj.changes.items():
+            if value is None:
+                parts.append(gettext("%(field)s changed") % {"field": name})
+            elif name in LISTS or not (isinstance(value, list) and len(value) == 2):
+                parts.append(f"{name}: {_shown(value)}")
+            else:
+                parts.append(f"{name}: {_shown(value[0])} → {_shown(value[1])}")
+        return "; ".join(parts) or "-"

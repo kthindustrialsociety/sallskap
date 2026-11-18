@@ -118,6 +118,14 @@ kit link someone@example.org
 
 There's no email yet, so you pass the link on yourself, privately.
 
+**Record your association's chair.** Add their account on the admin page first, if they aren't you, then:
+
+```sh
+kit chair chair@example.org --member-since 2024-09-01
+```
+
+That makes them the chair from today, and a member of your association from the day you give, as a chair has to be one. Everything else in your association's structure, such as its board, members and teams, is done by its chair and the people they appoint, not on the admin page: as an Operator, you run the server and have no say over members. The admin page shows it all, and the audit log there shows who changed what. The member pages and the command line where the board does this come in a later release. Later on, an outgoing chair records the next one themselves; `kit chair` is for when nobody is left who can.
+
 ## 6. Turn on the vault and Git hosting
 
 Each is one command. It lists one more DNS record to add:

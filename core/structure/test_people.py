@@ -634,6 +634,9 @@ class Examples(TestCase):
 
 
 class AdminPage(Tree):
+    """Operators see people and their ties, and change none of them, but for merging two
+    people (structure.md §7). Every model is checked in test_actions.py."""
+
     client_class = CaddyClient
 
     def enter(self, role):
@@ -641,39 +644,18 @@ class AdminPage(Tree):
         self.client.force_login(user)
         return user
 
-    def test_an_operator_adds_a_person_and_a_membership(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_person_add"), {
-            "name": "Bo",
-            "emails-TOTAL_FORMS": "1", "emails-INITIAL_FORMS": "0", "emails-0-address": "bo@example.org",
-        })
-        self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
-        p = Person.objects.get(name="Bo")
-        self.assertIsNone(p.emails.get().verified_at)
-        response = self.client.post(reverse("admin:structure_membership_add"), {
-            "person": p.pk, "association": self.robotics.pk, "kind": "ordinary", "start": "2026-01-01", "end": "",
-        })
-        self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
-        self.assertTrue(p.is_member(self.root))
-
-    def test_the_form_shows_a_broken_rule(self):
-        self.enter("operator")
-        p = person("Bo")
-        response = self.client.post(reverse("admin:structure_position_add"), {
-            "person": p.pk, "unit": self.robotics.pk, "role": "chair", "title": "", "start": "2026-01-01", "end": "", "appointed_by": "", "minutes": "",
-        })
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(Position.objects.exists())
-
-    def test_an_operator_ends_a_tie_and_cannot_delete_it(self):
+    def test_an_operator_adds_and_ends_nothing(self):
         self.enter("operator")
         membership = member(person(), self.robotics)
-        changelist = reverse("admin:structure_membership_changelist")
-        self.client.post(changelist, {"action": "end_today", "_selected_action": [membership.pk]})
-        membership.refresh_from_db()
-        self.assertEqual(membership.end, TODAY)
-        response = self.client.post(reverse("admin:structure_membership_delete", args=[membership.pk]), {"post": "yes"})
+        response = self.client.post(reverse("admin:structure_person_add"), {
+            "name": "Bo", "emails-TOTAL_FORMS": "1", "emails-INITIAL_FORMS": "0", "emails-0-address": "bo@example.org",
+        })
         self.assertEqual(response.status_code, 403)
+        self.client.post(reverse("admin:structure_membership_changelist"), {"action": "end_today", "_selected_action": [membership.pk]})
+        membership.refresh_from_db()
+        self.assertIsNone(membership.end)
+        self.assertFalse(Person.objects.filter(name="Bo").exists())
+        self.assertEqual(self.client.get(reverse("admin:structure_person_change", args=[membership.person.pk])).status_code, 200)
 
     def test_an_operator_merges_two_people(self):
         self.enter("operator")
@@ -755,29 +737,24 @@ class AfterReview(Tree):
         self.assertEqual(Person.objects.count(), 1)
 
 
-class AdminAfterReview(Tree):
-    client_class = CaddyClient
-    enter = AdminPage.enter
-
-    def test_two_new_addresses_differing_in_case_are_a_form_error(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_person_add"), {
-            "name": "Bo", "emails-TOTAL_FORMS": "2", "emails-INITIAL_FORMS": "0",
-            "emails-0-address": "Bo@example.org", "emails-1-address": "bo@example.org",
-        })
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(Person.objects.filter(name="Bo").exists())
-
+class TakingPartAfterReview(Tree):
     def test_an_association_a_lead_rests_on_stays_taking_part(self):
-        self.enter("operator")
+        """Checked by the admin form until A6, and by the model since, so every way holds it."""
         hackathon = unit(TEAM, "hackathon", self.robotics)
         hackathon.taking_part.add(self.chemistry)
         p = person()
         member(p, self.chemistry)
         position(p, hackathon, Role.LEAD)
-        response = self.client.post(reverse("admin:structure_unit_change", args=[hackathon.pk]), {
-            "kind": TEAM, "name": "Hackathon", "description": "", "parent": self.robotics.pk,
-            "primary_colour": "", "accent_colour": "", "end_date": "", "run_for": "",
-        })
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(hackathon.taking_part.filter(pk=self.chemistry.pk).exists())
+        for take_off in (lambda: hackathon.taking_part.remove(self.chemistry), hackathon.taking_part.clear, lambda: self.chemistry.teams_taking_part.remove(hackathon)):
+            with self.assertRaises(ValidationError), transaction.atomic():  # Django's remove has no savepoint of its own
+                take_off()
+            self.assertTrue(hackathon.taking_part.filter(pk=self.chemistry.pk).exists())
+
+    def test_one_nobody_rests_on_can_go(self):
+        hackathon = unit(TEAM, "hackathon", self.robotics)
+        hackathon.taking_part.add(self.chemistry)
+        p = person()
+        member(p, self.robotics)
+        position(p, hackathon, Role.LEAD)
+        hackathon.taking_part.remove(self.chemistry)
+        self.assertFalse(hackathon.taking_part.exists())

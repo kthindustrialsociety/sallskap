@@ -1,13 +1,30 @@
 from allauth.mfa.models import Authenticator
 from django.contrib import admin
 from django.contrib.auth.models import Group
+from django.db import transaction
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
+from structure.models import AuditEntry, Person
+
 from . import sync
 from .models import AccessSync, FollowUp, User
+
+ADMIN = AuditEntry.Via.ADMIN
+
+
+def account(user):
+    """What the audit log compares when an operator changes an account. Its address and
+    name are recorded as changed, without their values."""
+    if user is None:
+        return {}
+    permissions = sorted(f"{p.content_type.app_label}.{p.codename}" for p in user.user_permissions.select_related("content_type"))
+    return {
+        "email": user.email, "name": user.name, "is_active": user.is_active, "is_superuser": user.is_superuser,
+        "operator": user.is_operator, "user_permissions": permissions,
+    }
 
 
 @admin.register(User)
@@ -45,7 +62,29 @@ class UserAdmin(admin.ModelAdmin):
     def save_model(self, request, obj, form, change):
         if not change:
             obj.set_unusable_password()  # they choose their own, through `kit link`
+        obj.audit_before = account(User.objects.filter(pk=obj.pk).first() if change else None)
         super().save_model(request, obj, form, change)
+
+    def delete_model(self, request, obj):
+        self.delete_queryset(request, User.objects.filter(pk=obj.pk))
+
+    @transaction.atomic
+    def delete_queryset(self, request, queryset):
+        """Only superusers can. Each is a row, and so is whether its person went with it,
+        which happens when nothing was ever tied to them."""
+        for user in queryset:
+            pk, before = user.pk, account(user)
+            person = Person.objects.filter(user=user).values_list("pk", flat=True).first()
+            user.delete()
+            changes = {**AuditEntry.compare(before, {}, "accounts.user"), "person_removed": not Person.objects.filter(pk=person).exists()}
+            AuditEntry.record("delete_account", ADMIN, obj=user, object_id=pk, changes=changes, **AuditEntry.by(request.user))
+
+    def save_related(self, request, form, formsets, change):
+        """After the groups, so Operator shows in the audit log's row."""
+        super().save_related(request, form, formsets, change)
+        user = form.instance
+        changes = AuditEntry.compare(getattr(user, "audit_before", {}), account(user), "accounts.user")
+        AuditEntry.record("change_account" if change else "add_account", ADMIN, obj=user, changes=changes, **AuditEntry.by(request.user))
 
     @admin.display(description=_("keys"))
     def keys(self, obj):
@@ -98,10 +137,13 @@ class AuthenticatorAdmin(admin.ModelAdmin):
         return super().has_delete_permission(request, obj)
 
     def delete_model(self, request, obj):
-        Authenticator.objects.filter(user=obj.user).delete()
+        self.delete_queryset(request, Authenticator.objects.filter(pk=obj.pk))
 
+    @transaction.atomic
     def delete_queryset(self, request, queryset):
-        Authenticator.objects.filter(user__in=queryset.values("user")).delete()
+        for user in User.objects.filter(pk__in=queryset.values("user")):
+            Authenticator.objects.filter(user=user).delete()
+            AuditEntry.record("remove_2fa", ADMIN, obj=user, changes={"two_factor": [True, False]}, **AuditEntry.by(request.user))
 
 
 @admin.register(FollowUp)
@@ -122,6 +164,10 @@ class FollowUpAdmin(admin.ModelAdmin):
         return False
 
     @admin.action(description=_("Mark as done"), permissions=["change"])
+    @transaction.atomic
     def mark_done(self, request, queryset):
-        done = queryset.filter(done_at__isnull=True).update(done_at=timezone.now(), done_by=request.user)
+        open_ones = list(queryset.filter(done_at__isnull=True).values_list("pk", flat=True))
+        done = FollowUp.objects.filter(pk__in=open_ones, done_at__isnull=True).update(done_at=timezone.now(), done_by=request.user)
+        for pk in open_ones:
+            AuditEntry.record("follow_up_done", ADMIN, obj=FollowUp(pk=pk), changes={"done": [False, True]}, **AuditEntry.by(request.user))
         self.message_user(request, ngettext("%d follow-up marked as done.", "%d follow-ups marked as done.", done) % done)

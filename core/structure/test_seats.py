@@ -689,80 +689,43 @@ class MadeUp(TestCase):
 
 
 class AdminPage(Federation):
+    """Rules are made and ended through the actions (test_actions.py). The admin page shows
+    them, and each seat with its rule, to operators alone."""
+
     client_class = CaddyClient
 
     def enter(self, group):
         user, _ = make_user(f"{group}-admin@example.org", [group], two_factor=True)
         self.client.force_login(user)
 
-    def form(self, **fields):
-        return {
-            "unit": self.u["ext"].pk, "role": "participant", "from_roles": ["chair", "vice_chair"], "held_in": self.u["root"].pk,
-            "each_association_under": "on", "start": "2026-01-01", "end": "", "made_by": self.people["chair@root"].pk, **fields,
-        }
-
     def a_rule(self):
         return rule(self.u["ext"], Role.PARTICIPANT, [Role.CHAIR, Role.VICE_CHAIR], self.u["root"], self.people["chair@root"], each_association_under=True)
 
-    def test_an_operator_sets_a_rule_and_the_seats_follow(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_seatrule_add"), self.form())
-        self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
-        r = SeatRule.objects.get()
-        self.assertEqual(r.from_roles, ["chair", "vice_chair"])
-        self.assertEqual({s.person for s in r.seats.all()}, {self.people["chair@chem"], self.people["vice_chair@rob"]})
-
-    def test_the_form_refuses_a_maker_who_cannot_appoint_there(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_seatrule_add"), self.form(made_by=self.people["treasurer@root"].pk))
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(SeatRule.objects.exists())
-
-    def test_the_form_never_offers_a_chair_seat(self):
-        self.enter("operator")
-        form = self.client.get(reverse("admin:structure_seatrule_add")).context["adminform"].form
-        self.assertNotIn("chair", [value for value, _ in form.fields["role"].choices])
-        self.assertIn("chair", [value for value, _ in form.fields["from_roles"].choices])
-
-    def test_an_operator_ends_a_rule_and_its_seats_and_cannot_delete_it(self):
-        self.enter("operator")
+    def test_an_operator_sees_a_rule_and_cannot_set_end_or_delete_one(self):
         r = self.a_rule()
-        page = self.client.get(reverse("admin:structure_seatrule_change", args=[r.pk]))
-        self.assertEqual(page.status_code, 200)
+        self.enter("operator")
+        self.assertContains(self.client.get(reverse("admin:structure_seatrule_change", args=[r.pk])), "vice chair")
+        self.assertEqual(self.client.get(reverse("admin:structure_seatrule_add")).status_code, 403)
         self.client.post(reverse("admin:structure_seatrule_changelist"), {"action": "end_today", "_selected_action": [r.pk]})
-        self.assertEqual(SeatRule.objects.get().end, TODAY)
-        self.assertEqual({s.end for s in seats()}, {TODAY})
+        self.assertIsNone(SeatRule.objects.get().end)
         self.assertEqual(self.client.post(reverse("admin:structure_seatrule_delete", args=[r.pk]), {"post": "yes"}).status_code, 403)
 
     def test_the_board_cannot_reach_rules_until_its_own_pages(self):
         self.a_rule()
         self.enter("board")
         self.assertEqual(self.client.get(reverse("admin:structure_seatrule_changelist"), follow=True).status_code, 403)
-        self.assertEqual(self.client.post(reverse("admin:structure_seatrule_add"), self.form(), follow=True).status_code, 403)
         self.assertEqual(SeatRule.objects.count(), 1)
 
-    def test_a_seat_is_shown_and_never_changed(self):
+    def test_a_seat_is_shown_with_its_rule_and_never_changed(self):
         r = self.a_rule()
         seat = seats(person=self.people["chair@chem"]).get()
         self.enter("operator")
         url = reverse("admin:structure_position_change", args=[seat.pk])
-        page = self.client.get(url)
-        self.assertEqual(page.status_code, 200)
-        self.assertContains(page, str(r))
+        self.assertContains(self.client.get(url), str(r))
         self.assertEqual(self.client.post(url, {"title": "Ex officio"}).status_code, 403)
-        appointed = Position.objects.get(person=self.people["chair@chem"], seat_rule=None)
-        response = self.client.post(
-            reverse("admin:structure_position_changelist"), {"action": "end_today", "_selected_action": [seat.pk, appointed.pk]}, follow=True,
-        )
-        self.assertEqual(Position.objects.get(pk=appointed.pk).end, TODAY)  # ending it ends the seat too
-        self.assertEqual(Position.objects.get(pk=seat.pk).end, TODAY)
-        self.assertEqual([m.level_tag for m in response.context["messages"]], ["warning", "info"])
 
-    def test_a_position_is_never_made_a_seat_in_the_form(self):
-        self.enter("operator")
-        page = self.client.get(reverse("admin:structure_position_add")).content.decode()
-        self.assertNotIn('name="seat_rule"', page)
-        self.assertNotIn('name="seat_from"', page)
+    def test_a_rule_never_gives_a_chair_seat(self):
+        self.assertNotIn("chair", [value for value, _ in SeatRule._meta.get_field("role").choices])
 
     def test_the_list_picks_out_seats(self):
         self.a_rule()

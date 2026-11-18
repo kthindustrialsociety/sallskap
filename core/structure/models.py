@@ -300,6 +300,17 @@ class Unit(models.Model):
         if problem:
             raise ValidationError(problem)
 
+    def check_leads_without(self, removed):
+        """Before associations are taken off this team's list: a lead who is a member only
+        of one of them would be left a non-member (structure.md §3)."""
+        today = _today()
+        remaining = [association for association in self.taking_part.all() if association.pk not in removed]
+        needed = [self.association(), *remaining]
+        leads = Tie.overlapping(Position.objects.filter(unit=self, role=Position.Role.LEAD), today, None).select_related("person")
+        for position in leads:
+            if not any(position.person.is_member(association, on=max(position.start, today)) for association in needed):
+                raise ValidationError(_("%(person)s leads %(team)s as a member of an association taken off its list. Hand over the lead first.") % {"person": position.person, "team": self})
+
     def delete(self, *args, **kwargs):
         self.check_can_delete()
         return super().delete(*args, **kwargs)
@@ -307,14 +318,20 @@ class Unit(models.Model):
 
 @receiver(m2m_changed, sender=Unit.taking_part.through)
 def _check_taking_part(sender, instance, action, reverse, pk_set, **kwargs):
-    if action != "pre_add":
-        return
-    added = Unit.objects.filter(pk__in=pk_set)
-    if reverse:  # an association being added to teams
-        for team in added:
-            Unit.check_taking_part(team.kind, team.parent, [instance])
-    else:
-        Unit.check_taking_part(instance.kind, instance.parent, added)
+    if action == "pre_add":
+        added = Unit.objects.filter(pk__in=pk_set)
+        if reverse:  # an association being added to teams
+            for team in added:
+                Unit.check_taking_part(team.kind, team.parent, [instance])
+        else:
+            Unit.check_taking_part(instance.kind, instance.parent, added)
+    elif action in ("pre_remove", "pre_clear"):
+        if reverse:  # an association taken off teams' lists
+            teams = Unit.objects.filter(pk__in=pk_set) if action == "pre_remove" else instance.teams_taking_part.all()
+            for team in teams:
+                team.check_leads_without({instance.pk})
+        else:
+            instance.check_leads_without(set(pk_set) if action == "pre_remove" else set(instance.taking_part.values_list("pk", flat=True)))
 
 
 def ensure_root(using="default", apps=None, **kwargs):
@@ -329,6 +346,10 @@ def ensure_root(using="default", apps=None, **kwargs):
             apps.get_model("structure", "Unit")
         except LookupError:  # migrated back to before units existed
             return
+    try:
+        logged = apps is None or apps.get_model("structure", "AuditEntry")
+    except LookupError:  # migrated back to before the audit log
+        logged = False
     name, key = config["name"], config["key"]
     try:
         validate_key(key)
@@ -339,15 +360,22 @@ def ensure_root(using="default", apps=None, **kwargs):
     if root is None:
         if units.filter(key=key).exists():
             raise ImproperlyConfigured(f"The config's key {key!r} under [association] is already another unit's. Choose another.")
-        Unit(kind=Unit.Kind.ASSOCIATION, key=key, name=name).save(using=using)
+        with transaction.atomic(using=using):
+            root = Unit(kind=Unit.Kind.ASSOCIATION, key=key, name=name)
+            root.save(using=using)
+            if logged:
+                AuditEntry.record("create_root", AuditEntry.Via.SERVER, unit=root, obj=root, changes={"key": [None, key], "name": [None, name]}, using=using)
     elif root.key != key:
         raise ImproperlyConfigured(
             f"The config says key = {key!r} under [association], but the association's key is {root.key!r}, "
             f"and a key can't change: tools know it by it. Put key = {root.key!r} back in the config."
         )
     elif root.name != name:
-        root.name = name
-        root.save(using=using)
+        with transaction.atomic(using=using):
+            before, root.name = root.name, name
+            root.save(using=using)
+            if logged:
+                AuditEntry.record("rename_root", AuditEntry.Via.SERVER, unit=root, obj=root, changes={"name": [before, name]}, using=using)
 
 
 # ---- People and ties: structure.md §2 and §3 ----------------------------------------
@@ -438,10 +466,11 @@ class Person(models.Model):
 
     @staticmethod
     @transaction.atomic
-    def merge(first, second):
+    def merge(first, second, via=None, by=None):
         """Makes two rows one person, and returns the one kept: the one with an account,
         or else `first`. Two people with accounts are never merged, as one of their subs
-        would vanish."""
+        would vanish. Logged as core's own change, or as `by`'s, an operator's account,
+        through `via`."""
         if first.pk == second.pk:
             return first
         if first.user_id and second.user_id:
@@ -478,6 +507,8 @@ class Person(models.Model):
         kept.name = kept.name or gone.name
         kept.save()
         _erase(Person.objects.filter(pk=gone.pk))
+        actor = AuditEntry.by(by) if by is not None else {}
+        AuditEntry.record("merge", via or AuditEntry.Via.CORE, obj=kept, changes={"person": [gone.pk, kept.pk]}, **actor)
         from .access import tell_tools
 
         tell_tools(Person.objects.filter(pk=kept.pk))  # their ties moved over
@@ -835,10 +866,15 @@ class Position(Tie):
     def before_save(self):
         if self.is_seat() and not _seating.get():  # and problems() keeps a seat a seat
             raise ValidationError(_("%(seat)s is a seat, from a seat rule, so core alone sets, changes and ends it. Change the rule, or the position it comes from.") % {"seat": self})
-        # Appointing the next chair ends the last one's position on the day the new one starts.
-        if self.role == self.Role.CHAIR and self.pk is None:
-            for chair in Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True):
-                chair.end_on(self.start)
+        for chair in self.chairs_it_ends():
+            chair.end_on(self.start)
+
+    def chairs_it_ends(self):
+        """Appointing the next chair ends the last one's position on the day the new one
+        starts: the open ones that started before, for a new chair, and none otherwise."""
+        if self.role != self.Role.CHAIR or self.pk is not None:
+            return Position.objects.none()
+        return Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True)
 
     def after_save(self):
         from .access import tell_tools
@@ -1128,3 +1164,114 @@ class SeatRule(Tie):
             if not can(self.made_by, Permission.APPOINT, unit, on=self.start):
                 problems.append(_("%(person)s couldn't appoint in %(unit)s on %(day)s, so they can't make its seat rules.") % {"person": self.made_by, "unit": unit, "day": self.start})
         return problems
+
+
+# ---- The audit log: structure.md §7 -------------------------------------------------------
+
+
+class AuditQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError(_("The audit log is only ever added to."))
+
+    def delete(self):
+        raise ValidationError(_("The audit log is only ever added to."))
+
+
+class AuditEntry(models.Model):
+    """One row for each action, and for each change operators and core make themselves.
+    It names nobody: people are ids, and a tie's row leads to its person through the tie,
+    while the tie exists. It has no foreign keys, so it never stops a unit or a person
+    from being deleted and never needs changing when they are. It's only ever added to."""
+
+    class Via(models.TextChoices):
+        ADMIN = "admin", _("the admin page")
+        SERVER = "server", _("a command on the server")
+        CORE = "core", _("core itself")
+
+    # What can say something about a person: recorded as changed, without its value.
+    HIDDEN = {"structure.reason": ("source",), "accounts.user": ("email", "name")}
+    # Who a tie is for is left out, so the row leads to them only through the tie. Whoever
+    # gave a grant or made a rule is the actor, and the rest is worked out by core.
+    LEFT_OUT = ("id", "path", "person", "given_by", "made_by", "seat_since", "seat_until")
+
+    at = models.DateTimeField(_("when"), default=timezone.now, db_index=True)
+    action = models.CharField(_("action"), max_length=50, db_index=True)
+    via = models.CharField(_("way in"), max_length=20, choices=Via.choices)
+    # Ids, as the rows they point at have: BigAutoField.
+    actor_account = models.BigIntegerField(_("by account"), null=True, blank=True)
+    actor_person = models.BigIntegerField(_("by person"), null=True, blank=True, db_index=True)
+    unit = models.BigIntegerField(_("unit"), null=True, blank=True, help_text=_("The unit the permission check asked about."))
+    unit_key = models.CharField(_("unit"), max_length=40, blank=True, db_index=True)
+    object_type = models.CharField(_("kind of thing"), max_length=50, blank=True)
+    object_id = models.BigIntegerField(_("which"), null=True, blank=True)
+    changes = models.JSONField(_("changes"), default=dict, blank=True)
+
+    objects = AuditQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = _("audit log entry")
+        verbose_name_plural = _("audit log")
+        ordering = ["-at", "-pk"]
+        indexes = [models.Index(fields=["object_type", "object_id"], name="audit_object")]
+
+    def __str__(self):
+        return f"{self.at:%Y-%m-%d %H:%M} {self.action}"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError(_("The audit log is only ever added to."))
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("The audit log is only ever added to."))
+
+    @classmethod
+    def record(cls, action, via, *, account=None, person=None, unit=None, obj=None, object_id=None, changes=None, using="default"):
+        """The one way a row is written. A mistyped way in is a bug, so it raises."""
+        cls.Via(via)
+        entry = cls(
+            action=action, via=via, actor_account=account, actor_person=person,
+            unit=unit.pk if unit is not None else None, unit_key=unit.key if unit is not None else "",
+            object_type=obj._meta.label_lower if obj is not None else "",
+            object_id=object_id if object_id is not None else getattr(obj, "pk", None),
+            changes=changes or {},
+        )
+        entry.save(using=using)
+        return entry
+
+    @staticmethod
+    def by(user):
+        """An operator's account, and its person, as the actor of a row."""
+        return {"account": user.pk, "person": Person.objects.filter(user=user.pk).values_list("pk", flat=True).first()}
+
+    @classmethod
+    def fields(cls, obj):
+        """What a row shows of a unit, a tie, a grant or a rule: its own fields, a unit by
+        its key, and dates as text."""
+        found = {}
+        for field in obj._meta.concrete_fields:
+            if field.name in cls.LEFT_OUT:
+                continue
+            value = getattr(obj, field.attname)
+            if field.is_relation and value is not None and field.related_model is Unit:
+                value = getattr(obj, field.name).key
+            elif hasattr(value, "isoformat"):
+                value = value.isoformat()
+            found[field.name] = None if value == "" else value
+        return found
+
+    @classmethod
+    def created(cls, obj):
+        """The changes for something new: every field it was given."""
+        return cls.compare({}, cls.fields(obj), obj._meta.label_lower)
+
+    @classmethod
+    def compare(cls, before, after, kind):
+        """Each field that changed, before and after, or None for one whose value isn't
+        shown. `kind` is the model's label, such as structure.reason."""
+        hidden = cls.HIDDEN.get(kind, ())
+        changes = {}
+        for name in [*before, *(name for name in after if name not in before)]:
+            if before.get(name) != after.get(name):
+                changes[name] = None if name in hidden else [before.get(name), after.get(name)]
+        return changes

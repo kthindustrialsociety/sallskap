@@ -462,6 +462,9 @@ class Examples(TestCase):
 
 
 class AdminPage(TestCase):
+    """Operators see the tree and change none of it (structure.md §7). Every model is
+    checked in test_actions.py; these are the units' own."""
+
     client_class = CaddyClient
 
     def setUp(self):
@@ -475,75 +478,18 @@ class AdminPage(TestCase):
         self.client.force_login(user)
         return user
 
-    def form(self, **fields):
-        data = {"kind": TEAM, "key": "", "name": "", "description": "", "parent": self.root.pk, "primary_colour": "", "accent_colour": "", "end_date": "", "run_for": "", "taking_part": []}
-        data.update(fields)
-        return {k: v for k, v in data.items() if v is not None}
-
-    def test_an_operator_adds_a_unit(self):
+    def test_an_operator_cannot_add_change_archive_or_delete_a_unit(self):
         self.enter("operator")
-        response = self.client.post(reverse("admin:structure_unit_add"), self.form(key="events", name="Events"))
-        self.assertEqual(response.status_code, 302, response.content.decode()[:2000])
-        self.assertTrue(Unit.objects.filter(key="events", parent=self.root).exists())
-
-    def test_the_form_shows_a_broken_rule(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_unit_add"), self.form(key="Bad Key", name="Bad"))
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(Unit.objects.filter(name="Bad").exists())
-
-    def test_the_key_is_fixed_after_creation(self):
-        self.enter("operator")
+        self.assertEqual(self.client.post(reverse("admin:structure_unit_add"), {"kind": TEAM, "key": "events", "name": "Events", "parent": self.root.pk}).status_code, 403)
         url = reverse("admin:structure_unit_change", args=[self.website.pk])
-        self.client.post(url, self.form(key="site", name="Site"))
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(self.client.post(url, {"kind": TEAM, "name": "Site", "parent": self.root.pk}).status_code, 403)
+        changelist = reverse("admin:structure_unit_changelist")
+        self.client.post(changelist, {"action": "archive", "_selected_action": [self.website.pk]})
+        self.assertEqual(self.client.post(reverse("admin:structure_unit_delete", args=[self.website.pk]), {"post": "yes"}).status_code, 403)
         self.website.refresh_from_db()
-        self.assertEqual((self.website.key, self.website.name), ("website", "Site"))
-
-    def test_the_roots_name_comes_from_the_config(self):
-        self.enter("operator")
-        url = reverse("admin:structure_unit_change", args=[self.root.pk])
-        self.client.post(url, self.form(kind=ASSOCIATION, name="Other", parent=""))
-        self.root.refresh_from_db()
-        self.assertEqual(self.root.name, "Example")
-
-    def test_the_root_has_no_delete_button(self):
-        self.enter("operator")
-        response = self.client.post(reverse("admin:structure_unit_delete", args=[self.root.pk]), {"post": "yes"})
-        self.assertEqual(response.status_code, 403)
-        self.assertTrue(Unit.objects.filter(pk=self.root.pk).exists())
-
-    def test_an_operator_archives_and_brings_back(self):
-        self.enter("operator")
-        project = team("hackathon", self.root, end_date=date(2027, 4, 1))
-        changelist = reverse("admin:structure_unit_changelist")
-        self.client.post(changelist, {"action": "archive", "_selected_action": [project.pk]})
-        project.refresh_from_db()
-        self.assertTrue(project.archived)
-        self.client.post(changelist, {"action": "unarchive", "_selected_action": [project.pk]})
-        project.refresh_from_db()
-        self.assertFalse(project.archived)
-
-    def test_a_team_inside_an_archived_one_can_still_be_edited(self):
-        self.enter("operator")
-        project = team("hackathon", self.root, end_date=date(2027, 4, 1))
-        catering = team("catering", project)
-        project.archive()
-        url = reverse("admin:structure_unit_change", args=[catering.pk])
-        response = self.client.post(url, self.form(key="catering", name="Food", parent=project.pk))
-        self.assertEqual(response.status_code, 302)
-        catering.refresh_from_db()
-        self.assertEqual(catering.name, "Food")
-
-    def test_bringing_back_a_team_and_the_one_above_it_together(self):
-        self.enter("operator")
-        zeta = team("zeta", self.root)
-        alpha = team("alpha", zeta)
-        zeta.archive()
-        changelist = reverse("admin:structure_unit_changelist")
-        self.client.post(changelist + "?o=2", {"action": "unarchive", "_selected_action": [alpha.pk, zeta.pk]})
-        alpha.refresh_from_db()
-        zeta.refresh_from_db()
-        self.assertFalse(alpha.archived or zeta.archived)
+        self.assertEqual((self.website.name, self.website.archived), ("Website", False))
+        self.assertFalse(Unit.objects.filter(key="events").exists())
 
     def test_the_list_is_a_tree(self):
         self.enter("operator")
@@ -555,7 +501,7 @@ class AdminPage(TestCase):
     def test_the_board_cannot_reach_units_until_its_own_pages(self):
         self.enter("board")
         self.assertEqual(self.client.get(reverse("admin:structure_unit_changelist"), follow=True).status_code, 403)
-        self.assertEqual(self.client.post(reverse("admin:structure_unit_add"), self.form(key="events", name="Events"), follow=True).status_code, 403)
+        self.assertEqual(self.client.post(reverse("admin:structure_unit_add"), {"kind": TEAM, "key": "events", "name": "Events"}, follow=True).status_code, 403)
         self.assertFalse(Unit.objects.filter(key="events").exists())
 
     def test_a_member_sees_nothing(self):

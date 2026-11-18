@@ -9,7 +9,8 @@ deletes everything under the root, and every tie to it.
 
 The domain has to be the server's own primary domain, so it's never run on the wrong
 one by mistake. The definitions are in core/structure/examples.py. They're the same
-ones core's tests use, and they grow with each segment.
+ones core's tests use, and they grow with each segment. Everything is done through
+core's actions, as the made-up people who did it, so the audit log shows who did what.
 
 Standard library only, as the rest of the kit's tooling is.
 """
@@ -27,16 +28,17 @@ EXAMPLES = ("society", "federation")
 
 LOAD = """
 import json, sys
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from structure.examples import EXAMPLES, build
-from structure.models import Unit
+from structure.models import AuditEntry, Unit
+before = AuditEntry.objects.count()
 try:
     units = build({name}, Unit.objects.root(), replace={replace})
-except (ValidationError, Unit.DoesNotExist) as error:
+except (ValidationError, PermissionDenied, Unit.DoesNotExist) as error:
     print(" ".join(getattr(error, "messages", [str(error)])), file=sys.stderr)
     sys.exit(1)
 example = EXAMPLES[{name}]
-print(json.dumps({{"units": len(units), "people": len(example.people), "grants": len(example.grants), "seat_rules": len(example.seat_rules)}}))
+print(json.dumps({{"units": len(units), "people": len(example.people), "grants": len(example.grants), "seat_rules": len(example.seat_rules), "logged": AuditEntry.objects.count() - before}}))
 """
 
 
@@ -74,6 +76,7 @@ def main(argv=None):
         parts.append(f"{loaded['seat_rules']} seat rules")
         pages.append("Seat rules")
     print(f"Loaded Example {args.example.title()}: {', '.join(parts[:-1])} and {parts[-1]}. See them in the admin page, under {', '.join(pages[:-1])} and {pages[-1]}.")
+    print(f"Each change went through core's actions, as the made-up person who made it: {loaded['logged']} rows in the admin page's Audit log.")
 
 
 if __name__ == "__main__":

@@ -618,6 +618,13 @@ def _check_email(address: str) -> str:
     return address
 
 
+def _check_day(text: str) -> str:
+    """Core checks the day again. This only stops it being read as an option."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise KitError(f"{text!r} isn't a day. Write it as 2027-07-01.")
+    return text
+
+
 def _check_tool_name(name: str) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
         raise KitError(f"{name!r} isn't a valid tool name. Use lowercase letters, numbers and dashes.")
@@ -2370,6 +2377,10 @@ def build_parser() -> argparse.ArgumentParser:
     admin.add_argument("email")
     admin.add_argument("--reset-2fa", action="store_true", help="also remove their 2FA, if they've lost their phone and codes")
     commands.add_parser("link", help="create a one-time link for someone to choose a password").add_argument("email")
+    chair = commands.add_parser("chair", help="record the association's chair, such as its first one")
+    chair.add_argument("email", help="one of their verified addresses, such as their account's")
+    chair.add_argument("--from", dest="start", help="their first day as chair, such as 2027-07-01 (today if not given)")
+    chair.add_argument("--member-since", help="if they aren't a member yet: when their membership began (their first day as chair if not given)")
     commands.add_parser("status", help="show sites, published releases and DNS problems")
     commands.add_parser("enable", help="switch on a module, or finish switching it on").add_argument("module")
     commands.add_parser("disable", help="stop a module and keep its data").add_argument("module")
@@ -2474,6 +2485,10 @@ def main(argv: list[str] | None = None) -> int:
             return _manage("create_admin", _check_email(args.email), *(["--reset-2fa"] if args.reset_2fa else []))
         elif args.command == "link":
             return _manage("password_link", _check_email(args.email))
+        elif args.command == "chair":
+            days = [f"--from={_check_day(args.start)}"] if args.start else []
+            days += [f"--member-since={_check_day(args.member_since)}"] if args.member_since else []
+            return _manage("root_chair", _check_email(args.email), *days)
         elif args.command == "tool":
             if args.tool_action == "add":
                 rules = [f"--group={group}" for group in args.group]  # the = stops it being read as an option

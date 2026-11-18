@@ -4,7 +4,7 @@ A free and open-source kit that lets a student association run its own websites,
 
 Sällskap is built by KTH Industrial Society, which is also its first installation. "Sällskap" is a working title.
 
-**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, the tree of associations and teams with people's ties to them, 2FA, an admin page, and the login service for other tools, which tells them each person's keys. The other modules aren't built yet.
+**Status: early development, not ready to use.** So far this repo holds the specification, the server installer, the `website`, `git` and `vault` modules, the first `kit` commands, and core: Django with accounts, the tree of associations and teams with people's ties to them, the actions that change it and the audit log that records them, 2FA, an admin page, and the login service for other tools, which tells them each person's keys. The other modules aren't built yet.
 
 ## Install
 
@@ -23,7 +23,7 @@ kit init example.org --name "Example Society" --key example
 | Path | Contents |
 |---|---|
 | `docs/spec.md` | The specification |
-| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units, people, their ties, authority and seat rules are in core |
+| `docs/structure.md` | Associations, teams, people and their roles, and the member CLI: the design, being built. Units, people, their ties, authority, seat rules, keys to the tools, actions and the audit log are in core |
 | `docs/installing.md` | Installing, step by step |
 | `docs/restore.md` | What a backup holds, how to take a copy off the server, and how to restore |
 | `docs/updating.md` | What `kit update` does |
@@ -32,7 +32,7 @@ kit init example.org --name "Example Society" --key example
 | `compose.yml` | Containers for core, and the worker that tells tools about changes to people's access |
 | `kit/` | The `kit` CLI, in progress |
 | `systemd/` | The timer that takes a backup every night |
-| `core/` | Django: accounts, login, the tree of associations and teams (`core/structure/`), and the admin page. Who sees what in the admin page is set in `core/accounts/roles.py`, and who can do what in the tree in `core/structure/authority.py` |
+| `core/` | Django: accounts, login, the tree of associations and teams (`core/structure/`), and the admin page. Who sees what in the admin page is set in `core/accounts/roles.py`, and who can do what in the tree in `core/structure/authority.py`. Every change to the tree is an action in `core/structure/actions.py`, which asks it once and leaves a row in the audit log |
 | `modules/website/` | Public sites and redirects |
 | `modules/git/` | Forgejo, with login through core |
 | `modules/vault/` | Vaultwarden, with login through core |
@@ -46,7 +46,10 @@ There's no email yet, so people get in through one-time links that only set a pa
 ```sh
 kit admin you@example.org      # create the first admin, and print their link
 kit link someone@example.org   # a new link for someone an Operator has added
+kit chair chair@example.org    # record your association's chair, such as its first one
 ```
+
+The admin page is for Operators, who run the server. It shows the associations, teams, people, their ties and the audit log, and changes none of them, as Operators have no say over members. Those changes are made by the people whose positions allow them, through the member pages and the command line, which come in a later release. `kit chair` records the chair your association starts from, and makes them a member if they aren't one. It also ends the last chair's position, for when nobody is left who could record the next.
 
 If an Operator is locked out, `kit admin` restores their access and clears any login lockouts. If they've lost both their phone and their recovery codes, `kit admin you@example.org --reset-2fa` also removes their 2FA, so they can set it up again.
 
@@ -104,7 +107,7 @@ docker run --rm --env SALLSKAP_DOMAIN=example.org --env SALLSKAP_DATA_DIR=/tmp \
 
 `tests/live_check.py` checks a running server from the outside, and creates fake users, so don't run it on an installation with real members.
 
-Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams, projects and their people, and **Example Federation**, with associations inside it, people in several of them, grants, seats that come with other positions, and an advisory board. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page:
+Core's tests, and test servers, use two made-up installations, defined in `core/structure/examples.py`: **Example Society**, one association with teams, projects and their people, and **Example Federation**, with associations inside it, people in several of them, grants, seats that come with other positions, and an advisory board. Every feature has to work for both. `tests/load_example.py` loads one onto a test server, under that server's own association, to check by hand in the admin page. It records the first chair as `kit chair` does, and does everything else through core's actions as the made-up people, so the audit log shows who did what:
 
 ```sh
 python3 tests/load_example.py society test.example.org               # the server's primary domain, to confirm

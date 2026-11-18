@@ -594,6 +594,23 @@ class Docker(unittest.TestCase):
         self.run_kit("admin", "o'brien@kth.se", "--reset-2fa")
         self.assertEqual(self.calls[-1][-3:], ["create_admin", "o'brien@kth.se", "--reset-2fa"])
 
+    def test_chair_passes_on_only_what_was_asked_for(self):
+        """structure.md §4: the root's chair, recorded by an operator on the server."""
+        self.run_kit("chair", "o'brien@kth.se")
+        self.assertEqual(self.calls[-1][-2:], ["root_chair", "o'brien@kth.se"])
+        self.run_kit("chair", "o'brien@kth.se", "--from", "2027-07-01", "--member-since", "2024-09-01")
+        self.assertEqual(self.calls[-1][-4:], ["root_chair", "o'brien@kth.se", "--from=2027-07-01", "--member-since=2024-09-01"])
+
+    def test_chair_refuses_what_is_not_a_date_or_an_address(self):
+        for args in (("chair", "--help=x"), ("chair", "a@kth.se", "--from", "1 July"), ("chair", "a@kth.se", "--member-since", "--x")):
+            with self.subTest(args), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    code, _ = self.run_kit(*args)
+                except SystemExit as stopped:  # argparse refuses some of these itself
+                    code = stopped.code
+                self.assertNotEqual(code, 0)
+        self.assertFalse([call for call in self.calls if "root_chair" in call])
+
 
     def test_tool_commands_reach_core(self):
         self.run_kit("tool", "add", "git", "https://git.example.org/callback")

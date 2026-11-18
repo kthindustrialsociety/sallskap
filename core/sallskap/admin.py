@@ -14,6 +14,7 @@ SHOWN_AT_ONCE = 10
 class SallskapAdminSite(admin.AdminSite):
     site_title = site_header = _("Sällskap admin")
     index_title = _("Administration")
+    index_template = "admin/sallskap_index.html"  # without Django's history, which isn't kept
 
     def has_permission(self, request):
         user = request.user
