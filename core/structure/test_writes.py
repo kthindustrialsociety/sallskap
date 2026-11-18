@@ -23,7 +23,7 @@ CORE = Path(__file__).resolve().parent.parent
 MODELS = ("Unit", "Membership", "Position", "Reason", "Grant", "SeatRule")
 TREE = (*MODELS, "AuditEntry", "taking_part", "teams_taking_part")
 WRITES = {"save", "delete", "create", "get_or_create", "update_or_create", "update", "bulk_create", "bulk_update", "add", "remove", "set", "clear"}
-CORES_OWN = {"end_on", "archive", "unarchive", "merge", "_erase", "link_account", "verify"}
+CORES_OWN = {"end_on", "archive", "unarchive", "merge", "_erase", "link_account", "verify", "forget", "delete_people"}
 UNSEEN = {"save", "delete"}
 
 # Every function in these may write: they're the actions, and the models and seats they use.
@@ -35,6 +35,11 @@ ALLOWED = {
     ("structure/apps.py", "_account_saved"): "an account's person, which merges people on a verified address (structure.md §2)",
     ("structure/admin.py", "PersonAdmin.merge"): "an operator merging two people by hand, which is logged",
     ("structure/examples.py", "_remove"): "removing a made-up installation with --replace, on a test server only",
+    ("structure/deleting.py", "forget"): "deleting someone with nothing left, keeping their ended positions (structure.md §3)",
+    ("structure/deleting.py", "delete_people"): "the job that finds who has nothing left, and forgets each of them",
+    ("accounts/sync.py", "new_day"): "the worker runs that job just after midnight",
+    ("structure/management/commands/delete_people.py", "Command.handle"): "an operator running it by hand, on the server",
+    ("structure/examples.py", "_Builder.delete_departed"): "a made-up installation's people with nothing left, on a test server only",
 }
 
 
