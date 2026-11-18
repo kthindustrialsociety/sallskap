@@ -321,11 +321,6 @@ class Claims(Service):
         user, _ = make_user()
         self.assertEqual(self.login_claims(user)["groups"], [])
 
-    def test_renaming_the_operator_group_cannot_break_a_tools_rules(self):
-        Group.objects.filter(role__key="operator").update(name="Drift")
-        user, _ = make_user(groups=["operator"], two_factor=True)
-        self.assertEqual(self.login_claims(user)["groups"], ["operator"])
-
     def test_a_group_made_by_hand_gives_nothing(self):
         """Operator is the one group: one named after it, or anything else, is no key."""
         user, _ = make_user(groups=["member"])

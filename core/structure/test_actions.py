@@ -684,7 +684,7 @@ class OperatorsChanges(TestCase):
 
     def test_changing_one_and_making_it_an_operator(self):
         user, _ = make_user("bo@example.org")
-        operator = Group.objects.get(role__key="operator")
+        operator = Group.objects.get(name="Operator")
         response = self.client.post(reverse("admin:accounts_user_change", args=[user.pk]), {"email": "bo@example.org", "name": "", "groups": [operator.pk]})
         self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
         row = self.rows("change_account").get()
@@ -818,7 +818,7 @@ class AdminPage(Tree):
         self.assertContains(self.client.get(reverse("admin:structure_auditentry_change", args=[row.pk])), "Kept Example, merged since")
 
     def test_operators_may_only_view_the_tree_people_and_log(self):
-        codenames = Group.objects.get(role__key="operator").permissions.filter(content_type__app_label="structure").values_list("codename", flat=True)
+        codenames = Group.objects.get(name="Operator").permissions.filter(content_type__app_label="structure").values_list("codename", flat=True)
         self.assertTrue(codenames)
         self.assertEqual([c for c in codenames if not c.startswith("view_")], [])
         self.assertIn("view_auditentry", codenames)
