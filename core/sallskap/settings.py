@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 
-from django.utils.translation import gettext_lazy as _
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("SALLSKAP_DATA_DIR", "/srv/core"))
@@ -172,10 +171,9 @@ EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 
 # ---- Language, static files and logs ------------------------------------------
 
-# To add Swedish: add locale/sv/LC_MESSAGES/django.po and LocaleMiddleware.
+# English only. Strings stay marked for translation, so another language, if an
+# association asks for one, is its locale files and LocaleMiddleware.
 LANGUAGE_CODE = "en"
-LANGUAGES = [("en", _("English")), ("sv", _("Swedish"))]
-LOCALE_PATHS = [BASE_DIR / "locale"]
 USE_I18N = True
 USE_TZ = True
 TIME_ZONE = "Europe/Stockholm"

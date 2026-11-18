@@ -767,7 +767,7 @@ class Membership(Tie):
 
 class Position(Tie):
     class Role(models.TextChoices):
-        # The keys never change. What people see comes from the dictionary (A7).
+        # The keys never change. What people see is the label.
         CHAIR = "chair", _("chair")
         VICE_CHAIR = "vice_chair", _("vice chair")
         TREASURER = "treasurer", _("treasurer")
