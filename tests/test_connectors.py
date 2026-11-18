@@ -464,6 +464,14 @@ class Forgejo(unittest.TestCase):
             self.apply(groups=["robotics:member"])
         self.assertEqual(self.forgejo.teams_of(), set())
 
+    def test_no_team_is_made_in_an_organisation_made_by_hand(self):
+        """A lead wants two teams there: refusing the first mustn't let the second be made."""
+        self.forgejo.add_org("robotics", "made in Forgejo")
+        with self.assertRaisesRegex(RuntimeError, "already has an organisation called robotics that core didn't make"):
+            self.apply(groups=["uavs:lead", "robotics:member", "test:member"])
+        self.assertEqual(self.forgejo.teams_of(), {("example", "members")})
+        self.assertFalse([path for method, path in self.forgejo.writes() if path.startswith("/orgs/robotics")])
+
     def test_a_team_made_by_hand_with_a_units_name_is_left_alone_and_says_why(self):
         self.made_org("robotics")
         self.made_team("robotics", "uavs", members=(), description="made in Forgejo")
