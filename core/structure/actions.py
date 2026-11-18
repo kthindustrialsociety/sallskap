@@ -135,6 +135,11 @@ def _appointing(role):
     return P.MANAGE_PARTICIPANTS if role == Position.Role.PARTICIPANT else P.APPOINT
 
 
+def _check_inside(parent):
+    if parent is None:
+        raise ValidationError(_("Every unit but the root sits inside another, so say which one."))
+
+
 def _taking_part(team):
     return sorted(team.taking_part.values_list("key", flat=True))
 
@@ -147,6 +152,7 @@ UNIT_CHANGES = ("name", "description", "primary_colour", "accent_colour", "end_d
 @action
 def create_unit(actor, *, parent, kind, key, name, description="", primary_colour="", accent_colour="", end_date=None):
     """Decided by whoever has authority over the unit it goes into."""
+    _check_inside(parent)
     check(actor, P.MANAGE_UNITS, parent)
     unit = Unit(
         parent=parent, kind=kind, key=key, name=name, description=description,
@@ -173,8 +179,7 @@ def change_unit(actor, *, unit, **changes):
 
 @action
 def move_unit(actor, *, unit, parent):
-    if parent is None:
-        raise ValidationError(_("Every unit but the root sits inside another, so say which one."))
+    _check_inside(parent)
     check(actor, P.MANAGE_UNITS, _above_both(_above(unit), parent))
     before = AuditEntry.fields(unit)
     unit.parent = parent

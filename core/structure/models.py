@@ -421,7 +421,9 @@ class Person(models.Model):
     def __str__(self):
         if self.name:
             return self.name
-        address = self.emails.order_by("verified_at").first() if self.pk else None
+        addresses = list(self.emails.all()) if self.pk else []  # what a list prefetched, if it did
+        verified = [address for address in addresses if address.verified_at]
+        address = min(verified, key=lambda address: address.verified_at, default=None) or next(iter(addresses), None)
         return address.address if address else _("Person %(id)s") % {"id": self.pk}
 
     def save(self, *args, **kwargs):
