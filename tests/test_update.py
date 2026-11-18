@@ -471,6 +471,7 @@ class Finishing(UpdateBase):
         code, out = self.kit("update", "--finish")
         self.assertEqual(code, 1)
         self.assertIn("name and key under [association]", out)
+        self.assertIn(f"Add both to {self.paths.config},", out)
         self.assertIn("kit update --finish", out)
         self.paths.config.write_text(good)
         code, out = self.kit("update", "--finish")
