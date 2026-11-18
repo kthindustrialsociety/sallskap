@@ -22,10 +22,9 @@ def record_root_chair(person, start=None, member_since=None):
     if not person.is_member(root, on=start):
         membership = Membership(person=person, association=root, start=member_since or start)
         membership.save()
-        AuditEntry.record("add_membership", SERVER, unit=root, obj=membership, changes=AuditEntry.compare({}, AuditEntry.fields(membership), "structure.membership"))
-    ended = list(Position.objects.filter(unit=root, role=Position.Role.CHAIR, start__lt=start, end__isnull=True).values_list("pk", flat=True))
+        AuditEntry.record("add_membership", SERVER, unit=root, obj=membership, changes=AuditEntry.created(membership))
     position = Position(person=person, unit=root, role=Position.Role.CHAIR, start=start)
+    ended = list(position.chairs_it_ends().values_list("pk", flat=True))
     position.save()
-    changes = AuditEntry.compare({}, AuditEntry.fields(position), "structure.position")
-    AuditEntry.record("record_root_chair", SERVER, unit=root, obj=position, changes={**changes, **({"ended": ended} if ended else {})})
+    AuditEntry.record("record_root_chair", SERVER, unit=root, obj=position, changes={**AuditEntry.created(position), **({"ended": ended} if ended else {})})
     return position, membership

@@ -866,10 +866,15 @@ class Position(Tie):
     def before_save(self):
         if self.is_seat() and not _seating.get():  # and problems() keeps a seat a seat
             raise ValidationError(_("%(seat)s is a seat, from a seat rule, so core alone sets, changes and ends it. Change the rule, or the position it comes from.") % {"seat": self})
-        # Appointing the next chair ends the last one's position on the day the new one starts.
-        if self.role == self.Role.CHAIR and self.pk is None:
-            for chair in Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True):
-                chair.end_on(self.start)
+        for chair in self.chairs_it_ends():
+            chair.end_on(self.start)
+
+    def chairs_it_ends(self):
+        """Appointing the next chair ends the last one's position on the day the new one
+        starts: the open ones that started before, for a new chair, and none otherwise."""
+        if self.role != self.Role.CHAIR or self.pk is not None:
+            return Position.objects.none()
+        return Position.objects.filter(unit=self.unit_id, role=self.Role.CHAIR, start__lt=self.start, end__isnull=True)
 
     def after_save(self):
         from .access import tell_tools
@@ -1192,12 +1197,13 @@ class AuditEntry(models.Model):
     at = models.DateTimeField(_("when"), default=timezone.now, db_index=True)
     action = models.CharField(_("action"), max_length=50, db_index=True)
     via = models.CharField(_("way in"), max_length=20, choices=Via.choices)
-    actor_account = models.IntegerField(_("by account"), null=True, blank=True)
-    actor_person = models.IntegerField(_("by person"), null=True, blank=True, db_index=True)
-    unit = models.IntegerField(_("unit"), null=True, blank=True, help_text=_("The unit the permission check asked about."))
+    # Ids, as the rows they point at have: BigAutoField.
+    actor_account = models.BigIntegerField(_("by account"), null=True, blank=True)
+    actor_person = models.BigIntegerField(_("by person"), null=True, blank=True, db_index=True)
+    unit = models.BigIntegerField(_("unit"), null=True, blank=True, help_text=_("The unit the permission check asked about."))
     unit_key = models.CharField(_("unit"), max_length=40, blank=True, db_index=True)
     object_type = models.CharField(_("kind of thing"), max_length=50, blank=True)
-    object_id = models.IntegerField(_("which"), null=True, blank=True)
+    object_id = models.BigIntegerField(_("which"), null=True, blank=True)
     changes = models.JSONField(_("changes"), default=dict, blank=True)
 
     objects = AuditQuerySet.as_manager()
@@ -1253,6 +1259,11 @@ class AuditEntry(models.Model):
                 value = value.isoformat()
             found[field.name] = None if value == "" else value
         return found
+
+    @classmethod
+    def created(cls, obj):
+        """The changes for something new: every field it was given."""
+        return cls.compare({}, cls.fields(obj), obj._meta.label_lower)
 
     @classmethod
     def compare(cls, before, after, kind):

@@ -3,7 +3,7 @@ from datetime import date
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 
-from structure.models import EmailAddress, normalize_address
+from structure.models import EmailAddress, Unit, normalize_address
 from structure.server import record_root_chair
 
 
@@ -31,6 +31,8 @@ class Command(BaseCommand):
             position, membership = record_root_chair(found.person, start, member_since)
         except ValidationError as error:
             raise CommandError(" ".join(error.messages)) from None
+        except Unit.DoesNotExist:
+            raise CommandError("There's no association yet. Core creates it from name and key under [association] in the config when it starts.") from None
         person, root = found.person, position.unit
         if membership is not None:
             self.stdout.write(f"{person} is a member of {root} from {membership.start}, as a chair has to be.")

@@ -6,7 +6,8 @@ A way in, such as the API, the member pages or a command on the server, logs the
 and checks their account, two-factor authentication included. It passes their person and
 says which way in it is (`via`). An action that finishes without having asked can()
 exactly once is stopped and undone, so one can't be added without its check. Actions don't
-call each other.
+call each other. Each works on its own copies of what it's given, read afresh, so what it
+records as before is what was stored, and a refusal leaves the caller's objects as they were.
 
 The models keep structure.md's rules whatever writes to them: a ValidationError is a rule
 broken, and NotAllowed is someone without the authority. Both leave nothing written."""
@@ -16,11 +17,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
+from django.db import models, transaction
 from django.utils.translation import gettext as _
 
 from .authority import can
-from .models import AuditEntry, Grant, Membership, Permission, Position, Reason, SeatRule, Unit, path_and_above
+from .models import AuditEntry, Grant, Membership, Permission, Person, Position, Reason, SeatRule, Unit, path_and_above
 
 P = Permission
 ACTIONS = {}  # every action by its name: what C1's API gives an endpoint each
@@ -59,8 +60,10 @@ def _wrap(function):
     @functools.wraps(function)
     def run(actor, *, via, **arguments):
         AuditEntry.Via(via)  # a way in that isn't one is a bug
-        if actor is None or actor.pk is None:
+        actor = Person.objects.filter(pk=actor.pk).first() if isinstance(actor, Person) and actor.pk else None
+        if actor is None:
             raise NotAllowed(_("Only a person can do that."))
+        arguments = {name: _fresh(value) for name, value in arguments.items()}
         if _doing.get() is not None:
             raise RuntimeError(f"{name} was called from inside another action. Actions don't call each other.")
         doing = _Doing()
@@ -86,6 +89,13 @@ def action(function):
     run = _wrap(function)
     ACTIONS[function.__name__] = run
     return run
+
+
+def _fresh(value):
+    """A saved row passed in, read again, so the action changes its own copy."""
+    if isinstance(value, models.Model) and value.pk is not None:
+        return type(value)._default_manager.get(pk=value.pk)
+    return value
 
 
 def _done(obj, before=None, object_id=None, after=None, **more):
@@ -163,6 +173,8 @@ def change_unit(actor, *, unit, **changes):
 
 @action
 def move_unit(actor, *, unit, parent):
+    if parent is None:
+        raise ValidationError(_("Every unit but the root sits inside another, so say which one."))
     check(actor, P.MANAGE_UNITS, _above_both(_above(unit), parent))
     before = AuditEntry.fields(unit)
     unit.parent = parent
@@ -207,7 +219,7 @@ def add_taking_part(actor, *, team, association):
     check(actor, P.MANAGE_UNITS, team)
     before = _taking_part(team)
     team.taking_part.add(association)
-    _done(team, AuditEntry.fields(team), taking_part=[before, _taking_part(team)])
+    _done(team, {}, after={}, taking_part=[before, _taking_part(team)])  # its own fields don't change
     return team
 
 
@@ -217,7 +229,7 @@ def end_taking_part(actor, *, team, association):
     check(actor, P.MANAGE_UNITS, team)
     before = _taking_part(team)
     team.taking_part.remove(association)
-    _done(team, AuditEntry.fields(team), taking_part=[before, _taking_part(team)])
+    _done(team, {}, after={}, taking_part=[before, _taking_part(team)])  # its own fields don't change
     return team
 
 
@@ -256,9 +268,7 @@ def appoint(actor, *, person, unit, role, start=None, end=None, title="", appoin
     position = Position(person=person, unit=unit, role=role, end=end, title=title, appointed_by=appointed_by, minutes=minutes)
     if start is not None:
         position.start = start
-    ended = []
-    if role == Position.Role.CHAIR:  # as Position.before_save does
-        ended = list(Position.objects.filter(unit=unit, role=role, start__lt=position.start, end__isnull=True).values_list("pk", flat=True))
+    ended = list(position.chairs_it_ends().values_list("pk", flat=True))
     position.save()
     _done(position, **({"ended": ended} if ended else {}))
     return position

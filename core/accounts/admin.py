@@ -7,7 +7,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 
-from structure.models import AuditEntry
+from structure.models import AuditEntry, Person
 
 from . import sync
 from .models import AccessSync, FollowUp, User
@@ -20,7 +20,11 @@ def account(user):
     name are recorded as changed, without their values."""
     if user is None:
         return {}
-    return {"email": user.email, "name": user.name, "is_active": user.is_active, "is_superuser": user.is_superuser, "operator": user.is_operator}
+    permissions = sorted(f"{p.content_type.app_label}.{p.codename}" for p in user.user_permissions.select_related("content_type"))
+    return {
+        "email": user.email, "name": user.name, "is_active": user.is_active, "is_superuser": user.is_superuser,
+        "operator": user.is_operator, "user_permissions": permissions,
+    }
 
 
 @admin.register(User)
@@ -60,6 +64,20 @@ class UserAdmin(admin.ModelAdmin):
             obj.set_unusable_password()  # they choose their own, through `kit link`
         obj.audit_before = account(User.objects.filter(pk=obj.pk).first() if change else None)
         super().save_model(request, obj, form, change)
+
+    def delete_model(self, request, obj):
+        self.delete_queryset(request, User.objects.filter(pk=obj.pk))
+
+    @transaction.atomic
+    def delete_queryset(self, request, queryset):
+        """Only superusers can. Each is a row, and so is whether its person went with it,
+        which happens when nothing was ever tied to them."""
+        for user in queryset:
+            pk, before = user.pk, account(user)
+            person = Person.objects.filter(user=user).values_list("pk", flat=True).first()
+            user.delete()
+            changes = {**AuditEntry.compare(before, {}, "accounts.user"), "person_removed": not Person.objects.filter(pk=person).exists()}
+            AuditEntry.record("delete_account", ADMIN, obj=user, object_id=pk, changes=changes, **AuditEntry.by(request.user))
 
     def save_related(self, request, form, formsets, change):
         """After the groups, so Operator shows in the audit log's row."""

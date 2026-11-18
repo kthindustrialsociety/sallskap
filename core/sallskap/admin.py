@@ -11,16 +11,6 @@ from django.utils.translation import gettext_lazy as _
 SHOWN_AT_ONCE = 10
 
 
-def _no_history(*args, **kwargs):
-    """Django's own admin history keeps the name or address of everything an operator
-    changes, with nothing to delete it. The audit log records those changes instead,
-    naming nobody (structure.md §7)."""
-
-
-for _method in ("log_addition", "log_change", "log_deletion", "log_deletions"):
-    setattr(admin.ModelAdmin, _method, _no_history)
-
-
 class SallskapAdminSite(admin.AdminSite):
     site_title = site_header = _("Sällskap admin")
     index_title = _("Administration")

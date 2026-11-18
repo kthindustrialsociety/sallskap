@@ -382,4 +382,10 @@ def build(name, root, replace=False):
         if not replace:
             raise ValidationError(f"{root} already has units or made-up people. Use --replace to remove them first.")
         _remove(root)
+    real = Position.objects.filter(unit=root, role=R.CHAIR).exclude(person__in=Person.objects.filter(emails__address__in=example_addresses()))
+    if real.exists():
+        raise ValidationError(
+            f"{root} has a chair who isn't made up, {real.first().person}. A made-up installation records its own chairs, "
+            "so it's only loaded where nobody real has ever held that seat. Nothing was changed."
+        )
     return _Builder(EXAMPLES[name], root).build()

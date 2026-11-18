@@ -243,6 +243,22 @@ class SeatRuleAdmin(TieAdmin):
 LISTS = ("ended", "archived_with_it")
 
 
+def _merged_into(ids):
+    """For people merged into another since, who they are now, from the merges' rows, which
+    say who went into whom. The rows they acted in keep their old id, as the log is only
+    ever added to."""
+    into = {changes["person"][0]: changes["person"][1] for changes in AuditEntry.objects.filter(action="merge").values_list("changes", flat=True)}
+    found = {}
+    for pk in ids:
+        seen, now = set(), pk
+        while now in into and now not in seen:  # one merged, then merged again
+            seen.add(now)
+            now = into[now]
+        if now != pk:
+            found[pk] = now
+    return found
+
+
 def _model(kind):
     try:
         return apps.get_model(kind) if kind else None
@@ -272,7 +288,10 @@ class AuditEntryAdmin(ShownAdmin):
         row. The names go on that request's rows."""
         changelist = super().get_changelist_instance(request)
         rows = changelist.result_list
-        people = Person.objects.prefetch_related("emails").in_bulk({row.actor_person for row in rows if row.actor_person})
+        ids = {row.actor_person for row in rows if row.actor_person}
+        people = Person.objects.prefetch_related("emails").in_bulk(ids)
+        merged = _merged_into(ids - set(people)) if ids - set(people) else {}
+        people.update(Person.objects.prefetch_related("emails").in_bulk(set(merged.values())))
         things = {}
         for kind in {row.object_type for row in rows if row.object_type}:
             model = _model(kind)
@@ -281,7 +300,7 @@ class AuditEntryAdmin(ShownAdmin):
                 ids = {row.object_id for row in rows if row.object_type == kind}
                 things.update({(kind, pk): obj for pk, obj in model._default_manager.select_related(*related).in_bulk(ids).items()})
         for row in rows:
-            row.found_person = people.get(row.actor_person)
+            row.found_person = people.get(row.actor_person), people.get(merged.get(row.actor_person))
             row.found_thing = things.get((row.object_type, row.object_id))
         return changelist
 
@@ -289,8 +308,16 @@ class AuditEntryAdmin(ShownAdmin):
     def who(self, obj):
         if obj.actor_person is None:
             return "-"
-        found = obj.found_person if hasattr(obj, "found_person") else Person.objects.filter(pk=obj.actor_person).first()
-        return str(found) if found is not None else gettext("someone since deleted")
+        if hasattr(obj, "found_person"):
+            found, kept = obj.found_person
+        else:
+            found = Person.objects.filter(pk=obj.actor_person).first()
+            kept = Person.objects.filter(pk=_merged_into({obj.actor_person}).get(obj.actor_person)).first() if found is None else None
+        if found is not None:
+            return str(found)
+        if kept is not None:  # they were merged into another, as the merge's own row says
+            return gettext("%(person)s, merged since") % {"person": kept}
+        return gettext("someone since deleted")
 
     @admin.display(description=_("what"))
     def what(self, obj):

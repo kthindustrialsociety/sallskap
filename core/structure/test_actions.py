@@ -20,6 +20,7 @@ from django.contrib import admin
 from django.contrib.admin.models import ADDITION, LogEntry
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.contrib.auth.models import Permission as AccountPermission
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.core.management import CommandError, call_command
@@ -337,6 +338,7 @@ RULES = [
     ("change_unit", "chair@root", lambda t: dict(unit=t.u("root"), name="Another name")),  # the root's name follows the config
     ("move_unit", "chair@root", lambda t: dict(unit=t.u("root"), parent=t.u("rob"))),
     ("move_unit", "chair@root", lambda t: dict(unit=t.u("dev"), parent=t.u("uavs"))),  # into itself
+    ("move_unit", "chair@root", lambda t: dict(unit=t.u("ops"), parent=None)),  # every unit but the root sits in another
     ("archive_unit", "chair@root", lambda t: dict(unit=t.u("rob"))),  # only teams
     ("delete_unit", "chair@root", lambda t: dict(unit=t.u("uavs"))),  # people were tied to it
     ("end_position", "chair@root", lambda t: dict(position=t.seat())),  # a seat follows its rule
@@ -440,6 +442,21 @@ class Walk(Tree):
         with self.assertRaises(RuntimeError):
             actions._wrap(twice)(self.p("chair@root"), unit=self.u("ops"), via=SERVER)
         self.assertEqual(self.u("ops").name, "Operations")
+
+    def test_a_refused_change_leaves_the_callers_object_as_it_was(self):
+        unit = self.u("uavs")
+        with self.assertRaises(NotAllowed):
+            actions.change_unit(self.p("lead@web"), unit=unit, name="Refused", via=SERVER)
+        self.assertEqual(unit.name, "Uavs")
+        actions.change_unit(self.p("lead@uavs"), unit=unit, description="Flying things", via=SERVER)
+        self.assertEqual(self.u("uavs").name, "Uavs")
+
+    def test_what_it_records_as_before_is_what_was_stored(self):
+        unit = self.u("uavs")
+        unit.name = "Never saved"
+        actions.change_unit(self.p("lead@uavs"), unit=unit, description="Flying things", via=SERVER)
+        self.assertEqual(AuditEntry.objects.get().changes, {"description": [None, "Flying things"]})
+        self.assertEqual(self.u("uavs").name, "Uavs")
 
     def test_check_outside_an_action_is_a_mistake(self):
         with self.assertRaises(RuntimeError):
@@ -587,6 +604,13 @@ class RootChair(TestCase):
             self.chair("alva@example.org", "--from", "1 July")
 
 
+class NoRootYet(TestCase):
+    def test_kit_chair_says_there_is_no_association_yet(self):
+        User.objects.create_user("alva@example.org")
+        with self.assertRaises(CommandError):
+            call_command("root_chair", "alva@example.org", stdout=io.StringIO())
+
+
 class ServerRecords(TestCase):
     def test_kit_admin_is_recorded(self):
         call_command("create_admin", "op@example.org", stdout=io.StringIO())
@@ -676,6 +700,25 @@ class OperatorsChanges(TestCase):
         row = AuditEntry.objects.get(action="merge")
         self.assertEqual((row.via, row.actor_account, row.actor_person), ("core", None, None))
 
+    def test_a_superuser_giving_permissions_or_deleting_an_account(self):
+        root, _ = make_user("root@example.org", two_factor=True)
+        root.is_superuser = True
+        root.save()
+        self.client.force_login(root)
+        user, _ = make_user("bo@example.org")
+        view_units = AccountPermission.objects.get(content_type__app_label="structure", codename="view_unit")
+        response = self.client.post(reverse("admin:accounts_user_change", args=[user.pk]), {
+            "email": "bo@example.org", "name": "", "is_active": "on", "groups": [], "user_permissions": [view_units.pk],
+        })
+        self.assertEqual(response.status_code, 302, response.content.decode()[:3000])
+        changed = AuditEntry.objects.get(action="change_account")
+        self.assertEqual((changed.actor_account, changed.changes), (root.pk, {"user_permissions": [[], ["structure.view_unit"]]}))
+        self.client.post(reverse("admin:accounts_user_delete", args=[user.pk]), {"post": "yes"})
+        self.assertFalse(User.objects.filter(pk=user.pk).exists())
+        deleted = AuditEntry.objects.get(action="delete_account")
+        self.assertEqual((deleted.object_id, deleted.changes["email"], deleted.changes["person_removed"]), (user.pk, None, True))
+        self.assertFalse(LogEntry.objects.exists())
+
     def test_django_keeps_no_history_of_its_own(self):
         self.client.post(reverse("admin:accounts_user_add"), {"email": "bo@example.org", "name": "Bo", "is_active": "on", "groups": []})
         self.assertFalse(LogEntry.objects.exists())
@@ -744,6 +787,15 @@ class AdminPage(Tree):
         self.assertIn("lead@uavs", page)
         self.assertIn("UAV team", page)
 
+    def test_someone_merged_since_is_shown_as_who_they_became(self):
+        gone, kept = someone("Gone Example"), someone("Kept Example")
+        AuditEntry.record("change_unit", SERVER, person=gone.pk, unit=self.u("uavs"), obj=self.u("uavs"))
+        Person.merge(kept, gone)
+        self.enter(self.operator())
+        self.assertIn("Kept Example, merged since", self.client.get(reverse("admin:structure_auditentry_changelist")).content.decode())
+        row = AuditEntry.objects.get(action="change_unit")
+        self.assertContains(self.client.get(reverse("admin:structure_auditentry_change", args=[row.pk])), "Kept Example, merged since")
+
     def test_operators_may_only_view_the_tree_people_and_log(self):
         codenames = Group.objects.get(role__key="operator").permissions.filter(content_type__app_label="structure").values_list("codename", flat=True)
         self.assertTrue(codenames)
@@ -803,6 +855,17 @@ class MadeUp(TestCase):
         successor = AuditEntry.objects.get(action="appoint", object_id=una.pk)
         self.assertLess(grant.pk, successor.pk)
         self.assertTrue(Grant.objects.filter(given_by=viktor, end=None).exists())
+
+    def test_a_root_with_a_real_chair_is_left_alone(self):
+        root = Unit.objects.create(kind=ASSOCIATION, key="test", name="Test Association")
+        real = User.objects.create_user("real@example.com", name="Real Chair").person
+        Membership.objects.create(person=real, association=root, start=LONG_AGO)
+        chair = Position.objects.create(person=real, unit=root, role=Role.CHAIR, start=LONG_AGO)
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaises(ValidationError):
+                examples.build("society", root, replace=replace)
+        self.assertFalse(root.descendants().exists() or AuditEntry.objects.exists())
+        self.assertIsNone(Position.objects.get(pk=chair.pk).end)
 
     def test_the_first_chair_of_example_federation_is_also_a_member_of_the_root(self):
         root = self.build("federation")
