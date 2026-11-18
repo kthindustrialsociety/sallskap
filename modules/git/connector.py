@@ -177,18 +177,20 @@ class Connector:
         for (org, name), team in current.items():
             if (org, name) not in wanted and self._our_org(team["organization"]) and (leaving or self._our_team(org, team)):
                 self._expect("DELETE", f"/teams/{team['id']}/members/{_quoted(login)}", 204)
-        teams, problems = {}, []  # each organisation's teams, once
+        teams, problems = {}, []  # each organisation's teams, once, or None if core can't use it
         for org, name in sorted(wanted - set(current)):
             try:
                 if org not in teams:
+                    teams[org] = None  # until _teams() answers, so a refusal holds for its other teams
                     teams[org] = self._teams(org, units)
+                if teams[org] is None:
+                    continue
                 team = teams[org].get(name.lower()) or self._make_team(org, name, units)
                 teams[org][name.lower()] = team
                 if not self._our_team(org, team):
                     raise RuntimeError(f"Forgejo already has a team called {team['name']} in {org} that core didn't make, so core won't use it. Rename it there")
                 self._expect("PUT", f"/teams/{team['id']}/members/{_quoted(login)}", 204)
             except RuntimeError as problem:
-                teams.setdefault(org, {})
                 if str(problem) not in problems:
                     problems.append(str(problem))
         return problems
