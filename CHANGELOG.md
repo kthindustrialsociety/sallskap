@@ -32,6 +32,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
 - **Django's own admin history is deleted by the update,** as it kept the names and addresses of what was changed, with no way to delete them. The new audit log records changes from the update on, naming nobody. There's nothing to do.
 - **The admin page is for Operators only now.** Board members no longer reach it, and the vault's follow-ups go to Operators. The board's own pages come in a later release.
 - **If Git is on, refresh Forgejo's sign-in after updating,** so it maps your association's chair and vice chair the way core does: run `kit tool remove forgejo`, then `kit enable git`. Signing in to Forgejo doesn't work between the two. Forgejo's old developers team is left as it was, and nobody is added to it any more: give its people a team in core, then delete it in Forgejo.
+- **If you push backups to a target with `[backup] target`,** the first backup after updating forgets the old ones there, as the server does, keeping 7 daily, 4 weekly and 6 monthly. Anything older than about six months goes. The server forgot those long ago, so if you want to keep one, copy the target itself somewhere else before updating. A pulled copy, from `kit backup export`, is yours to keep: keep the newest, and none older than six months, as each holds every backup.
 - **A tool you limited with `kit tool add --group`** to developer, events or a group made by hand lets nobody in now. Remove it with `kit tool remove`, then add it again with the keys you want, such as `board` or `website:lead`. The vault needs nothing: it already uses `board` and `operator`.
 
 ### Tool versions
@@ -72,6 +73,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - The audit log records each action, with who did it, where, through which way in, and what changed, and also Operators' changes to accounts and `kit admin` and `kit chair` on the server. It names nobody, so it never keeps anyone's data after they're deleted, and it's only ever added to. Operators read it in the admin page, under Audit log.
   - The admin page shows the tree, people and their ties, and changes none of them. Operators merge two people there, which the log records.
   - `kit chair <email>` records your association's chair, and makes them a member of it if they aren't one. It's how a new installation records its first chair.
+- fix: a backup target set with `[backup] target` now forgets old backups after each copy, as the server does, keeping 7 daily, 4 weekly and 6 monthly. It kept every backup for ever, and with them everyone since deleted.
 
 
 ## 0.7.2 (2026-11-10)

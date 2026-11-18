@@ -1264,13 +1264,15 @@ def _start_after_backup(paths: Paths, config: Config) -> None:
         raise KitError(f"The backup finished, but these didn't come back: {', '.join(problems)}. Run: kit apply")
 
 
-def _copy_off_server(paths: Paths, config: Config, password: str) -> None:
+def _copy_off_server(paths: Paths, config: Config, password: str, forget: bool = True) -> None:
     """Push to the target in the config, with the same password, so the copy there and
     an exported file are interchangeable. Its chunker parameters are copied from this
     repository, or everything would be stored again from scratch on each run. This is
     for an association with somewhere to put backups but no machine to pull them: a
     pull needs no credentials here, and a server that can write to its own off-server
-    copy can also be made to delete it."""
+    copy can also be made to delete it. Old backups there are then forgotten as here,
+    or someone deleted (structure.md §3) would stay there for ever. `forget` is False
+    during an update, as on the server: the nightly run does it."""
     target = config.backup_target
     source = {"RESTIC_FROM_PASSWORD": password}
     if _restic_read(paths, "cat", "config", password=password, repo=target, **source) is None:
@@ -1278,6 +1280,8 @@ def _copy_off_server(paths: Paths, config: Config, password: str) -> None:
         _restic_run(paths, "init", "--copy-chunker-params", "--from-repo", str(paths.repo), repo=target, **source)
     print(f"Copying off the server to {target}.")
     _restic_run(paths, "copy", "--from-repo", str(paths.repo), repo=target, **source)
+    if forget:
+        _restic_run(paths, "forget", "--prune", "--tag", BACKUP_TAG, *BACKUP_KEEP, repo=target)
 
 
 def run_backup(paths: Paths) -> None:
@@ -1317,7 +1321,7 @@ def _take_backup(paths: Paths, config: Config, leave_stopped: bool = False) -> N
         print(f"\nLogins and the tools were paused for {time.monotonic() - paused:.0f} seconds. The public sites weren't.")
         _restic_run(paths, "forget", "--prune", "--tag", BACKUP_TAG, *BACKUP_KEEP)  # the nightly run does this during an update
     if config.backup_target:
-        _copy_off_server(paths, config, password)
+        _copy_off_server(paths, config, password, forget=not leave_stopped)
     elif not leave_stopped:
         print(f"\nNothing has left this server. Take a copy with: kit backup export {_export_name()}")
 

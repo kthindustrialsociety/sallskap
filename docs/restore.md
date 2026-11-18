@@ -51,7 +51,9 @@ Whole folders are copied, not chosen files, which matters more than it looks: ea
 
 It also stops the vault's emergency copy if one is running, since that writes to the same data. Start it again with `kit emergency vault` if you still need it.
 
-Old snapshots are forgotten and pruned on each run, keeping 7 daily, 4 weekly and 6 monthly, so the repository doesn't grow for ever.
+Old snapshots are forgotten and pruned on each run, keeping 7 daily, 4 weekly and 6 monthly, so the repository doesn't grow for ever, and so that someone deleted (below) doesn't stay in it for ever either.
+
+**Someone deleted stays in the backups until they age out.** Core deletes people it has no reason to keep ([structure.md](structure.md) §3). Backups taken before that still hold them, for six months at most on the server and on a push target, and for as long as a pulled copy is kept. A restore brings them back, and core deletes them again the next night.
 
 ## Taking a copy off the server
 
@@ -63,7 +65,7 @@ A backup that never leaves the server doesn't survive losing the server. There a
 ssh root@<server> 'kit backup export -' > sallskap-backup-$(date +%F).tar
 ```
 
-That file holds the whole repository, every snapshot in it, and it's already encrypted, so it needs no password of its own. Put the same line in a cron job on a machine the association trusts and the copy happens by itself. Pulling is better than pushing because the credentials then live on the receiving machine: a server that can write to its own off-server copy can also be made to delete it.
+That file holds the whole repository, every snapshot in it, and it's already encrypted, so it needs no password of its own. Put the same line in a cron job on a machine the association trusts and the copy happens by itself. As each file holds every backup, keep the newest few and delete any older than six months, or people deleted since stay in them. Pulling is better than pushing because the credentials then live on the receiving machine: a server that can write to its own off-server copy can also be made to delete it.
 
 `kit backup export <file>` writes it on the server instead, and `kit backup export <folder>` names it by the date.
 
@@ -74,7 +76,7 @@ That file holds the whole repository, every snapshot in it, and it's already enc
 target = "sftp:backups@storage.example.org:/sallskap"
 ```
 
-Every `kit backup` then copies to it as well. The same password is used, so a copy there and an exported file are interchangeable, and a restore can read it directly:
+Every `kit backup` then copies to it as well, and forgets old backups there as on the server. The same password is used, so a copy there and an exported file are interchangeable, and a restore can read it directly:
 
 ```sh
 kit restore --from sftp:backups@storage.example.org:/sallskap

@@ -290,6 +290,29 @@ class RealRestic(unittest.TestCase):
         self.assertNotIn("Setting up", out)  # it's only set up once
         self.assertIn("Copying off the server", out)
 
+    def test_repeated_backups_dont_fill_the_off_server_copy_either(self):
+        """The target forgets as the server does, so someone deleted (structure.md §3)
+        doesn't stay there for ever, and both hold the same snapshots."""
+        target = self.base / "off-server"
+        self.paths.config.write_text(
+            f'[association]\nname = "Example"\nkey = "example"\ndomain = "example.org"\n[backup]\ntarget = "{target}"\n[modules]\ndemo = true\n'
+        )
+        password = None
+        for _ in range(6):
+            code, out = self.run_kit("backup")
+            self.assertEqual(code, 0, out)
+            password = password or kit._read_env(self.paths.backup_env)["RESTIC_PASSWORD"]
+        result = subprocess.run(
+            ["restic", "--repo", str(target), "snapshots", "--json"],
+            env={**kit.os.environ, "RESTIC_PASSWORD": password},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        there = sorted(snapshot["time"] for snapshot in json.loads(result.stdout))
+        self.assertEqual(there, sorted(snapshot["time"] for snapshot in self.snapshots()))
+        self.assertLess(len(there), 6)
+
 
 if __name__ == "__main__":
     unittest.main()
