@@ -80,6 +80,7 @@ A section is never edited once its release is tagged. A mistake is put right in 
   - Their ended positions stay, seats included, under their name and nothing else, and can't be changed. Grants and seat rules they gave stay as they were, and show their giver as since deleted. Their addresses, memberships and reasons go. The tools are told nothing: someone without an account has nothing in them.
   - The audit log gets one row for each night that deleted anyone, counting what went and naming nobody.
   - `manage.py delete_people --dry-run` says who would go today; without `--dry-run`, it deletes them now.
+- chore: core runs django-allauth 65.22.1 and gunicorn 27.0.1. allauth's fixes to the login service come with it: a code can be used once even when two tries come together, and using it twice revokes what it gave. A code given to an account turned off since still gets no tokens: allauth stopped checking that in 65.22, so core does.
 
 
 ## 0.7.2 (2026-11-10)

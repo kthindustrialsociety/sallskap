@@ -13,6 +13,7 @@ from allauth.idp.oidc.views import TokenView as ProviderTokenView
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.models import AnonymousUser
+from django.http import JsonResponse
 from django.shortcuts import redirect, render
 from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
@@ -126,9 +127,17 @@ class AuthorizationView(ProviderAuthorizationView):
 class TokenView(ProviderTokenView):
     """oauthlib always issues a refresh token, even though tools aren't allowed to
     use one. Holding on to one a tool can't use could make it fail later, or log
-    someone out, so it never leaves here."""
+    someone out, so it never leaves here.
+
+    A code given to an account that's been turned off since gets no tokens. allauth
+    refused it until 65.22, which keeps codes in the database and takes their account
+    as it is, so it's refused here, with the answer allauth gave."""
 
     def post(self, request):
+        code = request.POST.get("code")
+        if request.POST.get("grant_type") == "authorization_code" and code:
+            if Token.objects.by_value(code).filter(type=Token.Type.AUTHORIZATION_CODE, user__is_active=False).exists():
+                return JsonResponse({"error": "invalid_grant"}, status=400, headers={"Cache-Control": "no-store"})
         response = super().post(request)
         if response.status_code == 200:
             data = json.loads(response.content)
