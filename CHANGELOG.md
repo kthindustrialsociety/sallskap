@@ -10,6 +10,8 @@ A section is never edited once its release is tagged. A mistake is put right in 
 
 ## 0.8.0 (2026-11-19)
 
+Your association's structure comes to core: its associations and teams, its people and their memberships and positions, who can do what, and each person's access to the tools, worked out from those. The groups go, so read the first two points below before updating.
+
 ### Before you update
 
 - **Add your association's name and key to the config,** under `[association]`, before you update. The update stops without them:
