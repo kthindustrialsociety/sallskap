@@ -2475,8 +2475,8 @@ def main(argv: list[str] | None = None) -> int:
             apply(paths)
             print(f"Created {paths.config}.\n")
             status(paths)
-            print(f"\nNext, add the DNS record for app.{args.domain} above at your registrar.")
-            print("While it spreads, create the first admin, whose link works once the record has:")
+            print(f"\nNext: if app.{args.domain} isn't ok above, add its DNS record at your registrar.")
+            print("Meanwhile, create the first admin, whose link works once the record does:")
             print("  kit admin you@example.org")
             print("The rest is in docs/installing.md.")
         elif args.command == "apply":

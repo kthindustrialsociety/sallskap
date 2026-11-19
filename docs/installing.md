@@ -174,7 +174,7 @@ The last part checks the file. It prints a line starting `ssh-ed25519` if the ke
 **By hand,** for a site that rarely changes: from the computer with the key file, send the folder that holds `index.html`:
 
 ```sh
-tar -C <folder> -czf - . | ssh -o IdentitiesOnly=yes -i example.org-deploy-key sallskap-deploy@203.0.113.10
+tar -C <folder> -czf - . | ssh -T -o IdentitiesOnly=yes -i example.org-deploy-key sallskap-deploy@203.0.113.10
 ```
 
 It ends with `Published` and the release's name.

@@ -572,8 +572,10 @@ class Docker(unittest.TestCase):
 
     def test_init_shows_what_dns_is_needed(self):
         self.paths.config.unlink()
-        self.run_kit("init", "example.org", "--name", "Example Society", "--key", "example")
+        _, out = self.run_kit("init", "example.org", "--name", "Example Society", "--key", "example")
         kit.status.assert_called_once()
+        # Only if it isn't there already: on a reinstall, or a record added first, it's ok above.
+        self.assertIn("if app.example.org isn't ok above, add its DNS record", out)
 
     def test_admin_passes_on_only_what_was_asked_for(self):
         self.run_kit("admin", "o'brien@kth.se")
