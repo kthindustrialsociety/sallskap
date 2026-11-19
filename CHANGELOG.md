@@ -44,12 +44,12 @@ A section is never edited once its release is tagged. A mistake is put right in 
 
 - feat: units, the tree of associations and teams (structure.md §1).
   - Core creates your association as the root unit, from the config's name and key, and keeps its name in step with the config. The admin page shows the units inside it, under Units.
-  - A unit's key is fixed once set and never reused. A project is archived by hand, which archives everything inside it.
+  - A unit's key is fixed once set and never reused. A project is archived when it's over, which archives everything inside it.
   - Nothing is visible to members yet.
   - `kit init` now asks for the association's name and key.
 - feat: people, and the ties between them and units (structure.md §2 and §3).
   - Every account becomes a person, with its name and its address, marked verified. Accounts themselves don't change, so neither does anything the tools see.
-  - The admin page shows people, memberships, positions and reasons, under People. Ties are ended, never deleted, so the record of who held what is kept.
+  - The admin page shows people, memberships, positions and reasons, under People. Ties are ended rather than deleted, so the record of who held what is kept, until core deletes someone with nothing left (below).
   - Only members hold board roles or lead teams, and membership of an association counts for every association above it.
   - When an account's address is changed, the old one stays on its person, unverified, so it can be given to someone else, such as a role's shared address.
 - feat: authority, and grants (structure.md §4).
