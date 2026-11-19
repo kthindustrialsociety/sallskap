@@ -8,7 +8,7 @@ Newest first. Each release has three parts:
 
 A section is never edited once its release is tagged. A mistake is put right in the next release's section. See [docs/releasing.md](docs/releasing.md).
 
-## Unreleased
+## 0.8.0 (2026-11-19)
 
 ### Before you update
 
