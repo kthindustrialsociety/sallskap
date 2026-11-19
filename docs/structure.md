@@ -231,7 +231,7 @@ sk mailing send robotics news --file spring.md
 - **It runs on your own computer** and talks to the API over HTTPS, like `gh` talks to GitHub. Nobody gets a shell on the server, as §12 of the spec requires.
 - **The server decides, never the CLI.** A changed CLI gets the same answer as an honest one: the action is refused. `sk --help` and `sk whoami` show only what you can do.
 - **Login is the device login** that `gh auth login` uses (OAuth 2.0 device authorization, RFC 8628), through core's login service. It's switched on for the CLI alone, and stays off for every tool. You approve it in the browser, with your password and 2FA.
-- **How core checks the CLI's tokens** (checked against django-allauth 65.21.1, which core runs, on 2026-11-13):
+- **How core checks the CLI's tokens** (checked against django-allauth 65.21.1 on 2026-11-13, and again against 65.22.1, which core runs, on 2026-11-19):
   - allauth's login service supports the device login, and comes with a check for its own tokens on an API built with django-ninja. That's the API library to use.
   - **Only the CLI's tokens may call the API.** The check only asks whether a token carries the right scope, so a tool's token, such as Forgejo's, would otherwise pass. The API needs its own scope, which only the CLI is allowed to ask for. Each token is also tied to `app.<domain>/api/`.
   - **The device approval page needs core's own guard,** as the tools' login page has: someone whose role needs 2FA and who hasn't set it up yet is sent to set it up first.
