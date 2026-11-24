@@ -3,7 +3,7 @@ name: sallskap
 services:
   # No published ports: only Caddy can reach it, over Compose's own network.
   forgejo:
-    image: codeberg.org/forgejo/forgejo:15.0.11-rootless
+    image: codeberg.org/forgejo/forgejo:15.0.12-rootless
     restart: unless-stopped
     mem_limit: 512m
     pids_limit: 256
